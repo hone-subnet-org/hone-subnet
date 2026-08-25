@@ -74,6 +74,9 @@ Validator hosts can measure local sandbox throughput with
 [`scripts/benchmark_grading.py`](scripts/benchmark_grading.py); see
 [`docs/GRADING_BENCHMARK.md`](docs/GRADING_BENCHMARK.md).
 
+Local rollout shards are automatically limited to 2 GiB. Do not delete
+`data/validator_scores.json`; it contains the validator's scoring history.
+
 ## Protocol
 
 ```text
