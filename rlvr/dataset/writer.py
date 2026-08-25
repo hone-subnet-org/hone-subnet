@@ -21,6 +21,7 @@ from rlvr.types import (
 
 # Records per JSONL shard before rolling over to a new file.
 DEFAULT_SHARD_SIZE = 1000
+DATASET_MAX_BYTES = 2 * 1024**3
 SHARD_PREFIX = "rollouts"
 # The problem store: statement + hidden tests + measured difficulty, one record
 # per evaluated problem-turn. It is stored only by the validator because it
@@ -31,9 +32,17 @@ PROBLEM_PREFIX = "problems"
 class RolloutWriter:
     """Persists Rollouts as appended, sharded JSONL."""
 
-    def __init__(self, dataset_dir: str, shard_size: int = DEFAULT_SHARD_SIZE) -> None:
+    def __init__(
+        self,
+        dataset_dir: str,
+        shard_size: int = DEFAULT_SHARD_SIZE,
+        max_bytes: int = DATASET_MAX_BYTES,
+    ) -> None:
         self.dataset_dir = dataset_dir
         self.shard_size = max(1, int(shard_size))
+        self.max_bytes = int(max_bytes)
+        if self.max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")
         os.makedirs(self.dataset_dir, exist_ok=True)
 
     # ------------------------------------------------------------------ #
@@ -106,18 +115,32 @@ class RolloutWriter:
         """Append rollouts to JSONL, rolling over to a new shard when the active
         shard is full."""
         for r in rollouts:
-            shard_path = self._active_shard_path()
-            line = json.dumps(self._serialize(r), ensure_ascii=False)
-            self._append_line(shard_path, line)
+            try:
+                shard_path = self._active_shard_path()
+                line = json.dumps(self._serialize(r), ensure_ascii=False)
+                self._append_line(shard_path, line)
+                self._prune_to_cap()
+            except OSError as error:
+                self._warn_write_error(error)
+                break
 
     def write_problem(self, problem: Problem) -> None:
         """Append one locally evaluated problem and its revealed tests.
 
         Revealed tests stay local to the validator.
         """
-        shard_path = self._active_shard_path(PROBLEM_PREFIX)
-        line = json.dumps(problem.model_dump(mode="json"), ensure_ascii=False)
-        self._append_line(shard_path, line)
+        try:
+            shard_path = self._active_shard_path(PROBLEM_PREFIX)
+            line = json.dumps(problem.model_dump(mode="json"), ensure_ascii=False)
+            self._append_line(shard_path, line)
+            self._prune_to_cap()
+        except OSError as error:
+            self._warn_write_error(error)
+
+    @staticmethod
+    def _warn_write_error(error: OSError) -> None:
+        detail = str(error).replace("\n", " ")[:160]
+        print(f"[validator] WARN: local rollout export failed ({detail})")
 
     @staticmethod
     def _append_line(path: str, line: str) -> None:
@@ -143,10 +166,43 @@ class RolloutWriter:
         return os.path.join(self.dataset_dir, f"{prefix}-{index:05d}.jsonl")
 
     def _shard_count(self, prefix: str = SHARD_PREFIX) -> int:
-        i = 0
-        while os.path.exists(self._shard_path(i, prefix)):
-            i += 1
-        return i
+        indices = self._shard_indices(prefix)
+        return max(indices, default=-1) + 1
+
+    def _shard_indices(self, prefix: str) -> list[int]:
+        start = f"{prefix}-"
+        end = ".jsonl"
+        indices = []
+        for name in os.listdir(self.dataset_dir):
+            if not name.startswith(start) or not name.endswith(end):
+                continue
+            value = name[len(start) : -len(end)]
+            if value.isdigit():
+                indices.append(int(value))
+        return indices
+
+    def _prune_to_cap(self) -> None:
+        shards = []
+        protected = set()
+        for prefix in (SHARD_PREFIX, PROBLEM_PREFIX):
+            indices = self._shard_indices(prefix)
+            if indices:
+                protected.add((prefix, max(indices)))
+            for index in indices:
+                path = self._shard_path(index, prefix)
+                stat = os.stat(path)
+                shards.append(
+                    (stat.st_mtime_ns, index, prefix, path, stat.st_size)
+                )
+
+        total = sum(size for _, _, _, _, size in shards)
+        for _, index, prefix, path, size in sorted(shards):
+            if total <= self.max_bytes:
+                break
+            if (prefix, index) in protected:
+                continue
+            os.unlink(path)
+            total -= size
 
     def _active_shard_path(self, prefix: str = SHARD_PREFIX) -> str:
         """Return the path of the shard to append to next, rolling over once the
