@@ -12,9 +12,18 @@ import httpx
 from ..config import Settings
 from ..protocol import SignedSolution, SolutionPayload, TaskRequest, sign_message, verify_signature
 from ..types import Problem, SolutionResponse
+from ..v3.api import (
+    EPISTULA_HEADERS,
+    MinerSubmission as V3MinerSubmission,
+    MinerTaskRequest,
+    MinerTaskResponse,
+    derive_miner_request_id,
+    validate_miner_response,
+)
 from .validator import ValidatorNeuron
 
 _SEND_START_BUDGET_S = 6.0
+_SOLVE_DEADLINE_GRACE_S = 10.0
 
 
 class _SendPermit:
@@ -95,6 +104,137 @@ class LiveSolverClient:
     async def solve(self, problem: Problem, prompt: str) -> SolutionResponse:
         artifact = await self.solve_signed(problem, request_id=uuid4().hex)
         return artifact.to_solution(problem.problem_id)
+
+    async def solve_v3(
+        self, task: MinerTaskRequest
+    ) -> tuple[V3MinerSubmission, MinerTaskResponse | None]:
+        if task.slots.submission.uid != self.uid or task.slots.submission.hotkey != self.hotkey:
+            raise ValueError("V3 task slots do not match the target miner")
+        request_id = derive_miner_request_id(task.challenge_id, self.uid, self.hotkey)
+        body = task.model_dump_json().encode("utf-8")
+        started = time.monotonic()
+
+        def elapsed_ms() -> int:
+            return min((2**53) - 1, max(0, int((time.monotonic() - started) * 1000)))
+
+        def bounded_error(value: str) -> str:
+            raw = value.encode("utf-8", "replace")[:4_096]
+            while raw:
+                try:
+                    return raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    raw = raw[:-1]
+            return "miner request failed"
+
+        def failed(message: str) -> tuple[V3MinerSubmission, None]:
+            return (
+                V3MinerSubmission(
+                    uid=self.uid,
+                    hotkey=self.hotkey,
+                    request_id=request_id,
+                    response_body="",
+                    response_headers={},
+                    error=bounded_error(message) or "miner request failed",
+                    latency_ms=elapsed_ms(),
+                ),
+                None,
+            )
+
+        permit = await self._gate.acquire()
+        body_consumed = asyncio.Event()
+
+        async def body_stream():
+            try:
+                yield body
+                body_consumed.set()
+            finally:
+                permit.release()
+
+        try:
+            headers = sign_message(self._wallet, body, signed_for=self.hotkey)
+        except Exception as error:  # noqa: BLE001
+            permit.release()
+            return failed(f"dispatch signing failed: {error}")
+        headers["Content-Type"] = "application/json"
+        headers["Content-Length"] = str(len(body))
+        timeout_s = max(
+            0.001,
+            min(self._settings.solve_deadline_s, task.expires_at - time.time()),
+        )
+        overall_deadline = time.monotonic() + timeout_s + _SOLVE_DEADLINE_GRACE_S
+
+        async def exchange():
+            try:
+                async with self._http.stream(
+                    "POST",
+                    f"{self._url}/solve",
+                    content=body_stream(),
+                    headers=headers,
+                    timeout=timeout_s + 10.0,
+                ) as response:
+                    if response.status_code < 200 or response.status_code >= 300:
+                        detail = await _read_bounded_response(response, 512)
+                        rendered = "" if detail is None else detail.decode("utf-8", "replace")
+                        return failed(f"HTTP {response.status_code}: {rendered}")
+                    response_body = await _read_bounded_response(response, 16_384)
+                    if response_body is None:
+                        return failed("miner response exceeds byte limit")
+                    response_headers = {
+                        name: response.headers.get(name, "") for name in EPISTULA_HEADERS
+                    }
+                if (
+                    response_headers["Epistula-Signed-By"] != self.hotkey
+                    or not verify_signature(
+                        response_headers,
+                        response_body,
+                        expected_signed_for=headers["Epistula-Signed-By"],
+                    )
+                ):
+                    return failed("invalid or unauthenticated miner response")
+                try:
+                    response_text = response_body.decode("utf-8")
+                    parsed = MinerTaskResponse.model_validate_json(response_body)
+                    validate_miner_response(task, parsed)
+                except (UnicodeError, ValueError):
+                    return failed("invalid V3 miner response")
+                return (
+                    V3MinerSubmission(
+                        uid=self.uid,
+                        hotkey=self.hotkey,
+                        request_id=request_id,
+                        response_body=response_text,
+                        response_headers=response_headers,
+                        error="",
+                        latency_ms=elapsed_ms(),
+                    ),
+                    parsed,
+                )
+            except Exception as error:  # noqa: BLE001
+                return failed(f"dispatch failed: {error}")
+
+        exchange_task = asyncio.create_task(exchange())
+        consumed_task = asyncio.create_task(body_consumed.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {exchange_task, consumed_task},
+                timeout=_SEND_START_BUDGET_S,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if exchange_task in done or consumed_task in done:
+                remaining = max(0.001, overall_deadline - time.monotonic())
+                try:
+                    return await asyncio.wait_for(exchange_task, timeout=remaining)
+                except asyncio.TimeoutError:
+                    return failed("miner response exceeded the solve deadline")
+            exchange_task.cancel()
+            await asyncio.gather(exchange_task, return_exceptions=True)
+            return failed("request body did not reach transport before signature deadline")
+        finally:
+            consumed_task.cancel()
+            if not exchange_task.done():
+                exchange_task.cancel()
+            await asyncio.gather(consumed_task, exchange_task, return_exceptions=True)
+            permit.release()
 
     async def solve_signed(self, problem: Problem, request_id: str) -> SignedSolution:
         """Return exact miner-signed bytes for commit-before-test-reveal."""

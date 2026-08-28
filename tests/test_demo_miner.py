@@ -1,34 +1,22 @@
-"""GLM demo miner protocol and provider-client coverage."""
-
 from __future__ import annotations
 
 import json
+import subprocess
 
 import httpx
 import pytest
 
-import rlvr.protocol as protocol_module
 from rlvr.neurons.demo_miner import (
     DemoMiner,
     DemoMinerSettings,
-    GLM52Client,
-    build_demo_miner_app,
+    BedrockClient,
+    ModelCompletion,
     build_model_messages,
-    extract_python,
+    extract_submission,
 )
-from rlvr.neurons.live import LiveSolverClient
-from rlvr.protocol import TaskRequest
-from rlvr.types import Problem, TestCase as Case
-
-fastapi = pytest.importorskip("fastapi")
-
-
-@pytest.fixture(autouse=True)
-def force_chain_free_signatures(monkeypatch):
-    """Keep protocol tests hermetic when a chain-signing package is installed."""
-
-    monkeypatch.setattr(protocol_module, "_HAVE_CRYPTO", False)
-    monkeypatch.setattr(protocol_module, "_Keypair", None)
+from rlvr.v3.api import MinerTaskRequest, MinerTaskResponse
+from rlvr.v3.trajectory import parse_trajectory
+from tests.test_v3_api import lease, slot_set
 
 
 class WalletLike:
@@ -40,255 +28,149 @@ class WalletLike:
         self.hotkey = self.Hotkey(address)
 
 
-class FakeMetagraph:
-    def __init__(self, validator: str, *, permit: bool = True):
-        self.hotkeys = [validator]
-        self.S = [100.0]
-        self.validator_permit = [permit]
+def settings(**updates) -> DemoMinerSettings:
+    return DemoMinerSettings(_env_file=None, bedrock_api_key="key", **updates)
 
 
-class FakeGLM:
-    def __init__(
-        self, content: str = "```python\ndef add(a, b):\n    return a + b\n```"
-    ):
-        self.content = content
-        self.messages = None
-
-    async def complete(self, messages, *, timeout_s):
-        self.messages = messages
-        return self.content
-
-    async def aclose(self):
-        return None
-
-
-class FailingGLM(FakeGLM):
-    async def complete(self, messages, *, timeout_s):
-        request = httpx.Request("POST", "https://provider.example/v4")
-        response = httpx.Response(429, request=request)
-        raise httpx.HTTPStatusError(
-            "quota unavailable",
-            request=request,
-            response=response,
-        )
-
-
-def demo_settings(**updates) -> DemoMinerSettings:
-    return DemoMinerSettings(
-        _env_file=None,
-        glm_api_key="test-key",
-        miner_require_validator_permit=True,
-        **updates,
+def task(hotkey="miner") -> MinerTaskRequest:
+    value = lease()
+    return MinerTaskRequest(
+        protocol_version=3,
+        challenge_id=value["challenge_id"],
+        task_id=value["task_id"],
+        identity=value["identity"],
+        workspace=value["workspace"],
+        workspace_url=value["workspace_url"],
+        expires_at=2**53 - 1,
+        slots=slot_set(hotkey=hotkey),
     )
 
 
-def test_extract_python_prefers_python_fence():
-    reply = "Text\n```json\n{}\n```\n```python\ndef f():\n    return 1\n```"
-    assert extract_python(reply) == "def f():\n    return 1"
-    assert extract_python("def f():\n    return 1") == "def f():\n    return 1"
+def test_prompt_and_submission_are_v3_shapes():
+    messages = build_model_messages(task())
+    assert "Git unified diff" in messages[0]["content"]
+    assert messages[1]["content"] == "Fix it"
+    assert extract_submission("```diff\n--- a/a\n+++ b/a\n```") == b"--- a/a\n+++ b/a\n"
+    assert extract_submission("```diff\n context line \n```") == b" context line \n"
+    assert extract_submission("```diff\n+value\r\n```") == b"+value\r\n"
 
 
-def test_model_prompt_contains_only_public_task_data():
-    request = TaskRequest(
-        problem_id="request-id",
-        language="python",
-        statement="Add two integers.",
-        entrypoint="add",
-        public_examples=[Case(args=[20, 22], expected=42)],
+def test_extracted_repository_patch_remains_git_applicable(tmp_path):
+    (tmp_path / "a.txt").write_text("old\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    patch = extract_submission(
+        "```diff\n"
+        "diff --git a/a.txt b/a.txt\n"
+        "--- a/a.txt\n"
+        "+++ b/a.txt\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+        "```"
     )
-    messages = build_model_messages(request)
-    rendered = json.dumps(messages)
+    completed = subprocess.run(
+        ["git", "apply", "--check", "-"],
+        cwd=tmp_path,
+        input=patch,
+        capture_output=True,
+    )
+    assert completed.returncode == 0, completed.stderr
 
-    assert "Add two integers." in rendered
-    assert "add" in rendered
-    assert "42" in rendered
-    assert "hidden" not in rendered.lower()
 
+async def test_provider_response_records_exact_bodies_and_five_alternatives():
+    token = {
+        "token": "x",
+        "bytes": [120],
+        "token_id": 7,
+        "logprob": -0.1,
+        "top_logprobs": [
+            {"token": value, "bytes": [ord(value)], "token_id": index, "logprob": -index}
+            for index, value in enumerate("abcde")
+        ],
+    }
 
-async def test_glm_client_uses_configured_chat_completion_contract():
-    captured = {}
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        captured["url"] = str(request.url)
-        captured["authorization"] = request.headers["authorization"]
-        captured["body"] = json.loads(request.content)
+    async def handler(request):
+        body = json.loads(request.content)
+        assert body["logprobs"] is True and body["top_logprobs"] == 5
         return httpx.Response(
             200,
-            json={
-                "choices": [
-                    {"message": {"content": "```python\ndef f(): return 1\n```"}}
-                ]
+            json={"choices": [{"finish_reason": "stop", "message": {"content": "x", "reasoning_content": "r"}, "logprobs": {"content": [token]}}]},
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = BedrockClient(
+        settings(bedrock_base_url="https://provider.invalid"), http=http
+    )
+    result = await client.complete([{"role": "user", "content": "x"}], timeout_s=10)
+    await http.aclose()
+    assert result.generated_bytes == b"x"
+    assert len(result.tokens[0]["top_logprobs"]) == 5
+    assert json.loads(result.request_body)["model"] == "moonshotai.kimi-k2.5"
+
+
+async def test_demo_uploads_submission_and_genuine_canonical_trajectory(monkeypatch):
+    completion = ModelCompletion(
+        request_body=b"{}",
+        response_body=b'{"ok":true}',
+        output="```diff\n\n```",
+        reasoning="No change is needed.",
+        generated_bytes=b"x",
+        tokens=[{
+            "token_bytes_b64": "eA==",
+            "token_id": None,
+            "logprob": 0,
+            "top_logprobs": [
+                {"token_bytes_b64": "eA==", "token_id": None, "logprob": 0}
+            ] * 5,
+        }],
+    )
+
+    class Provider:
+        async def complete(self, messages, *, timeout_s):
+            return completion
+
+        async def aclose(self):
+            return None
+
+    captured = {}
+
+    async def upload(_http, request, submission, trajectory, *, allowed_origins):
+        captured.update(submission=submission, trajectory=trajectory, origins=allowed_origins)
+        return MinerTaskResponse(
+            protocol_version=3,
+            challenge_id=request.challenge_id,
+            task_id=request.task_id,
+            response_type=request.identity.task_type,
+            submission={
+                "artifact_role": "patch",
+                "artifact_format": "unified_diff_v1",
+                "upload_id": request.slots.submission.upload_id,
+                "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "size_bytes": 0,
+            },
+            trajectory={
+                "artifact_role": "trajectory",
+                "artifact_format": "trajectory_v1",
+                "upload_id": request.slots.trajectory.upload_id,
+                "sha256": "1" * 64,
+                "size_bytes": len(trajectory),
             },
         )
 
-    settings = demo_settings(
-        glm_base_url="https://provider.example/v4",
-        glm_model="glm-5.2",
-        glm_reasoning_effort="max",
-    )
-    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    client = GLM52Client(settings, http=http)
-    content = await client.complete(
-        [{"role": "user", "content": "Implement f."}],
-        timeout_s=30.0,
-    )
-    await http.aclose()
-
-    assert content.startswith("```python")
-    assert captured["url"] == "https://provider.example/v4/chat/completions"
-    assert captured["authorization"] == "Bearer test-key"
-    assert captured["body"]["model"] == "glm-5.2"
-    assert captured["body"]["thinking"] == {"type": "enabled"}
-    assert captured["body"]["reasoning_effort"] == "max"
+    monkeypatch.setattr("rlvr.neurons.demo_miner.upload_miner_result", upload)
+    miner = DemoMiner(settings(), Provider(), wallet=WalletLike("miner"))
+    response = await miner.solve(task(), 30)
+    trajectory = parse_trajectory(captured["trajectory"])
+    assert response.response_type == "repository_patch_v1"
+    assert captured["submission"] == b""
+    assert trajectory.miner_hotkey == "miner"
+    assert trajectory.events[-1].submission_sha256 == trajectory.submission_sha256
 
 
-async def test_glm_client_requires_https():
-    settings = demo_settings(glm_base_url="http://provider.example/v4")
-    client = GLM52Client(settings)
+async def test_bedrock_client_requires_https():
+    client = BedrockClient(settings(bedrock_base_url="http://provider.invalid"))
     try:
         with pytest.raises(RuntimeError, match="HTTPS"):
             _ = client.completion_url
     finally:
         await client.aclose()
-
-
-def setup_roundtrip(*, permit: bool = True, request_limit: int = 1_000_000):
-    validator_address = "validator-test-address"
-    miner_address = "miner-test-address"
-    settings = demo_settings(miner_max_request_bytes=request_limit)
-    fake_glm = FakeGLM()
-    miner = DemoMiner(
-        settings,
-        fake_glm,  # type: ignore[arg-type]
-        wallet=WalletLike(miner_address),
-        metagraph=FakeMetagraph(validator_address, permit=permit),
-    )
-    app = build_demo_miner_app(miner)
-    http = httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app),
-        base_url="http://miner",
-    )
-
-    from rlvr.config import Settings
-
-    validator_settings = Settings(_env_file=None)
-    client = LiveSolverClient(
-        uid=0,
-        hotkey=miner_address,
-        url="http://miner",
-        wallet=WalletLike(validator_address),
-        settings=validator_settings,
-        http=http,
-    )
-    problem = Problem(
-        problem_id="canonical-problem-id",
-        language="python",
-        statement="Add two integers.",
-        entrypoint="add",
-        tests=[],
-        public_examples=[Case(args=[1, 2], expected=3)],
-    )
-    return http, client, problem, fake_glm
-
-
-async def test_signed_validator_to_demo_miner_roundtrip():
-    http, client, problem, fake_glm = setup_roundtrip()
-    try:
-        solution = await client.solve(problem, problem.statement)
-    finally:
-        await http.aclose()
-
-    assert solution.code == "def add(a, b):\n    return a + b"
-    assert fake_glm.messages[1]["content"].startswith("Add two integers.")
-
-
-async def test_provider_http_failure_returns_signed_zero_code(capsys):
-    validator_address = "validator-test-address"
-    miner_address = "miner-test-address"
-    miner = DemoMiner(
-        demo_settings(),
-        FailingGLM(),  # type: ignore[arg-type]
-        wallet=WalletLike(miner_address),
-        metagraph=FakeMetagraph(validator_address),
-    )
-    request = TaskRequest(
-        problem_id="request-id",
-        language="python",
-        statement="Implement f.",
-        entrypoint="f",
-    )
-
-    payload = await miner.solve(request, timeout_s=30.0)
-
-    assert payload.code == ""
-    assert payload.raw_response == "<model request failed>"
-    assert "HTTP 429" in capsys.readouterr().out
-
-
-async def test_demo_miner_rejects_unpermitted_validator():
-    http, client, problem, _fake_glm = setup_roundtrip(permit=False)
-    try:
-        solution = await client.solve(problem, problem.statement)
-    finally:
-        await http.aclose()
-
-    assert solution.code == ""
-    assert "HTTP 403" in solution.raw_response
-
-
-async def test_demo_miner_rejects_oversized_request():
-    http, client, problem, _fake_glm = setup_roundtrip(request_limit=16)
-    try:
-        solution = await client.solve(problem, problem.statement)
-    finally:
-        await http.aclose()
-
-    assert solution.code == ""
-    assert "HTTP 413" in solution.raw_response
-
-
-# --------------------------------------------------------------------------- #
-# Rust prompting and extraction (docs/RUST_CHALLENGES.md)
-# --------------------------------------------------------------------------- #
-def test_rust_task_prompts_for_a_complete_program():
-    from rlvr.neurons.demo_miner import RUST_SYSTEM_PROMPT
-
-    request = TaskRequest(
-        problem_id="p",
-        statement="Sum the integers on stdin.",
-        entrypoint="main",
-        language="rust",
-    )
-
-    messages = build_model_messages(request)
-
-    assert messages[0]["content"] == RUST_SYSTEM_PROMPT
-    assert "Rust" in RUST_SYSTEM_PROMPT
-    assert "standard input" in RUST_SYSTEM_PROMPT
-    # Program mode has no entrypoint concept for the model to target.
-    assert "Required function name" not in messages[1]["content"]
-
-
-def test_python_prompt_is_unchanged_when_language_is_omitted():
-    from rlvr.neurons.demo_miner import PYTHON_SYSTEM_PROMPT
-
-    request = TaskRequest(
-        problem_id="p",
-        statement="Return a + b.",
-        entrypoint="add",
-        language="python",
-    )
-
-    messages = build_model_messages(request)
-
-    assert messages[0]["content"] == PYTHON_SYSTEM_PROMPT
-    assert "Required function name: add" in messages[1]["content"]
-
-
-def test_rust_fence_is_preferred_over_other_fences():
-    from rlvr.neurons.demo_miner import extract_rust
-
-    both = "```python\nx = 1\n```\n\n```rust\nfn main() {}\n```"
-    assert extract_rust(both) == "fn main() {}"
-    assert extract_rust("```\nfn main() {}\n```") == "fn main() {}"
-    assert extract_python("```python\nx = 1\n```") == "x = 1"
