@@ -1,0 +1,1 @@
+"""Validator protocol V3."""

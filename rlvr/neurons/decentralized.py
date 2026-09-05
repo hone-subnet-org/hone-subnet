@@ -1,69 +1,36 @@
-"""V1 validator: private problem source, decentralized local evaluation.
-
-Validators obtain a public challenge, query miners, commit the miner-signed
-response bytes, reveal hidden tests, and only then execute/score locally. The
-private server has no grading, score, or weight API.
-"""
+"""V3 decentralized validator runtime."""
 
 from __future__ import annotations
 
 import asyncio
 import json
-import math
 import os
-import threading
-import time
-from dataclasses import dataclass
-from typing import Optional, cast
+from pathlib import Path
+from typing import Optional
 
 import httpx
 import numpy as np
 
 from ..config import Settings, get_settings
-from ..dataset.writer import RolloutWriter
-from ..execution import get_executor
-from ..orchestrator import Orchestrator, RotationSampler
 from ..policy import (
     LEGACY_SCORE_WINDOW_SECONDS,
     RELEASE_POLICY,
     ValidatorPolicy,
 )
-from ..problemserver.api import (
-    ChallengeFeedback,
-    FeedbackVerdict,
-    MinerSubmission,
-    PublicChallenge,
-    derive_request_id,
-)
 from ..problemserver.client import (
-    LeaseCategory,
-    ProblemServerClient,
     next_lease_not_before,
     require_secure_problem_url,
 )
-from ..protocol import SignedSolution
 from ..scoring.eval_engine import EvalEngine
-from ..scoring.verifier import Verifier
-from ..types import ChallengeResult, Problem, SolutionResponse, TestCase
-from .live import LiveSolverClient, SendGate, _solver_clients
+from ..v3.client import V3ProblemServerClient
+from ..v3.release import round_policy as v3_round_policy
+from ..v3.round import apply_round_scores, evaluate_round
+from .live import SendGate, _solver_clients
 from .validator import ValidatorNeuron
 
-_MINER_RESPONSE_GRACE_S = 10.0
-_SANDBOX_ERROR_PROBE_THRESHOLD = 0.25
 _WEIGHTS_RATE_LIMIT_MARGIN = 20
 _MAX_WEIGHT_DETAIL_CHARS = 200
 _MAX_WEIGHT_FIELD_CHARS = 80
-
-
-@dataclass
-class _CapturedSolver:
-    uid: int
-    hotkey: str
-    solution: SolutionResponse
-    responded: bool = False
-
-    async def solve(self, problem: Problem, prompt: str) -> SolutionResponse:
-        return self.solution
 
 
 def _weight_result_status(result: object) -> tuple[bool, str]:
@@ -484,427 +451,6 @@ def _save_scores(engine: EvalEngine, path: str) -> None:
         print(f"[validator] WARN: could not persist local scores ({e})")
 
 
-async def _dispatch_committed(
-    public: PublicChallenge,
-    solvers: list[LiveSolverClient],
-    concurrency: int,
-) -> tuple[list[MinerSubmission], list[_CapturedSolver]]:
-    public_problem = public.to_problem(tests=[])
-    sem = asyncio.Semaphore(max(1, concurrency))
-
-    async def one(solver: LiveSolverClient):
-        request_id = derive_request_id(public.challenge_id, solver.uid, solver.hotkey)
-        started = time.monotonic()
-        try:
-            async with sem:
-                # HTTPX's scalar timeout is a per-phase inactivity bound, not a
-                # whole-request deadline. A hostile miner can otherwise drip
-                # bytes forever without triggering it and stall the entire
-                # gather. This outer timeout bounds connect + solve + complete
-                # response-body consumption in wall-clock time.
-                artifact = await asyncio.wait_for(
-                    solver.solve_signed(public_problem, request_id),
-                    timeout=max(
-                        0.001,
-                        float(public.deadline_s) + _MINER_RESPONSE_GRACE_S,
-                    ),
-                )
-        except asyncio.TimeoutError:
-            artifact = SignedSolution(
-                error="<miner total response deadline exceeded>",
-                latency_ms=(time.monotonic() - started) * 1000.0,
-            )
-        submission = MinerSubmission(
-            uid=solver.uid,
-            hotkey=solver.hotkey,
-            request_id=request_id,
-            response_body=artifact.response_body,
-            response_headers=artifact.response_headers,
-            error=artifact.error,
-            latency_ms=artifact.latency_ms,
-        )
-        captured = _CapturedSolver(
-            uid=solver.uid,
-            hotkey=solver.hotkey,
-            solution=artifact.to_solution(public.problem_id),
-            responded=artifact.responded,
-        )
-        return submission, captured
-
-    pairs = await asyncio.gather(*(one(solver) for solver in solvers))
-    return [pair[0] for pair in pairs], [pair[1] for pair in pairs]
-
-
-def _dispatch_subset_size(
-    pool_size: int,
-    required: int,
-    fraction: float,
-) -> int:
-    """Choose a bounded sample, raising the default to commit quorum."""
-    if pool_size <= 0:
-        return 0
-    requested = math.ceil(pool_size * fraction)
-    return min(pool_size, max(1, required, requested))
-
-
-_RUST_READINESS_LOCK = threading.Lock()
-_RUST_READINESS: Optional[bool] = None
-
-
-def _host_memory_bytes() -> int:
-    try:
-        with open("/proc/meminfo", encoding="utf-8") as meminfo:
-            for line in meminfo:
-                if line.startswith("MemTotal:"):
-                    return int(line.split()[1]) * 1024
-    except (OSError, ValueError, IndexError):
-        pass
-    return 0
-
-
-def _rust_verify_concurrency(settings: Settings) -> int:
-    units = {"k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}
-    memory = RELEASE_POLICY.rust_memory.strip().lower()
-    multiplier = units.get(memory[-1], 1)
-    amount = memory[:-1] if memory[-1] in units else memory
-    container_bytes = max(1, int(float(amount) * multiplier))
-    available = max(0, _host_memory_bytes() - 2 * 1024**3)
-    memory_slots = max(1, available // container_bytes)
-    return min(max(1, settings.validator_verify_concurrency), memory_slots)
-
-
-def _rust_ready(settings: Settings) -> bool:
-    """Run one real, process-cached canary against the pinned Rust image."""
-
-    global _RUST_READINESS
-    if settings.executor != "docker":
-        return False
-    with _RUST_READINESS_LOCK:
-        if _RUST_READINESS is not None:
-            return _RUST_READINESS
-        try:
-            from ..execution.executor import get_executor
-
-            executor = get_executor(settings, language="rust")
-            canary = executor.run_tests(
-                'fn main() { println!("ready"); }',
-                "main",
-                [TestCase(args=[""], kwargs={}, expected="ready\n")],
-                timeout_s=2.0,
-            )
-            _RUST_READINESS = (
-                len(canary) == 1
-                and canary[0].passed
-                and canary[0].error is None
-            )
-        except Exception as error:  # noqa: BLE001 - readiness fails closed
-            print(
-                "[validator] WARN: Rust sandbox readiness failed for "
-                f"{RELEASE_POLICY.rust_image} ({type(error).__name__}: {error})"
-            )
-            _RUST_READINESS = False
-        if not _RUST_READINESS:
-            print(
-                "[validator] WARN: Rust sandbox is not ready for "
-                f"{RELEASE_POLICY.rust_image}; Rust dispatch is disabled"
-            )
-        return _RUST_READINESS
-
-
-async def _evaluate_one(
-    client: ProblemServerClient,
-    orchestrator: Orchestrator,
-    rotation: RotationSampler,
-    solvers: list[LiveSolverClient],
-    settings: Settings,
-    quorum_hint: Optional[dict[str, int]] = None,
-    pacing: Optional[dict[str, object]] = None,
-    now: Optional[float] = None,
-    policy: ValidatorPolicy = RELEASE_POLICY,
-) -> Optional[ChallengeResult]:
-    # A lease BURNS the problem server-side (durable FIFO cursor), so refuse to
-    # lease when the last-seen quorum requirement already rules this round out.
-    # The requirement only travels with a lease, so the first-ever under-quorum
-    # round still burns one problem; every later one is skipped for free.
-    if quorum_hint is not None:
-        known_required = int(quorum_hint.get("required", 0))
-        if known_required > 0 and len(solvers) < known_required:
-            print(
-                f"[validator] WARN: only {len(solvers)} miners serving but "
-                f"challenges require {known_required} committed responses; "
-                "skipping lease to avoid burning a problem"
-            )
-            return None
-    outcome = await client.lease()
-    public = outcome.challenge
-    if public is None:
-        if outcome.category is LeaseCategory.PACED and pacing is not None:
-            pacing["paced"] = True
-            if outcome.retry_after_s is not None:
-                pacing["not_before"] = next_lease_not_before(
-                    outcome.retry_after_s,
-                    now=now,
-                )
-        # An exhausted pool, a paced lease, a rejected validator and an
-        # unreachable server all used to print the same line; each is a
-        # different operator action, so each says so.
-        print(f"[validator] WARN: no public challenge ({outcome.describe()})")
-        return None
-    if public.language == "rust":
-        from ..problemserver.rust_validation import validate_rust_tests
-
-        try:
-            if settings.executor != "docker" or not _rust_ready(settings):
-                raise ValueError("Rust sandbox is not ready")
-            if public.entrypoint != "main":
-                raise ValueError("Rust entrypoint must be main")
-            validate_rust_tests(public.public_examples, require_nonempty=False)
-        except ValueError as error:
-            print(f"[validator] WARN: invalid Rust challenge; abandoning ({error})")
-            return None
-    required = max(
-        public.commit_min_responses, public.commit_min_signed_responses
-    )
-    if quorum_hint is not None:
-        quorum_hint["required"] = required
-    if len(solvers) < required:
-        print(
-            f"[validator] WARN: challenge requires {required} committed miner "
-            f"responses but only {len(solvers)} miners are serving"
-        )
-        return None
-    subset_k = _dispatch_subset_size(
-        len(solvers),
-        required,
-        policy.dispatch_fraction,
-    )
-    subset = cast(
-        list[LiveSolverClient],
-        rotation.sample(solvers, subset_k),
-    )
-    if not subset:
-        return None
-
-    submissions, captured = await _dispatch_committed(
-        public, subset, settings.validator_dispatch_concurrency
-    )
-    responded = sum(
-        bool(
-            getattr(
-                solution,
-                "responded",
-                not getattr(submission, "error", ""),
-            )
-        )
-        for submission, solution in zip(submissions, captured, strict=True)
-    )
-    signed = sum(
-        bool(getattr(submission, "response_headers", {}))
-        for submission in submissions
-    )
-    print(
-        "[validator] miner response counts "
-        f"contacted={len(subset)} responses={responded} signed={signed}"
-    )
-    receipt = await client.commit(public.challenge_id, submissions)
-    if receipt is not None and not receipt.accepted:
-        print(f"[validator] WARN: response commit rejected ({receipt.detail})")
-        return None
-    if receipt is None:
-        print("[validator] WARN: response commit failed (server unavailable)")
-        return None
-    if not receipt.commit_token:
-        print("[validator] WARN: accepted response commit omitted its token")
-        return None
-    if receipt.num_submissions != len(submissions):
-        print(
-            "[validator] WARN: accepted response commit protocol error "
-            f"(receipt count {receipt.num_submissions}, sent {len(submissions)})"
-        )
-        return None
-
-    reveal = await client.reveal(public.challenge_id, receipt.commit_token)
-    if reveal is None or reveal.challenge_id != public.challenge_id:
-        print("[validator] WARN: hidden-test reveal failed")
-        return None
-    if not reveal.tests:
-        print("[validator] WARN: challenge revealed no tests; refusing to score")
-        return None
-    if reveal.language != public.language:
-        print("[validator] WARN: lease/reveal language mismatch; abandoning")
-        return None
-    if public.language == "rust":
-        try:
-            validate_rust_tests(reveal.tests)
-        except ValueError as error:
-            print(f"[validator] WARN: invalid Rust reveal; abandoning ({error})")
-            return None
-
-    problem = public.to_problem(reveal.tests)
-    verify_concurrency = settings.validator_verify_concurrency
-    if public.language == "rust":
-        verify_concurrency = _rust_verify_concurrency(settings)
-    result = await orchestrator.evaluate(
-        problem,
-        captured,
-        # Verification concurrency, NOT the HTTP fan-out width: each permit
-        # holds a sandbox (subprocess/Docker) verification slot.
-        asyncio.Semaphore(max(1, verify_concurrency)),
-    )
-    sandbox_error_rate = _sandbox_error_rate(result)
-    if sandbox_error_rate > 0.0:
-        print(
-            "[validator] WARN: sandbox-error rate "
-            f"{sandbox_error_rate:.1%} for challenge {public.challenge_id}"
-        )
-    if sandbox_error_rate >= _SANDBOX_ERROR_PROBE_THRESHOLD:
-        sandbox_healthy = await asyncio.to_thread(
-            _sandbox_healthcheck, orchestrator, public.language
-        )
-        if not sandbox_healthy:
-            if public.language == "rust":
-                global _RUST_READINESS
-                with _RUST_READINESS_LOCK:
-                    _RUST_READINESS = False
-            print(
-                "[validator] ERROR: independent sandbox health probe failed; "
-                "discarding challenge without updating scores"
-            )
-            return None
-        print(
-            "[validator] WARN: independent sandbox health probe passed; "
-            "retaining candidate failures"
-        )
-    orchestrator.score_and_export(
-        problem,
-        result,
-        active_uids={solver.uid for solver in solvers},
-    )
-    outcomes_by_registration = {
-        (outcome.uid, outcome.hotkey): outcome for outcome in result.outcomes
-    }
-    verdicts = []
-    for submission, captured_solver in zip(submissions, captured, strict=True):
-        # A verdict means an authenticated response was actually graded. HTTP
-        # errors, timeouts, and invalid signatures remain committed attempts
-        # for response-rate accounting, but are not mislabeled as wrong answers.
-        if submission.error or not submission.response_headers:
-            continue
-        graded = outcomes_by_registration.get(
-            (captured_solver.uid, captured_solver.hotkey)
-        )
-        if graded is None:
-            continue
-        verdicts.append(
-            FeedbackVerdict(
-                uid=graded.uid,
-                hotkey=graded.hotkey,
-                passed=graded.verification.all_passed,
-            )
-        )
-    await client.feedback(
-        ChallengeFeedback(
-            challenge_id=public.challenge_id,
-            pass_rate=result.pass_rate,
-            band=result.band,
-            num_responses=result.num_responses,
-            dup_ratio=result.dup_ratio,
-            verdicts=verdicts,
-        )
-    )
-    return result
-
-
-async def _run_challenge_round(
-    validator: ValidatorNeuron,
-    client: ProblemServerClient,
-    orchestrator: Orchestrator,
-    rotation: RotationSampler,
-    solvers: list[LiveSolverClient],
-    settings: Settings,
-    *,
-    quorum_hint: Optional[dict[str, int]] = None,
-    now: Optional[float] = None,
-    policy: ValidatorPolicy = RELEASE_POLICY,
-) -> int:
-    """Evaluate configured challenges, stopping immediately on lease pacing."""
-    completed = 0
-    for _ in range(policy.challenges_per_round):
-        pacing: dict[str, object] = {}
-        result = await _evaluate_one(
-            client,
-            orchestrator,
-            rotation,
-            solvers,
-            settings,
-            quorum_hint=quorum_hint,
-            pacing=pacing,
-            now=now,
-            policy=policy,
-        )
-        completed += int(result is not None)
-        if pacing.get("paced"):
-            not_before = pacing.get("not_before")
-            if isinstance(not_before, (int, float)):
-                validator.defer_rounds_until(float(not_before))
-            break
-    return completed
-
-
-def _sandbox_error_rate(result: ChallengeResult) -> float:
-    """Fraction of outcomes that may reflect a validator sandbox failure."""
-    if not result.outcomes:
-        return 0.0
-    suspected = 0
-    for outcome in result.outcomes:
-        compile_error = outcome.verification.compile_error or ""
-        execution_errors = outcome.verification.results
-        if compile_error.startswith("VERIFY_ERROR:") or any(
-            item.error_kind == "sandbox_error" for item in execution_errors
-        ):
-            suspected += 1
-    return suspected / len(result.outcomes)
-
-
-def _sandbox_healthcheck(orchestrator: Orchestrator, language: str) -> bool:
-    """Verify trusted code through the full verifier and sandbox path."""
-    try:
-        if language == "rust":
-            entrypoint = "main"
-            tests = [TestCase(args=[""], expected="7\n")]
-            code = 'fn main() { println!("7"); }'
-        else:
-            entrypoint = "__rlvr_sandbox_healthcheck__"
-            tests = [TestCase(args=[7], expected=7)]
-            code = "def __rlvr_sandbox_healthcheck__(value):\n    return value\n"
-        problem = Problem(
-            problem_id="__rlvr_sandbox_healthcheck__",
-            language=language,
-            statement="Sandbox health check.",
-            entrypoint=entrypoint,
-            tests=tests,
-        )
-        verification = orchestrator.verifier.verify(
-            problem,
-            SolutionResponse(
-                problem_id=problem.problem_id,
-                code=code,
-            ),
-        )
-    except Exception as exc:  # noqa: BLE001 - a failed probe is the signal
-        print(f"[validator] ERROR: sandbox health probe raised ({exc})")
-        return False
-    return (
-        verification.all_passed
-        and verification.num_tests == 1
-        and verification.num_passed == 1
-        and verification.compile_error is None
-        and len(verification.results) == 1
-        and verification.results[0].passed
-        and verification.results[0].error is None
-    )
-
-
 async def _run_decentralized_validator_async(settings: Settings) -> None:
     require_secure_problem_url(
         settings.problem_server_url,
@@ -922,27 +468,20 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
         decay=policy.decay_nonresponders,
     )
     _load_scores(engine, settings.validator_score_state_file)
-    verifier = Verifier(
-        get_executor(settings, language="python"), settings, policy=policy
+    grading_policy = v3_round_policy(
+        policy, dispatch_concurrency=settings.validator_dispatch_concurrency
     )
-    writer = RolloutWriter(settings.dataset_dir)
-    # This path only evaluates challenges returned by the private service.
-    orchestrator = Orchestrator(verifier, engine, writer, settings, policy=policy)
-    rotation = RotationSampler()
+    state_dir = Path(settings.validator_score_state_file).parent
 
     async with httpx.AsyncClient(limits=_validator_http_limits(settings)) as http:
-        client = ProblemServerClient(
+        client = V3ProblemServerClient(
             settings.problem_server_url,
             validator.wallet,
             http,
             allow_insecure_http=settings.problem_server_allow_insecure_http,
             timeout_s=settings.problem_server_request_timeout_s,
-            max_response_bytes=policy.problem_response_read_bytes,
+            max_response_bytes=policy.v3_problem_response_read_bytes,
         )
-
-        # Last-seen challenge quorum requirement; survives across rounds so an
-        # under-quorum pool stops burning leases after the first observation.
-        quorum_hint: dict[str, int] = {}
         dispatch_policy_logged = False
         send_gate = SendGate(settings.validator_send_concurrency)
 
@@ -955,29 +494,32 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
             if not live_solvers:
                 return {}
             if not dispatch_policy_logged:
-                base_sample = _dispatch_subset_size(
-                    len(live_solvers),
-                    required=0,
-                    fraction=policy.dispatch_fraction,
-                )
-                rule = f"release fraction={policy.dispatch_fraction:g}"
                 print(
-                    "[validator] dispatch policy "
-                    f"sample={base_sample}/{len(live_solvers)} ({rule}); "
-                    "challenge quorum may raise the sample"
+                    "[validator] V3 dispatch uses the server-assigned slot pool; "
+                    f"serving miners={len(live_solvers)}"
                 )
                 dispatch_policy_logged = True
-
-            completed = await _run_challenge_round(
-                v,
+            result = await evaluate_round(
                 client,
-                orchestrator,
-                rotation,
+                http,
                 live_solvers,
-                settings,
-                quorum_hint=quorum_hint,
-                policy=policy,
+                grading_policy,
+                cache_dir=state_dir / "v3-workspace-cache",
+                work_dir=state_dir / "v3-rounds",
             )
+            completed = int(result.status == "completed")
+            if result.status == "completed":
+                apply_round_scores(
+                    result,
+                    engine,
+                    active_hotkeys={solver.uid: solver.hotkey for solver in live_solvers},
+                    speed_half_life_ms=policy.payment_speed_half_life_ms,
+                    speed_floor=policy.payment_speed_floor,
+                )
+            elif result.status == "unavailable" and result.retry_after_s is not None:
+                v.defer_rounds_until(next_lease_not_before(result.retry_after_s))
+            elif result.status == "abandoned":
+                print(f"[validator] WARN: V3 round abandoned ({result.reason})")
             _save_scores(engine, settings.validator_score_state_file)
             print(f"[validator] locally evaluated {completed} challenges")
             return {uid: float(score) for uid, score in enumerate(engine.scores)}
@@ -1003,5 +545,5 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
 def run_decentralized_validator(settings: Optional[Settings] = None) -> None:
     settings = settings or get_settings()
     if not settings.problem_server_url:
-        raise SystemExit("V1 decentralized evaluation requires PROBLEM_SERVER_URL")
+        raise SystemExit("V3 decentralized evaluation requires PROBLEM_SERVER_URL")
     asyncio.run(_run_decentralized_validator_async(settings))
