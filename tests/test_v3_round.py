@@ -9,6 +9,7 @@ import stat
 import httpx
 import pytest
 
+from rlvr.scoring.eval_engine import EvalEngine
 from rlvr.v3.api import (
     EPISTULA_HEADERS,
     ChallengeFeedbackRequest,
@@ -26,16 +27,15 @@ from rlvr.v3.grading import EvaluationResult
 from rlvr.v3.identity import compute_task_id
 from rlvr.v3.patch import PatchLimits
 from rlvr.v3.round import (
+    MinerEvaluation,
     RoundPolicy,
     RoundResult,
-    MinerEvaluation,
-    _send_diagnostic_feedback,
     _remove_tree,
+    _send_diagnostic_feedback,
     apply_round_scores,
     compute_round_payments,
     evaluate_round,
 )
-from rlvr.scoring.eval_engine import EvalEngine
 from rlvr.v3.script import ScriptLimits
 from rlvr.v3.submission import SubmissionLimits
 from rlvr.v3.supervisor import SupervisorPolicy
@@ -214,8 +214,9 @@ def policy(tmp_path):
 
 
 @pytest.mark.parametrize("submission_download_fails", [False, True])
+@pytest.mark.parametrize("checker_times_out", [False, True])
 def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
-    tmp_path, monkeypatch, submission_download_fails
+    tmp_path, monkeypatch, submission_download_fails, checker_times_out
 ):
     workspace_tar = make_tar([("repo", "dir", b"", 0o755), ("repo/a.txt", "file", b"a", 0o644)])
     workspace_blob = compress(workspace_tar)
@@ -235,6 +236,7 @@ def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
     }
     verifier_tar = make_tar([
         ("manifest.json", "file", json.dumps(manifest).encode(), 0o644),
+        ("checks", "dir", b"", 0o755),
         ("gold", "dir", b"", 0o755),
         ("gold/out", "file", b"", 0o644),
     ])
@@ -320,6 +322,21 @@ def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
         if patch == b"pass":
             return EvaluationResult("passed", "", (), None)
         if patch == b"fail":
+            if checker_times_out:
+                from rlvr.v3.grading import _run_checks
+                from rlvr.v3.supervisor import ContainerResult
+
+                monkeypatch.setattr(
+                    "rlvr.v3.grading.run_container",
+                    lambda *_args: ContainerResult(124, False, True, b"", b"", False, False),
+                )
+                _, manifest, verifier, supervisor, tree, _, docker, prefix = args
+                return _run_checks(
+                    workspace=workspace, host_work_base=workspace, result_tree=workspace,
+                    work_base="/work", manifest=manifest, verifier_dir=verifier,
+                    supervisor_policy=supervisor, tree_limits=tree, docker_binary=docker,
+                    run_prefix=prefix, script_exit_code=None,
+                )
             return EvaluationResult("failed", "tests failed", (), None)
         return EvaluationResult("rejected", "patch was rejected", (), None)
 

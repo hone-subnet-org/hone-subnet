@@ -24,12 +24,21 @@ rejection → rejected; setup/check/tree/resource failure → failed.
 
 from __future__ import annotations
 
+import shutil
 import stat
 from pathlib import Path
 
 import pytest
 
-from tests.test_v3_manifest import build_dir, expect, inspection, invocation, parse, repo_manifest, term_manifest
+from tests.test_v3_manifest import (
+    build_dir,
+    expect,
+    inspection,
+    invocation,
+    parse,
+    repo_manifest,
+    term_manifest,
+)
 from tests.test_v3_patch import MODIFY, git_version, make_workspace
 from tests.test_v3_supervisor import policy
 
@@ -332,10 +341,10 @@ def test_missing_trusted_inspection_executable_abandons_round(tmp_path, runner, 
         result(stderr_overflow=True),
     ],
 )
-def test_trusted_inspection_resource_failure_abandons_round(tmp_path, runner, failure):
+def test_trusted_inspection_resource_failure_only_fails_candidate(tmp_path, runner, failure):
     runner.responses = [result(), result(), failure]
     verdict = eval_repo(tmp_path, runner)
-    assert verdict.status == "abandoned"
+    assert verdict.status == "failed"
     assert [check.outcome for check in verdict.checks] == ["passed", "failed"]
 
 
@@ -448,3 +457,72 @@ def test_terminal_supervisor_fault_is_abandoned(tmp_path, runner):
     verdict = eval_term(tmp_path, runner)
     assert (verdict.status, verdict.script_exit_code, [c.outcome for c in verdict.checks]) == (
         "abandoned", None, ["skipped", "skipped"])
+
+
+@pytest.mark.parametrize("stage", ["script", "invocation", "setup"])
+def test_terminal_rejects_replaced_result_ancestor_without_touching_host(
+    tmp_path, runner, stage
+):
+    from tests.test_v3_manifest import SETUP
+
+    checks = [invocation("invoke"), inspection()] if stage == "invocation" else [inspection()]
+    doc = term_manifest(setup=SETUP if stage == "setup" else None, checks=checks)
+    env, verifier, manifest = term_setup(tmp_path, doc)
+    (env / "nested" / "out").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    (outside / "out").mkdir(parents=True)
+    private = outside / "out" / "private"
+    private.write_bytes(b"private fixture")
+    private.chmod(0o600)
+
+    def replace_ancestor(request):
+        shutil.rmtree(env / "nested")
+        (env / "nested").symlink_to(outside, target_is_directory=True)
+        return result()
+
+    runner.responses = ([result()] if stage == "invocation" else []) + [replace_ancestor]
+    verdict = _mod().evaluate_terminal(
+        env, b"true\n", term_identity("nested/out"), manifest, verifier,
+        policy(), tree_limits(), script_limits(), "/usr/bin/docker", RUN,
+    )
+    assert verdict.status == "failed"
+    assert len(runner.requests) == (2 if stage == "invocation" else 1)
+    assert all(not request.trusted for request in runner.requests)
+    assert stat.S_IMODE(private.stat().st_mode) == 0o600
+    assert private.read_bytes() == b"private fixture"
+
+
+def test_terminal_setup_runs_before_script_in_result_directory(tmp_path, runner):
+    from tests.test_v3_manifest import SETUP
+
+    def prepare(request):
+        (tmp_path / "env" / "out" / "prepared").write_bytes(b"ready")
+        return result()
+
+    def script(request):
+        assert (tmp_path / "env" / "out" / "prepared").read_bytes() == b"ready"
+        return result()
+
+    runner.responses = [prepare, script]
+    verdict = eval_term(tmp_path, runner, term_manifest(setup=SETUP))
+    assert verdict.status == "passed"
+    setup = runner.requests[0]
+    assert setup.name == f"{RUN}-setup" and setup.cwd == "/work/out"
+    assert setup.argv == tuple(SETUP["argv"])
+    assert not setup.trusted and mounts(setup) == {"/work": (tmp_path / "env", False)}
+    assert runner.requests[1].name == f"{RUN}-script"
+
+
+@pytest.mark.parametrize("failure,status", [
+    (result(exit_code=1), "failed"),
+    (result(timed_out=True), "failed"),
+    (_sup().SupervisorError("offline"), "abandoned"),
+])
+def test_terminal_setup_failure_stops_before_script(tmp_path, runner, failure, status):
+    from tests.test_v3_manifest import SETUP
+
+    runner.responses = [failure]
+    verdict = eval_term(tmp_path, runner, term_manifest(setup=SETUP))
+    assert verdict.status == status and verdict.script_exit_code is None
+    assert [check.outcome for check in verdict.checks] == ["skipped", "skipped"]
+    assert [request.name for request in runner.requests] == [f"{RUN}-setup"]

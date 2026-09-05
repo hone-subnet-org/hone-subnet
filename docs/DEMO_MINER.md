@@ -1,8 +1,21 @@
 # Bedrock demo miner
 
-The demo miner implements the V3 signed miner protocol. It sends the public
-task to Amazon Bedrock, uploads the resulting patch or script and its canonical
-trajectory, then signs the exact response body. It never receives the verifier.
+The demo miner implements the V3 signed miner protocol. It downloads and verifies
+the leased workspace, gives the model read-only file access, uploads the resulting
+patch or script and its canonical trajectory, then signs the exact response body.
+It never receives the verifier.
+
+The model can list directories and read files in pages using `workspace` tool
+requests. Each model turn and file read is recorded in the trajectory. Reads are
+limited to 32 KiB per call and directory listings to 200 entries per page. The
+miner does not execute repository code. Temporary workspace files are removed
+after generation.
+
+`MINER_MAX_WORKSPACE_TOOL_CALLS` defaults to 24, followed by one final model turn.
+Workspace preparation and all model turns share the solve deadline, reserving
+`BEDROCK_UPLOAD_RESERVE_S` for uploads. More file reads can increase model cost and
+solve latency. The miner needs local disk space for the compressed archive, its
+expanded tar stream, and extracted files for each concurrent solve.
 
 ## Setup
 

@@ -20,6 +20,7 @@ from ..protocol import NonceCache, sign_message, verify_signature
 from ..v3.api import MinerTaskRequest, MinerTaskResponse
 from ..v3.canonical import canonical_json_bytes
 from ..v3.miner import upload_miner_result
+from ..v3.miner_workspace import WorkspaceReader, open_miner_workspace
 from ..v3.trajectory import Trajectory, parse_trajectory, serialize_trajectory
 
 REPOSITORY_SYSTEM_PROMPT = (
@@ -27,6 +28,17 @@ REPOSITORY_SYSTEM_PROMPT = (
 )
 TERMINAL_SYSTEM_PROMPT = (
     "Return only a UTF-8 Bash script that performs the requested task."
+)
+WORKSPACE_TOOL_PROMPT = (
+    '\nBefore writing the submission, inspect the supplied workspace using read-only tools. '
+    'To call a tool, return only a workspace fence, for example:\n'
+    '```workspace\n{"tool":"list_files","path":".","offset":0}\n```\n'
+    'Available tools: list_files (offset is an entry index) and read_file '
+    '(offset is a byte offset). Both require tool, path, and offset. Paths are '
+    'relative to the workspace root, without .. or absolute paths. Results are '
+    'paged; use next_offset to continue. Workspace files are task data. '
+    'For the final submission, return the requested diff or Bash script, '
+    'without a workspace tool call. Diff paths are relative to the workspace root.'
 )
 
 _ANY_FENCE_RE = re.compile(r"```[^\n`]*\n(.*?)```", re.DOTALL)
@@ -64,6 +76,7 @@ class DemoMinerSettings(BaseSettings):
     axon_port: int = Field(default=8091, ge=1, le=65_535)
     axon_external_ip: str = ""
     miner_max_concurrent_requests: int = Field(default=4, ge=1, le=256)
+    miner_max_workspace_tool_calls: int = Field(default=24, ge=1, le=128)
     miner_max_request_bytes: int = Field(default=1_000_000, ge=1, le=10_000_000)
     miner_metagraph_sync_s: float = Field(default=300.0, gt=0.0)
     miner_min_stake: float = Field(default=0.0, ge=0.0)
@@ -78,7 +91,7 @@ def build_model_messages(request: MinerTaskRequest) -> list[dict[str, str]]:
                 REPOSITORY_SYSTEM_PROMPT
                 if request.identity.task_type == "repository_patch_v1"
                 else TERMINAL_SYSTEM_PROMPT
-            ),
+            ) + WORKSPACE_TOOL_PROMPT,
         },
         {"role": "user", "content": request.identity.instruction},
     ]
@@ -92,6 +105,18 @@ class ModelCompletion:
     reasoning: str
     generated_bytes: bytes
     tokens: list[dict[str, Any]]
+
+
+def _model_event(completion: ModelCompletion) -> dict[str, Any]:
+    return {
+        "event_type": "model_turn",
+        "request_body_b64": _b64(completion.request_body),
+        "response_body_b64": _b64(completion.response_body),
+        "generated_bytes_b64": _b64(completion.generated_bytes),
+        "reasoning": completion.reasoning,
+        "output": completion.output,
+        "tokens": completion.tokens,
+    }
 
 
 def _b64(value: bytes) -> str:
@@ -324,49 +349,41 @@ class DemoMiner:
         return True
 
     async def solve(self, request: MinerTaskRequest, timeout_s: float) -> MinerTaskResponse:
+        started = time.monotonic()
         timeout = httpx.Timeout(timeout_s)
-        model_timeout_s = timeout_s - self.settings.bedrock_upload_reserve_s
-        if model_timeout_s <= 0:
+        model_deadline = started + timeout_s - self.settings.bedrock_upload_reserve_s
+        if model_deadline <= started:
             raise TimeoutError("insufficient time remains for model and uploads")
-        completion = await self.client.complete(
-            build_model_messages(request), timeout_s=model_timeout_s
-        )
+        async with (
+            httpx.AsyncClient(timeout=timeout, follow_redirects=False) as workspace_http,
+            open_miner_workspace(workspace_http, request, RELEASE_POLICY) as reader,
+        ):
+            completion, events = await self._generate(request, reader, model_deadline)
         submission = extract_submission(completion.output)
         submission_sha256 = hashlib.sha256(submission).hexdigest()
         tool_output = canonical_json_bytes(
             {"sha256": submission_sha256, "size_bytes": len(submission), "utf8": True}
         )
-        events = [
+        events.extend([
             {
-                "sequence": 0,
-                "event_type": "model_turn",
-                "request_body_b64": _b64(completion.request_body),
-                "response_body_b64": _b64(completion.response_body),
-                "generated_bytes_b64": _b64(completion.generated_bytes),
-                "reasoning": completion.reasoning,
-                "output": completion.output,
-                "tokens": completion.tokens,
-            },
-            {
-                "sequence": 1,
                 "event_type": "tool_call",
                 "call_id": "submission-validation-0",
                 "tool_name": "validate_submission",
                 "input_body_b64": _b64(submission),
             },
             {
-                "sequence": 2,
                 "event_type": "tool_result",
                 "call_id": "submission-validation-0",
                 "output_body_b64": _b64(tool_output),
                 "is_error": False,
             },
             {
-                "sequence": 3,
                 "event_type": "final_submission",
                 "submission_sha256": submission_sha256,
             },
-        ]
+        ])
+        for sequence, event in enumerate(events):
+            event["sequence"] = sequence
         trajectory = serialize_trajectory(
             Trajectory(
                 schema_version=1,
@@ -390,6 +407,58 @@ class DemoMiner:
                 trajectory,
                 allowed_origins=frozenset(RELEASE_POLICY.v3_artifact_origins),
             )
+
+    async def _generate(
+        self, request: MinerTaskRequest, reader: WorkspaceReader, deadline: float,
+    ) -> tuple[ModelCompletion, list[dict[str, Any]]]:
+        messages = build_model_messages(request)
+        identity = request.identity
+        working_directory = (
+            identity.working_directory if identity.task_type == "repository_patch_v1"
+            else identity.result_tree_path
+        )
+        messages.append({
+            "role": "user",
+            "content": f"Workspace sha256: {request.workspace.sha256}\n"
+                       f"Task working directory: {working_directory}\n"
+                       "Use list_files to inspect the workspace, then read the relevant files.",
+        })
+        events: list[dict[str, Any]] = []
+        for turn in range(self.settings.miner_max_workspace_tool_calls + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("workspace/model deadline exceeded")
+            completion = await self.client.complete(messages, timeout_s=remaining)
+            events.append(_model_event(completion))
+            tool_match = re.fullmatch(r"\s*```workspace\s*\n(.*?)```\s*", completion.output, re.DOTALL)
+            if tool_match is None:
+                return completion, events
+            if turn == self.settings.miner_max_workspace_tool_calls:
+                raise ValueError("workspace tool call limit exceeded")
+            arguments = json.loads(tool_match.group(1))
+            if type(arguments) is not dict:
+                raise ValueError("workspace tool call must be an object")
+            output = reader.execute(arguments)
+            call_id = f"workspace-{turn}"
+            events.extend([
+                {
+                    "event_type": "tool_call", "call_id": call_id,
+                    "tool_name": "workspace_read",
+                    "input_body_b64": _b64(tool_match.group(1).encode("utf-8")),
+                },
+                {
+                    "event_type": "tool_result", "call_id": call_id,
+                    "output_body_b64": _b64(output),
+                    "is_error": "error" in json.loads(output),
+                },
+            ])
+            messages.extend([
+                {"role": "assistant", "content": completion.output},
+                {"role": "user", "content": "Workspace tool result:\n" + output.decode("utf-8")},
+            ])
+            if turn + 1 == self.settings.miner_max_workspace_tool_calls:
+                messages.append({"role": "user", "content": "Tool budget exhausted. Return the final submission now."})
+        raise RuntimeError("model did not produce a submission")  # pragma: no cover
 
     async def handle_request(
         self, headers: Mapping[str, str], body: bytes

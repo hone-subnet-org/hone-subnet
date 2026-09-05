@@ -6,6 +6,8 @@ The validator leases an immutable workspace and upload slots, verifies the works
 
 Repository submissions are UTF-8 Git unified diffs. Terminal submissions are UTF-8 Bash scripts. Each accepted submission is graded in a clean copy of the leased workspace with network access disabled. A passing submission must satisfy every verifier check; all other candidate outcomes receive zero.
 
+An optional manifest setup step runs after applying a repository patch, or before running a terminal script. Terminal setup uses the result directory as its working directory. Result paths are checked again after candidate execution, including every ancestor of a nested result directory.
+
 Trajectories use the strict `trajectory_v1` JCS JSON schema and bind the recorded model and tool events to the uploaded submission hash.
 V3 does not write the legacy local rollout shards.
 
@@ -16,6 +18,7 @@ Artifact hashes, compressed sizes, and decompressed tar-stream sizes are checked
 Candidate containers have fixed CPU, memory, process, time, output, temporary-directory, and single-file limits. The validator also checks available disk space before materializing each workspace, enforces a total-tree limit after candidate execution, and removes each miner workspace immediately after grading. The total workspace limit is advisory on ordinary Linux filesystems because portable non-root per-directory disk quotas are unavailable.
 
 Whole-round infrastructure or protocol failures do not update scores. Miner-specific upload, patch, build, test, timeout, or output failures affect only that miner.
+This includes timeout, memory, and output limits reached by a trusted inspection while processing a candidate's result. Missing trusted executables and container control failures remain infrastructure failures. This classification adds no container runs.
 
 After a completed round, the validator reports binary verdicts and grading durations for submission grants. This feedback is diagnostic and does not affect scores or weights.
 

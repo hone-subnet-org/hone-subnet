@@ -123,6 +123,16 @@ def _task_directory(root: Path, relative: str) -> Path | None:
         return None
 
 
+def _inspect_result_tree(workspace: Path, result_tree: Path, limits: TreeLimits) -> None:
+    # Candidate processes have stopped, but may have replaced any ancestor of
+    # a nested result tree. Check from the immutable mount root before chmod
+    # or a trusted bind mount can follow those ancestors on the host.
+    relative = result_tree.relative_to(workspace).as_posix()
+    if _task_directory(workspace, relative) is None:
+        raise TreeError("result tree path is unavailable or unsafe")
+    inspect_tree(result_tree, limits=limits, normalize_modes=True)
+
+
 def _request(
     *,
     name: str,
@@ -164,7 +174,7 @@ def _run_checks(
 ) -> EvaluationResult:
     completed: list[CheckResult] = []
     try:
-        inspect_tree(result_tree, limits=tree_limits, normalize_modes=True)
+        _inspect_result_tree(workspace, result_tree, tree_limits)
     except TreeError:
         return _stop(
             "failed",
@@ -220,20 +230,22 @@ def _run_checks(
                     trusted=True,
                 )
             container = run_container(request, supervisor_policy, docker_binary)
-            infrastructure = _container_failure(container)
+            failure = _container_failure(container)
+            infrastructure = False
             if (
-                infrastructure is None
+                failure is None
                 and isinstance(check, InspectionCheck)
                 and container.exit_code in (126, 127)
             ):
-                infrastructure = "verifier executable is unavailable"
-            if infrastructure is not None:
+                failure = "verifier executable is unavailable"
+                infrastructure = True
+            if failure is not None:
                 completed.append(
                     CheckResult(check.check_id, _kind(check), "failed", container.exit_code)
                 )
                 return _stop(
-                    "abandoned" if isinstance(check, InspectionCheck) else "failed",
-                    infrastructure,
+                    "abandoned" if infrastructure else "failed",
+                    failure,
                     manifest,
                     completed,
                     script_exit_code=script_exit_code,
@@ -268,7 +280,7 @@ def _run_checks(
                 )
             if isinstance(check, InvocationCheck):
                 try:
-                    inspect_tree(result_tree, limits=tree_limits, normalize_modes=True)
+                    _inspect_result_tree(workspace, result_tree, tree_limits)
                 except TreeError:
                     completed[-1] = CheckResult(
                         check.check_id, "invocation", "failed", container.exit_code
@@ -295,6 +307,50 @@ def _run_checks(
         checks=tuple(completed),
         script_exit_code=script_exit_code,
     )
+
+
+def _run_setup(
+    root: Path,
+    work_base: str,
+    manifest: VerifierManifest,
+    supervisor_policy: SupervisorPolicy,
+    docker_binary: str,
+    run_prefix: str,
+) -> EvaluationResult | None:
+    if manifest.setup is not None:
+        try:
+            setup = manifest.setup
+            result = run_container(
+                _request(
+                    name=f"{run_prefix}-setup",
+                    argv=setup.argv,
+                    cwd=work_base,
+                    mounts=(Mount(root, "/work", False),),
+                    stdin=b"",
+                    timeout_s=setup.timeout_s,
+                    stdout_bytes=setup.max_output_bytes,
+                    stderr_bytes=setup.max_output_bytes,
+                    trusted=False,
+                ),
+                supervisor_policy,
+                docker_binary,
+            )
+            failure = _container_failure(result)
+            if failure is None and result.exit_code != 0:
+                failure = "task setup failed"
+            if failure is not None:
+                return _stop(
+                    "failed", failure, manifest, [], script_exit_code=None
+                )
+        except (OSError, SupervisorError, ValueError):
+            return _stop(
+                "abandoned",
+                "validator could not run task setup",
+                manifest,
+                [],
+                script_exit_code=None,
+            )
+    return None
 
 
 def evaluate_repository(
@@ -345,39 +401,11 @@ def evaluate_repository(
             [],
             script_exit_code=None,
         )
-    if manifest.setup is not None:
-        try:
-            setup = manifest.setup
-            result = run_container(
-                _request(
-                    name=f"{run_prefix}-setup",
-                    argv=setup.argv,
-                    cwd=work_base,
-                    mounts=(Mount(root, "/work", False),),
-                    stdin=b"",
-                    timeout_s=setup.timeout_s,
-                    stdout_bytes=setup.max_output_bytes,
-                    stderr_bytes=setup.max_output_bytes,
-                    trusted=False,
-                ),
-                supervisor_policy,
-                docker_binary,
-            )
-            failure = _container_failure(result)
-            if failure is None and result.exit_code != 0:
-                failure = "repository setup failed"
-            if failure is not None:
-                return _stop(
-                    "failed", failure, manifest, [], script_exit_code=None
-                )
-        except (OSError, SupervisorError, ValueError):
-            return _stop(
-                "abandoned",
-                "validator could not run repository setup",
-                manifest,
-                [],
-                script_exit_code=None,
-            )
+    setup_failure = _run_setup(
+        root, work_base, manifest, supervisor_policy, docker_binary, run_prefix
+    )
+    if setup_failure is not None:
+        return setup_failure
     return _run_checks(
         workspace=root,
         host_work_base=host_work_base,
@@ -421,6 +449,18 @@ def evaluate_terminal(
             "terminal result tree is unavailable",
             manifest,
             [],
+            script_exit_code=None,
+        )
+
+    setup_failure = _run_setup(
+        root, _work_cwd("/work", identity.result_tree_path), manifest,
+        supervisor_policy, docker_binary, run_prefix,
+    )
+    if setup_failure is not None:
+        return setup_failure
+    if _task_directory(root, identity.result_tree_path) is None:
+        return _stop(
+            "failed", "setup removed the terminal result directory", manifest, [],
             script_exit_code=None,
         )
 
