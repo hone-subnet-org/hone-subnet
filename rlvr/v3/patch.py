@@ -9,8 +9,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from .reasons import MinerReason
+from .supervisor import (
+    ContainerRequest,
+    Mount,
+    SupervisorError,
+    SupervisorPolicy,
+    run_container,
+)
 from .tree import TreeError, inspect_tree
-from .supervisor import ContainerRequest, Mount, SupervisorError, SupervisorPolicy, run_container
 
 _MODE_LINE = re.compile(
     rb"^(?:old|new|new file|deleted file) mode ([0-9]+)$"
@@ -51,6 +58,7 @@ class PatchLimits:
 class PatchResult:
     status: Literal["applied", "rejected"]
     reason: str
+    reason_code: MinerReason | None = None
 
     def __post_init__(self) -> None:
         if self.status == "applied" and self.reason:
@@ -59,9 +67,11 @@ class PatchResult:
             raise ValueError("a rejected patch requires a bounded reason")
 
 
-def _rejected(reason: str) -> PatchResult:
+def _rejected(
+    reason: str, code: MinerReason = MinerReason.PATCH_STATIC_REJECTED,
+) -> PatchResult:
     first_line = next((line.strip() for line in reason.splitlines() if line.strip()), "")
-    return PatchResult("rejected", (first_line or "patch rejected")[:_REASON_LIMIT])
+    return PatchResult("rejected", (first_line or "patch rejected")[:_REASON_LIMIT], code)
 
 
 def _static_rejection(patch: bytes, limits: PatchLimits) -> PatchResult | None:
@@ -175,7 +185,7 @@ def apply_patch(
             timeout=limits.git_timeout_s,
         )
         if check_result.returncode != 0:
-            return _rejected(check_result.stderr.decode("utf-8", "replace"))
+            return _rejected(check_result.stderr.decode("utf-8", "replace"), MinerReason.PATCH_APPLY_FAILED)
 
         apply_result = _run_git(
             [executable, "apply", "-p1", str(patch_path)],
@@ -188,7 +198,7 @@ def apply_patch(
 
     post_error = _walk_tree(root, baseline=False)
     if post_error is not None:
-        return _rejected(post_error)
+        return _rejected(post_error, MinerReason.RESULT_TREE_INVALID)
     return PatchResult("applied", "")
 
 
@@ -245,7 +255,7 @@ def apply_patch_in_container(
         if checked.exit_code in (126, 127):
             raise PatchToolError("git is unavailable in the sandbox")
         if checked.exit_code != 0:
-            return _rejected(checked.stderr.decode("utf-8", "replace"))
+            return _rejected(checked.stderr.decode("utf-8", "replace"), MinerReason.PATCH_APPLY_FAILED)
 
         applied = invoke(
             "apply", ("/usr/bin/git", "apply", "-p1", "/submission.diff")
@@ -257,7 +267,7 @@ def apply_patch_in_container(
             or applied.stdout_overflow
             or applied.stderr_overflow
         ):
-            return _rejected("git apply failed")
+            return _rejected("git apply failed", MinerReason.PATCH_APPLY_FAILED)
 
     post_error = _walk_tree(root, baseline=False)
-    return _rejected(post_error) if post_error is not None else PatchResult("applied", "")
+    return _rejected(post_error, MinerReason.RESULT_TREE_INVALID) if post_error is not None else PatchResult("applied", "")

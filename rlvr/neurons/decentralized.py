@@ -23,6 +23,7 @@ from ..problemserver.client import (
 )
 from ..scoring.eval_engine import EvalEngine
 from ..v3.client import V3ProblemServerClient
+from ..v3.diagnostics import EvaluationLog
 from ..v3.release import round_policy as v3_round_policy
 from ..v3.round import apply_round_scores, evaluate_round
 from .live import SendGate, _solver_clients
@@ -472,6 +473,11 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
         policy, dispatch_concurrency=settings.validator_dispatch_concurrency
     )
     state_dir = Path(settings.validator_score_state_file).parent
+    diagnostics = EvaluationLog(
+        str(state_dir / "v3_evaluations.jsonl")
+        if settings.validator_diagnostics_file is None
+        else settings.validator_diagnostics_file
+    )
 
     async with httpx.AsyncClient(limits=_validator_http_limits(settings)) as http:
         client = V3ProblemServerClient(
@@ -521,6 +527,11 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
             elif result.status == "abandoned":
                 print(f"[validator] WARN: V3 round abandoned ({result.reason})")
             _save_scores(engine, settings.validator_score_state_file)
+            try:
+                if not diagnostics.record_round(result, str(v.wallet.hotkey.ss58_address)):
+                    print("[validator] WARN: local evaluation diagnostics could not be written")
+            except Exception:  # noqa: BLE001 - diagnostics must not interrupt validation
+                print("[validator] WARN: local evaluation diagnostics could not be written")
             print(f"[validator] locally evaluated {completed} challenges")
             return {uid: float(score) for uid, score in enumerate(engine.scores)}
 

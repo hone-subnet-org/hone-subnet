@@ -21,6 +21,7 @@ Whole-round infrastructure or protocol failures do not update scores. Miner-spec
 This includes timeout, memory, and output limits reached by a trusted inspection while processing a candidate's result. Missing trusted executables and container control failures remain infrastructure failures. This classification adds no container runs.
 
 After a completed round, the validator reports binary verdicts and grading durations for submission grants. This feedback is diagnostic and does not affect scores or weights.
+Validators also retain bounded [local evaluation records](MINER_DIAGNOSTICS.md), including failure codes and abandoned-round outcomes. These records do not change the feedback wire contract.
 
 ## Rollout
 

@@ -82,6 +82,7 @@ class Settings(BaseSettings):
     # full-pool dispatch cannot thrash the executor.
     validator_verify_concurrency: int = Field(default=16, ge=1, le=256)
     validator_score_state_file: str = "data/validator_scores.json"
+    validator_diagnostics_file: str | None = None
 
     # --- Dataset export ---
     dataset_dir: str = "data/rollouts"

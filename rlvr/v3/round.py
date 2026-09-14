@@ -24,19 +24,24 @@ from .api import (
     derive_miner_request_id,
     validate_commit_reveal,
 )
-from .artifacts import ArtifactGrant
 from .archive import ArchiveLimits, extract_archive
+from .artifacts import ArtifactGrant
 from .client import V3ProblemServerClient
 from .download import download_artifact
 from .grading import EvaluationResult, evaluate_repository, evaluate_terminal
 from .identity import RepositoryTaskIdentity, TerminalScriptTaskIdentity
 from .manifest import load_manifest
 from .patch import PatchLimits
+from .reasons import MinerReason, RoundReason, Stage
 from .script import ScriptLimits
 from .submission import SubmissionLimits, fetch_submission
 from .supervisor import SupervisorPolicy
 from .tree import TreeLimits
-from .workspace import cached_workspace_dir, ensure_cached_workspace, materialize_workspace
+from .workspace import (
+    cached_workspace_dir,
+    ensure_cached_workspace,
+    materialize_workspace,
+)
 
 
 class V3Solver(Protocol):
@@ -116,6 +121,14 @@ class RoundResult:
     reason: str
     evaluations: tuple[MinerEvaluation, ...]
     retry_after_s: int | None = None
+    reason_code: RoundReason | None = None
+    stage: Stage | None = None
+    challenge_id: str | None = None
+    task_id: str | None = None
+    assigned_miners: tuple[tuple[int, str], ...] = ()
+    diagnostic_evaluations: tuple[MinerEvaluation, ...] = ()
+    dispatch_failures: tuple[tuple[int, str, MinerReason], ...] = ()
+    checks_total: int | None = None
 
 
 def _failed_submission(challenge_id: str, uid: int, hotkey: str, error: str) -> MinerSubmission:
@@ -243,18 +256,50 @@ async def evaluate_round(
     lease = outcome.challenge
     if lease is None:
         reason = outcome.detail or outcome.category.value
-        return RoundResult("unavailable", reason[:200], (), outcome.retry_after_s)
+        return RoundResult(
+            "unavailable", reason[:200], (), outcome.retry_after_s,
+            reason_code=RoundReason.LEASE_UNAVAILABLE, stage=Stage.LEASE,
+        )
 
-    stage = "workspace download"
+    stage = Stage.LEASE
+    evaluations: list[MinerEvaluation] = []
+    dispatch_failures: dict[tuple[int, str], MinerReason] = {}
+    checks_total: int | None = None
+
+    def finish(
+        status: Literal["completed", "abandoned"],
+        reason: str = "",
+        code: RoundReason | None = None,
+        failure_stage: Stage | None = None,
+    ) -> RoundResult:
+        observed = tuple(sorted(evaluations, key=lambda item: item.uid))
+        return RoundResult(
+            status, reason, observed if status == "completed" else (),
+            reason_code=code,
+            stage=failure_stage or stage,
+            challenge_id=lease.challenge_id,
+            task_id=lease.task_id,
+            assigned_miners=tuple(
+                (slots.submission.uid, slots.submission.hotkey) for slots in lease.slot_pool
+            ),
+            diagnostic_evaluations=observed,
+            dispatch_failures=tuple(
+                (uid, hotkey, failure) for (uid, hotkey), failure in sorted(dispatch_failures.items())
+            ),
+            checks_total=checks_total,
+        )
+
     try:
         if lease.identity.execution_profile_id != policy.execution_profile_id:
-            return RoundResult("abandoned", "unsupported execution profile", ())
+            return finish("abandoned", "unsupported execution profile", RoundReason.UNSUPPORTED_PROFILE)
         if lease.identity.verifier_policy != policy.verifier_policy:
-            return RoundResult("abandoned", "unsupported verifier policy", ())
+            return finish("abandoned", "unsupported verifier policy", RoundReason.UNSUPPORTED_VERIFIER_POLICY)
+        stage = Stage.WORKSPACE_MATERIALIZATION
         cache = Path(cache_dir)
         root = Path(work_dir)
         cache.mkdir(mode=0o700, parents=True, exist_ok=True)
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        stage = Stage.CLEANUP
         for entry in root.iterdir():
             if (
                 entry.name.startswith("hone-v3-round-")
@@ -269,6 +314,7 @@ async def evaluate_round(
                     _remove_tree(entry)
                 elif entry.name.startswith(".workspace-"):
                     entry.unlink(missing_ok=True)
+        stage = Stage.WORKSPACE_MATERIALIZATION
         with tempfile.TemporaryDirectory(
             prefix="hone-v3-round-", dir=root, ignore_cleanup_errors=True
         ) as temporary:
@@ -276,13 +322,14 @@ async def evaluate_round(
             scratch = round_dir / "scratch"
             scratch.mkdir()
             workspace_archive = round_dir / "workspace.tar.zst"
+            stage = Stage.WORKSPACE_DOWNLOAD
             if not target_cache.exists():
                 workspace_space = (
                     lease.workspace.compressed_size_bytes
                     + 2 * lease.workspace.expanded_size_bytes
                 )
                 if shutil.disk_usage(root).free < workspace_space:
-                    return RoundResult("abandoned", "insufficient workspace storage", ())
+                    return finish("abandoned", "insufficient workspace storage", RoundReason.INSUFFICIENT_STORAGE)
                 workspace_archive = await download_artifact(
                     http,
                     lease.workspace_url,
@@ -291,6 +338,7 @@ async def evaluate_round(
                     policy.workspace_archive,
                     allowed_origins=policy.artifact_origins,
                 )
+            stage = Stage.WORKSPACE_EXTRACTION
             cached = ensure_cached_workspace(
                 cache,
                 workspace_archive,
@@ -306,6 +354,7 @@ async def evaluate_round(
                 registration = (slots.submission.uid, slots.submission.hotkey)
                 solver = by_registration.get(registration)
                 if solver is None:
+                    dispatch_failures[registration] = MinerReason.NOT_SERVING
                     return (
                         _failed_submission(
                             lease.challenge_id, *registration, "miner is not serving"
@@ -325,8 +374,11 @@ async def evaluate_round(
                 try:
                     async with semaphore:
                         submission, parsed = await solver.solve_v3(task)
+                    if parsed is None:
+                        dispatch_failures[registration] = MinerReason.RESPONSE_UNAVAILABLE
                     return submission, parsed
                 except Exception:  # noqa: BLE001
+                    dispatch_failures[registration] = MinerReason.DISPATCH_FAILED
                     return (
                         _failed_submission(
                             lease.challenge_id, *registration, "miner dispatch failed"
@@ -334,7 +386,7 @@ async def evaluate_round(
                         None,
                     )
 
-            stage = "miner dispatch"
+            stage = Stage.DISPATCH
             dispatched = await asyncio.gather(
                 *(dispatch(slots) for slots in lease.slot_pool)
             )
@@ -345,31 +397,31 @@ async def evaluate_round(
                 if parsed is not None
             }
             if len(signed_responses) < lease.commit_min_signed_responses:
-                return RoundResult("abandoned", "signed response quorum was not met", ())
+                return finish("abandoned", "signed response quorum was not met", RoundReason.QUORUM_NOT_MET)
             commit = ChallengeCommitRequest(
                 protocol_version=3,
                 challenge_id=lease.challenge_id,
                 submissions=submissions,
             )
-            stage = "commit"
+            stage = Stage.COMMIT
             revealed = await client.commit(commit)
             if revealed is None:
-                return RoundResult("abandoned", "commit or verifier reveal failed", ())
+                return finish("abandoned", "commit or verifier reveal failed", RoundReason.COMMIT_FAILED)
             try:
                 validate_commit_reveal(lease, commit, revealed)
             except (TypeError, ValueError):
-                return RoundResult("abandoned", "commit response did not match the lease", ())
+                return finish("abandoned", "commit response did not match the lease", RoundReason.REVEAL_MISMATCH)
             if revealed.grading_expires_at <= int(time.time()):
-                return RoundResult("abandoned", "grading window expired", ())
+                return finish("abandoned", "grading window expired", RoundReason.GRADING_EXPIRED)
 
-            stage = "verifier download"
+            stage = Stage.VERIFIER_DOWNLOAD
             verifier_space = (
                 revealed.verifier.compressed_size_bytes
                 + 2 * revealed.verifier.expanded_size_bytes
                 + policy.tree.max_total_file_bytes
             )
             if shutil.disk_usage(round_dir).free < verifier_space:
-                return RoundResult("abandoned", "insufficient verifier storage", ())
+                return finish("abandoned", "insufficient verifier storage", RoundReason.INSUFFICIENT_STORAGE)
             verifier_archive = await download_artifact(
                 http,
                 revealed.verifier_url,
@@ -379,7 +431,7 @@ async def evaluate_round(
                 allowed_origins=policy.artifact_origins,
             )
             verifier_dir = round_dir / "verifier"
-            stage = "verifier extraction"
+            stage = Stage.VERIFIER_EXTRACTION
             extract_archive(
                 verifier_archive,
                 revealed.verifier,
@@ -387,12 +439,12 @@ async def evaluate_round(
                 policy.verifier_archive,
                 scratch_dir=scratch,
             )
-            stage = "verifier manifest"
+            stage = Stage.VERIFIER_MANIFEST
             manifest = load_manifest(
                 verifier_dir, task_type=lease.identity.task_type
             )
+            checks_total = len(manifest.checks)
 
-            evaluations: list[MinerEvaluation] = []
             submissions_by_registration = {
                 (item.uid, item.hotkey): item for item in submissions
             }
@@ -403,22 +455,26 @@ async def evaluate_round(
                         failure.uid,
                         failure.hotkey,
                         latency,
-                        EvaluationResult("rejected", failure.reason, (), None),
+                        EvaluationResult(
+                            "rejected", failure.reason, (), None,
+                            MinerReason(failure.reason), Stage.COMMIT,
+                        ),
                     )
                 )
             for index, grant in enumerate(revealed.submission_grants):
+                stage = Stage.COMMIT
                 expected_format = (
                     "unified_diff_v1"
                     if lease.identity.task_type == "repository_patch_v1"
                     else "bash_script_v1"
                 )
                 if grant.format != expected_format:
-                    return RoundResult("abandoned", "submission format did not match the task", ())
+                    return finish("abandoned", "submission format did not match the task", RoundReason.SUBMISSION_FORMAT_MISMATCH)
                 signed = signed_responses.get((grant.uid, grant.hotkey))
                 if not _grant_matches_signed_response(grant, signed):
-                    return RoundResult("abandoned", "submission grant did not match the signed response", ())
+                    return finish("abandoned", "submission grant did not match the signed response", RoundReason.SUBMISSION_GRANT_MISMATCH)
                 try:
-                    stage = "submission download"
+                    stage = Stage.SUBMISSION_DOWNLOAD
                     submission_path = await fetch_submission(
                         http,
                         grant,
@@ -428,12 +484,12 @@ async def evaluate_round(
                     )
                     submission_bytes = submission_path.path.read_bytes()
                 except Exception:  # noqa: BLE001 - post-commit storage is infrastructure
-                    return RoundResult("abandoned", "submission download failed", ())
-                stage = "workspace materialization"
+                    return finish("abandoned", "submission download failed", RoundReason.SUBMISSION_DOWNLOAD_FAILED)
+                stage = Stage.WORKSPACE_MATERIALIZATION
                 if revealed.grading_expires_at <= int(time.time()):
-                    return RoundResult("abandoned", "grading window expired", ())
+                    return finish("abandoned", "grading window expired", RoundReason.GRADING_EXPIRED)
                 if shutil.disk_usage(round_dir).free < policy.tree.max_total_file_bytes:
-                    return RoundResult("abandoned", "insufficient grading storage", ())
+                    return finish("abandoned", "insufficient grading storage", RoundReason.INSUFFICIENT_STORAGE)
                 grading_started = time.monotonic()
                 miner_workspace: Path | None = None
                 challenge_tag = hashlib.sha256(
@@ -444,7 +500,7 @@ async def evaluate_round(
                     miner_workspace = materialize_workspace(
                         cached, round_dir / f"miner-{grant.uid}"
                     )
-                    stage = "candidate grading"
+                    stage = Stage.GRADING
                     if isinstance(lease.identity, RepositoryTaskIdentity):
                         result = await asyncio.to_thread(
                             evaluate_repository,
@@ -474,25 +530,31 @@ async def evaluate_round(
                             run_prefix,
                         )
                     else:  # pragma: no cover - discriminated identity is closed
-                        return RoundResult("abandoned", "unsupported task identity", ())
+                        return finish("abandoned", "unsupported task identity", RoundReason.UNSUPPORTED_TASK)
                     grading_duration_ms = min(
                         2**53 - 1,
                         int((time.monotonic() - grading_started) * 1000),
                     )
+                    evaluations.append(
+                        MinerEvaluation(
+                            grant.uid, grant.hotkey,
+                            submissions_by_registration[(grant.uid, grant.hotkey)].latency_ms,
+                            result, grading_duration_ms,
+                        )
+                    )
                 finally:
                     if miner_workspace is not None:
+                        previous_stage = stage
+                        stage = Stage.CLEANUP
                         _remove_tree(miner_workspace)
+                        stage = previous_stage
+                stage = Stage.GRADING
                 if result.status == "abandoned":
-                    return RoundResult("abandoned", result.reason, ())
-                evaluations.append(
-                    MinerEvaluation(
-                        grant.uid,
-                        grant.hotkey,
-                        submissions_by_registration[(grant.uid, grant.hotkey)].latency_ms,
-                        result,
-                        grading_duration_ms,
+                    return finish(
+                        "abandoned", result.reason,
+                        result.reason_code if isinstance(result.reason_code, RoundReason) else RoundReason.VALIDATOR_ERROR,
+                        result.stage,
                     )
-                )
             evaluations.sort(key=lambda item: item.uid)
             feedback_accepted = await _send_diagnostic_feedback(
                 client,
@@ -503,10 +565,18 @@ async def evaluate_round(
             )
             if not feedback_accepted:
                 print("[validator] WARN: V3 diagnostic feedback was not accepted")
-            return RoundResult("completed", "", tuple(evaluations))
+            return finish("completed")
     except Exception as error:  # noqa: BLE001 - infrastructure faults abandon atomically
-        return RoundResult(
+        return finish(
             "abandoned",
-            f"validator failed during {stage} ({type(error).__name__})",
-            (),
+            f"validator failed during {stage.value.replace('_', ' ')} ({type(error).__name__})",
+            {
+                Stage.WORKSPACE_DOWNLOAD: RoundReason.WORKSPACE_DOWNLOAD_FAILED,
+                Stage.WORKSPACE_EXTRACTION: RoundReason.WORKSPACE_EXTRACTION_FAILED,
+                Stage.WORKSPACE_MATERIALIZATION: RoundReason.WORKSPACE_MATERIALIZATION_FAILED,
+                Stage.VERIFIER_DOWNLOAD: RoundReason.VERIFIER_DOWNLOAD_FAILED,
+                Stage.VERIFIER_EXTRACTION: RoundReason.VERIFIER_INVALID,
+                Stage.VERIFIER_MANIFEST: RoundReason.VERIFIER_INVALID,
+                Stage.CLEANUP: RoundReason.CLEANUP_FAILED,
+            }.get(stage, RoundReason.VALIDATOR_ERROR),
         )

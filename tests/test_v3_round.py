@@ -23,9 +23,11 @@ from rlvr.v3.api import (
 from rlvr.v3.archive import ArchiveLimits
 from rlvr.v3.artifacts import ArtifactGrant, ArtifactRef
 from rlvr.v3.client import V3ProblemServerClient
+from rlvr.v3.diagnostics import round_records
 from rlvr.v3.grading import EvaluationResult
 from rlvr.v3.identity import compute_task_id
 from rlvr.v3.patch import PatchLimits
+from rlvr.v3.reasons import MinerReason, RoundReason, Stage
 from rlvr.v3.round import (
     MinerEvaluation,
     RoundPolicy,
@@ -213,10 +215,16 @@ def policy(tmp_path):
     )
 
 
-@pytest.mark.parametrize("submission_download_fails", [False, True])
-@pytest.mark.parametrize("checker_times_out", [False, True])
+@pytest.mark.parametrize("submission_download_fails,checker_times_out,round_fault", [
+    (False, False, None), (True, False, None), (False, True, None), (True, True, None),
+    *[(False, False, fault) for fault in (
+        "cleanup", "quorum", "commit", "reveal", "expired", "verifier_download",
+        "manifest", "workspace_download", "workspace_extract", "materialize",
+        "format", "grant", "grade_infrastructure", "grade_exception", "temporary_directory",
+    )],
+])
 def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
-    tmp_path, monkeypatch, submission_download_fails, checker_times_out
+    tmp_path, monkeypatch, submission_download_fails, checker_times_out, round_fault
 ):
     workspace_tar = make_tar([("repo", "dir", b"", 0o755), ("repo/a.txt", "file", b"a", 0o644)])
     workspace_blob = compress(workspace_tar)
@@ -263,7 +271,7 @@ def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
         identity=task_identity,
         task_id=task_id,
         slot_pool=slots,
-        commit_min_signed_responses=3,
+        commit_min_signed_responses=4 if round_fault == "quorum" else 3,
         workspace=workspace_ref,
         verifier=verifier_ref,
         expires_at=2**53 - 1,
@@ -276,14 +284,16 @@ def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
         if request.method == "POST" and path == "/v3/challenges/lease":
             return httpx.Response(200, content=leased.model_dump_json())
         if request.method == "POST" and path == "/v3/challenges/commit":
+            if round_fault == "commit":
+                return httpx.Response(403)
             grants = [
                 {
                     "uid": uid,
                     "hotkey": f"hk-{uid}",
                     "upload_id": f"u{uid}-submission",
-                    "sha256": hashlib.sha256(contents[uid]).hexdigest(),
+                    "sha256": "0" * 64 if round_fault == "grant" else hashlib.sha256(contents[uid]).hexdigest(),
                     "size_bytes": len(contents[uid]),
-                    "format": "unified_diff_v1",
+                    "format": "bash_script_v1" if round_fault == "format" else "unified_diff_v1",
                     "read_url": f"https://uploads.invalid/submission-{uid}",
                 }
                 for uid in contents
@@ -291,11 +301,11 @@ def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
             response = CommitRevealResponse(
                 protocol_version=3,
                 challenge_id=leased.challenge_id,
-                task_id=leased.task_id,
+                task_id="0" * 64 if round_fault == "reveal" else leased.task_id,
                 verifier=verifier_ref,
                 verifier_policy="command-gold-digest-v1",
                 verifier_url="https://uploads.invalid/verifier",
-                grading_expires_at=2**53 - 1,
+                grading_expires_at=1 if round_fault == "expired" else 2**53 - 1,
                 submission_grants=grants,
                 artifact_failures=[{"uid": 4, "hotkey": "hk-4", "reason": "artifact_invalid"}],
             )
@@ -311,8 +321,12 @@ def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
             )
             return httpx.Response(200, content=response.model_dump_json())
         if path == "/workspace":
+            if round_fault == "workspace_download":
+                return httpx.Response(503)
             return streamed(workspace_blob)
         if path == "/verifier":
+            if round_fault == "verifier_download":
+                return httpx.Response(503)
             return streamed(verifier_blob)
         if path.startswith("/submission-"):
             return streamed(contents[int(path.rsplit("-", 1)[1])])
@@ -322,6 +336,13 @@ def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
         if patch == b"pass":
             return EvaluationResult("passed", "", (), None)
         if patch == b"fail":
+            if round_fault == "grade_exception":
+                raise RuntimeError("fixture grading exception")
+            if round_fault == "grade_infrastructure":
+                return EvaluationResult(
+                    "abandoned", "verifier is unavailable", (), None,
+                    RoundReason.VERIFIER_UNAVAILABLE, Stage.CHECK,
+                )
             if checker_times_out:
                 from rlvr.v3.grading import _run_checks
                 from rlvr.v3.supervisor import ContainerResult
@@ -341,6 +362,30 @@ def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
         return EvaluationResult("rejected", "patch was rejected", (), None)
 
     monkeypatch.setattr("rlvr.v3.round.evaluate_repository", fake_grade)
+    if round_fault in {"manifest", "workspace_extract", "materialize", "temporary_directory"}:
+        from rlvr.v3.manifest import ManifestError
+        from rlvr.v3.workspace import WorkspaceError
+
+        function, error = {
+            "manifest": ("load_manifest", ManifestError),
+            "workspace_extract": ("ensure_cached_workspace", WorkspaceError),
+            "materialize": ("materialize_workspace", WorkspaceError),
+            "temporary_directory": ("tempfile.TemporaryDirectory", OSError),
+        }[round_fault]
+
+        def injected_fault(*_args, **_kwargs):
+            raise error("fixture exception details must not be logged")
+
+        monkeypatch.setattr(f"rlvr.v3.round.{function}", injected_fault)
+    cleaned_workspaces = []
+    if round_fault in {"cleanup", "grade_exception"}:
+        def failing_cleanup(path):
+            if path.name == "miner-2" and round_fault == "cleanup":
+                raise RuntimeError("fixture cleanup failure")
+            _remove_tree(path)
+            cleaned_workspaces.append(path.name)
+
+        monkeypatch.setattr("rlvr.v3.round._remove_tree", failing_cleanup)
     if submission_download_fails:
         async def fail_download(*_args, **_kwargs):
             raise httpx.ConnectError("storage unavailable")
@@ -363,13 +408,58 @@ def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
             )
 
     result = asyncio.run(go())
+    if round_fault:
+        expected = {
+            "cleanup": (RoundReason.CLEANUP_FAILED, Stage.CLEANUP),
+            "quorum": (RoundReason.QUORUM_NOT_MET, Stage.DISPATCH),
+            "commit": (RoundReason.COMMIT_FAILED, Stage.COMMIT),
+            "reveal": (RoundReason.REVEAL_MISMATCH, Stage.COMMIT),
+            "expired": (RoundReason.GRADING_EXPIRED, Stage.COMMIT),
+            "verifier_download": (RoundReason.VERIFIER_DOWNLOAD_FAILED, Stage.VERIFIER_DOWNLOAD),
+            "manifest": (RoundReason.VERIFIER_INVALID, Stage.VERIFIER_MANIFEST),
+            "workspace_download": (RoundReason.WORKSPACE_DOWNLOAD_FAILED, Stage.WORKSPACE_DOWNLOAD),
+            "workspace_extract": (RoundReason.WORKSPACE_EXTRACTION_FAILED, Stage.WORKSPACE_EXTRACTION),
+            "materialize": (RoundReason.WORKSPACE_MATERIALIZATION_FAILED, Stage.WORKSPACE_MATERIALIZATION),
+            "format": (RoundReason.SUBMISSION_FORMAT_MISMATCH, Stage.COMMIT),
+            "grant": (RoundReason.SUBMISSION_GRANT_MISMATCH, Stage.COMMIT),
+            "grade_infrastructure": (RoundReason.VERIFIER_UNAVAILABLE, Stage.CHECK),
+            "grade_exception": (RoundReason.VALIDATOR_ERROR, Stage.GRADING),
+            "temporary_directory": (RoundReason.WORKSPACE_MATERIALIZATION_FAILED, Stage.WORKSPACE_MATERIALIZATION),
+        }[round_fault]
+        assert result.status == "abandoned" and result.evaluations == ()
+        assert (result.reason_code, result.stage) == expected
+        assert feedback_requests == []
+        engine = EvalEngine(6, 1, 200, 4)
+        engine.update({1: 1.0}, hotkeys={1: "hk-1"}, dispatched={1})
+        before = repr(engine.histories)
+        assert not apply_round_scores(
+            result, engine, active_hotkeys={uid: f"hk-{uid}" for uid in (1, 2, 3, 4)},
+            speed_half_life_ms=180_000, speed_floor=0.95,
+        )
+        assert repr(engine.histories) == before
+        records = list(round_records(result, "validator"))
+        assert len(records) == 5 and all(record["score_effect"] == "unchanged" for record in records)
+        if round_fault == "grade_exception":
+            assert "miner-2" in cleaned_workspaces
+            assert result.reason == "validator failed during grading (RuntimeError)"
+        if round_fault in {"cleanup", "grade_infrastructure", "grade_exception"}:
+            by_uid = {record["uid"]: record for record in records[1:]}
+            assert by_uid[1]["status"] == "passed"
+            assert by_uid[3]["status"] == "not_evaluated"
+            assert by_uid[3]["checks_skipped"] == 1
+        return
     if submission_download_fails:
         assert result.status == "abandoned"
         assert result.reason == "submission download failed"
+        assert result.reason_code == RoundReason.SUBMISSION_DOWNLOAD_FAILED
         assert feedback_requests == []
         return
     assert result.reason == ""
     assert result.status == "completed"
+    records = list(round_records(result, "validator"))
+    missing = next(record for record in records[1:] if record["uid"] == 4)
+    assert missing["reason_code"] == MinerReason.ARTIFACT_INVALID.value
+    assert missing["dispatch_reason_code"] == MinerReason.NOT_SERVING.value
     assert [item.result.status for item in result.evaluations] == [
         "passed", "failed", "rejected", "rejected"
     ]

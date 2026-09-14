@@ -15,6 +15,7 @@ from .manifest import (
     VerifierManifest,
 )
 from .patch import PatchLimits, PatchToolError, apply_patch_in_container
+from .reasons import MinerReason, RoundReason, Stage
 from .script import ScriptLimits, validate_script
 from .supervisor import (
     ContainerRequest,
@@ -52,6 +53,8 @@ class EvaluationResult:
     reason: str
     checks: tuple[CheckResult, ...]
     script_exit_code: int | None
+    reason_code: MinerReason | RoundReason | None = None
+    stage: Stage | None = None
 
     def __post_init__(self) -> None:
         if self.status not in ("passed", "failed", "rejected", "abandoned"):
@@ -82,6 +85,8 @@ def _stop(
     completed: list[CheckResult],
     *,
     script_exit_code: int | None,
+    reason_code: MinerReason | RoundReason,
+    stage: Stage,
 ) -> EvaluationResult:
     remaining = manifest.checks[len(completed) :]
     return EvaluationResult(
@@ -89,6 +94,8 @@ def _stop(
         reason=reason[:200],
         checks=tuple(completed) + tuple(_skipped(check) for check in remaining),
         script_exit_code=script_exit_code,
+        reason_code=reason_code,
+        stage=stage,
     )
 
 
@@ -99,6 +106,16 @@ def _container_failure(result: ContainerResult) -> str | None:
         return "container exceeded its memory limit"
     if result.stdout_overflow or result.stderr_overflow:
         return "container exceeded its output limit"
+    return None
+
+
+def _resource_reason(result: ContainerResult) -> MinerReason | None:
+    if result.timed_out:
+        return MinerReason.TIMEOUT
+    if result.oom_killed:
+        return MinerReason.MEMORY_LIMIT
+    if result.stdout_overflow or result.stderr_overflow:
+        return MinerReason.OUTPUT_LIMIT
     return None
 
 
@@ -182,6 +199,8 @@ def _run_checks(
             manifest,
             completed,
             script_exit_code=script_exit_code,
+            reason_code=MinerReason.RESULT_TREE_INVALID,
+            stage=Stage.RESULT_TREE,
         )
 
     for check in manifest.checks:
@@ -197,6 +216,8 @@ def _run_checks(
                         manifest,
                         completed,
                         script_exit_code=script_exit_code,
+                        reason_code=MinerReason.WORKING_DIRECTORY_INVALID,
+                        stage=Stage.CHECK,
                     )
                 stdin = (
                     b""
@@ -249,6 +270,9 @@ def _run_checks(
                     manifest,
                     completed,
                     script_exit_code=script_exit_code,
+                    reason_code=(RoundReason.VERIFIER_UNAVAILABLE if infrastructure
+                                 else _resource_reason(container)),
+                    stage=Stage.CHECK,
                 )
 
             expected_stdout = (verifier_dir / check.expect.stdout).read_bytes()
@@ -277,6 +301,8 @@ def _run_checks(
                     manifest,
                     completed,
                     script_exit_code=script_exit_code,
+                    reason_code=MinerReason.CHECK_FAILED,
+                    stage=Stage.CHECK,
                 )
             if isinstance(check, InvocationCheck):
                 try:
@@ -291,6 +317,8 @@ def _run_checks(
                         manifest,
                         completed,
                         script_exit_code=script_exit_code,
+                        reason_code=MinerReason.RESULT_TREE_INVALID,
+                        stage=Stage.RESULT_TREE,
                     )
         except (OSError, SupervisorError, ValueError):
             return _stop(
@@ -299,6 +327,8 @@ def _run_checks(
                 manifest,
                 completed,
                 script_exit_code=script_exit_code,
+                reason_code=RoundReason.VERIFIER_UNAVAILABLE,
+                stage=Stage.CHECK,
             )
 
     return EvaluationResult(
@@ -306,6 +336,7 @@ def _run_checks(
         reason="",
         checks=tuple(completed),
         script_exit_code=script_exit_code,
+        stage=Stage.CHECK,
     )
 
 
@@ -340,7 +371,9 @@ def _run_setup(
                 failure = "task setup failed"
             if failure is not None:
                 return _stop(
-                    "failed", failure, manifest, [], script_exit_code=None
+                    "failed", failure, manifest, [], script_exit_code=None,
+                    reason_code=_resource_reason(result) or MinerReason.SETUP_FAILED,
+                    stage=Stage.SETUP,
                 )
         except (OSError, SupervisorError, ValueError):
             return _stop(
@@ -349,6 +382,8 @@ def _run_setup(
                 manifest,
                 [],
                 script_exit_code=None,
+                reason_code=RoundReason.SETUP_UNAVAILABLE,
+                stage=Stage.SETUP,
             )
     return None
 
@@ -376,6 +411,8 @@ def evaluate_repository(
             manifest,
             [],
             script_exit_code=None,
+            reason_code=RoundReason.WORKSPACE_INVALID,
+            stage=Stage.WORKSPACE_MATERIALIZATION,
         )
     try:
         applied = apply_patch_in_container(
@@ -387,9 +424,15 @@ def evaluate_repository(
             run_prefix=run_prefix,
         )
     except PatchToolError:
-        return EvaluationResult("abandoned", "validator could not apply the patch", (), None)
+        return EvaluationResult(
+            "abandoned", "validator could not apply the patch", (), None,
+            RoundReason.PATCH_TOOL_FAILED, Stage.PATCH,
+        )
     if applied.status == "rejected":
-        return EvaluationResult("rejected", "patch was rejected", (), None)
+        return EvaluationResult(
+            "rejected", applied.reason, (), None,
+            applied.reason_code or MinerReason.PATCH_REJECTED, Stage.PATCH,
+        )
 
     work_base = _work_cwd("/work", identity.working_directory)
     host_work_base = _task_directory(root, identity.working_directory)
@@ -400,6 +443,8 @@ def evaluate_repository(
             manifest,
             [],
             script_exit_code=None,
+            reason_code=MinerReason.WORKING_DIRECTORY_INVALID,
+            stage=Stage.PATCH,
         )
     setup_failure = _run_setup(
         root, work_base, manifest, supervisor_policy, docker_binary, run_prefix
@@ -439,7 +484,10 @@ def evaluate_terminal(
         raise ValueError("terminal task contract does not match")
     checked = validate_script(script, script_limits)
     if checked.status == "rejected":
-        return EvaluationResult("rejected", "script was rejected", (), None)
+        return EvaluationResult(
+            "rejected", checked.reason, (), None,
+            MinerReason.SCRIPT_REJECTED, Stage.SCRIPT,
+        )
     root = Path(environment)
     verifier = Path(verifier_dir)
     result_tree = _task_directory(root, identity.result_tree_path)
@@ -450,6 +498,8 @@ def evaluate_terminal(
             manifest,
             [],
             script_exit_code=None,
+            reason_code=RoundReason.WORKSPACE_INVALID,
+            stage=Stage.WORKSPACE_MATERIALIZATION,
         )
 
     setup_failure = _run_setup(
@@ -462,6 +512,8 @@ def evaluate_terminal(
         return _stop(
             "failed", "setup removed the terminal result directory", manifest, [],
             script_exit_code=None,
+            reason_code=MinerReason.WORKING_DIRECTORY_INVALID,
+            stage=Stage.SETUP,
         )
 
     try:
@@ -500,6 +552,8 @@ def evaluate_terminal(
             manifest,
             [],
             script_exit_code=None,
+            reason_code=RoundReason.SCRIPT_UNAVAILABLE,
+            stage=Stage.SCRIPT,
         )
 
     failure = _container_failure(result)
@@ -510,6 +564,8 @@ def evaluate_terminal(
             manifest,
             [],
             script_exit_code=result.exit_code,
+            reason_code=_resource_reason(result),
+            stage=Stage.SCRIPT,
         )
     return _run_checks(
         workspace=root,
