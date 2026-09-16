@@ -16,6 +16,7 @@ from .manifest import (
 )
 from .patch import PatchLimits, PatchToolError, apply_patch_in_container
 from .reasons import MinerReason, RoundReason, Stage
+from .receipts import CheckReceipt, build_check_receipt
 from .script import ScriptLimits, validate_script
 from .supervisor import (
     ContainerRequest,
@@ -55,6 +56,7 @@ class EvaluationResult:
     script_exit_code: int | None
     reason_code: MinerReason | RoundReason | None = None
     stage: Stage | None = None
+    receipt: CheckReceipt | None = None
 
     def __post_init__(self) -> None:
         if self.status not in ("passed", "failed", "rejected", "abandoned"):
@@ -68,6 +70,10 @@ class EvaluationResult:
             type(item) is not CheckResult for item in self.checks
         ):
             raise ValueError("evaluation checks must be a tuple")
+        if self.receipt is not None and (
+            self.status != "failed" or type(self.receipt) is not CheckReceipt
+        ):
+            raise ValueError("only a failed evaluation can carry a check receipt")
 
 
 def _kind(check: Check) -> Literal["invocation", "inspection"]:
@@ -87,6 +93,7 @@ def _stop(
     script_exit_code: int | None,
     reason_code: MinerReason | RoundReason,
     stage: Stage,
+    receipt: CheckReceipt | None = None,
 ) -> EvaluationResult:
     remaining = manifest.checks[len(completed) :]
     return EvaluationResult(
@@ -96,6 +103,7 @@ def _stop(
         script_exit_code=script_exit_code,
         reason_code=reason_code,
         stage=stage,
+        receipt=receipt,
     )
 
 
@@ -117,6 +125,14 @@ def _resource_reason(result: ContainerResult) -> MinerReason | None:
     if result.stdout_overflow or result.stderr_overflow:
         return MinerReason.OUTPUT_LIMIT
     return None
+
+
+def _receipt_or_none(**kwargs) -> CheckReceipt | None:
+    try:
+        receipt = build_check_receipt(**kwargs)
+    except Exception:  # noqa: BLE001 - receipts are diagnostics and never change grading
+        return None
+    return receipt if type(receipt) is CheckReceipt else None
 
 
 def _work_cwd(base: str, relative: str) -> str:
@@ -203,7 +219,7 @@ def _run_checks(
             stage=Stage.RESULT_TREE,
         )
 
-    for check in manifest.checks:
+    for check_index, check in enumerate(manifest.checks, start=1):
         try:
             if isinstance(check, InvocationCheck):
                 if _task_directory(host_work_base, check.cwd) is None:
@@ -264,15 +280,35 @@ def _run_checks(
                 completed.append(
                     CheckResult(check.check_id, _kind(check), "failed", container.exit_code)
                 )
+                if infrastructure:
+                    return _stop(
+                        "abandoned",
+                        failure,
+                        manifest,
+                        completed,
+                        script_exit_code=script_exit_code,
+                        reason_code=RoundReason.VERIFIER_UNAVAILABLE,
+                        stage=Stage.CHECK,
+                    )
+                limit = _resource_reason(container)
                 return _stop(
-                    "abandoned" if infrastructure else "failed",
+                    "failed",
                     failure,
                     manifest,
                     completed,
                     script_exit_code=script_exit_code,
-                    reason_code=(RoundReason.VERIFIER_UNAVAILABLE if infrastructure
-                                 else _resource_reason(container)),
+                    reason_code=limit,
                     stage=Stage.CHECK,
+                    receipt=_receipt_or_none(
+                        check=check,
+                        check_index=check_index,
+                        checks_total=len(manifest.checks),
+                        request=request,
+                        container=container,
+                        limit=None if limit is None else limit.value,
+                        expected_stdout=None,
+                        expected_stderr=None,
+                    ),
                 )
 
             expected_stdout = (verifier_dir / check.expect.stdout).read_bytes()
@@ -303,6 +339,16 @@ def _run_checks(
                     script_exit_code=script_exit_code,
                     reason_code=MinerReason.CHECK_FAILED,
                     stage=Stage.CHECK,
+                    receipt=_receipt_or_none(
+                        check=check,
+                        check_index=check_index,
+                        checks_total=len(manifest.checks),
+                        request=request,
+                        container=container,
+                        limit=None,
+                        expected_stdout=expected_stdout,
+                        expected_stderr=expected_stderr,
+                    ),
                 )
             if isinstance(check, InvocationCheck):
                 try:

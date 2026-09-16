@@ -1,9 +1,10 @@
 # Local evaluation diagnostics
 
 Validators write one round outcome and one evaluation record for each assigned
-miner to `v3_evaluations.jsonl`, beside the configured score-state file. Each
-line is a JSON object. These records are local to the validator; they do not
-change feedback sent to the problem server or expose hidden check output.
+miner to `v3_evaluations.jsonl`, beside the configured score-state file. When a
+miner's check runs and fails, a failure receipt may follow that miner's
+evaluation record. Each line is a JSON object. These records are local to the validator;
+they do not change feedback sent to the problem server.
 
 ```bash
 tail -f data/v3_evaluations.jsonl
@@ -25,8 +26,9 @@ Writes are best effort: a storage failure can leave only some records for a
 round. A missing miner record is not evidence of success, failure, or score credit.
 
 The log uses `schema_version: 1`. Consumers should tolerate additional reason
-codes. Each serialized line is at most 4 KiB; an optional reason is omitted
-if necessary to meet that cap. Readers should skip a malformed final line
+codes and skip record types they do not recognize. Each serialized line is at
+most 4 KiB; an optional reason is omitted if necessary to meet that cap, and a
+failure receipt that cannot fit is skipped. Readers should skip a malformed final line
 after an interrupted write. The next write repairs an incomplete active-file
 tail. If external corruption leaves more than 4 KiB without a newline at the
 end, writes fail until the operator moves the damaged file aside.
@@ -107,9 +109,59 @@ is handled by the existing round and server logic.
 | `cleanup_failed` | Managed workspace cleanup failed. |
 | `validator_error` | Another validator failure occurred; `stage` identifies the operation. |
 
-Reasons and counts do not include signed URLs, response headers, miner response
-bodies, checker stdout/stderr, expected answers, or verifier code. More detailed
-miner-facing receipts require a separate server-coordinated contract.
+Round outcome and miner evaluation records do not include signed URLs, response
+headers, miner response bodies, check output, expected answers, or verifier
+code. Failure receipts, described below, do include the failing check's command,
+input, and expected and actual output excerpts. Sending receipts to miners
+requires a separate server-coordinated contract.
+
+## Failure receipts
+
+A `failure_receipt` record describes the first check that ran and failed.
+Grading stops there, so later checks never run and are not identified. A
+receipt can be written when the check's exit code, stdout, or stderr did not
+match, or when the check reached a time, memory, or output limit under the
+existing grading rules. `output_source` identifies whose output it shows.
+Setup, script, patch, result-tree, and working-directory failures have no
+receipt, and neither do validator faults.
+
+The record carries the round and miner identity fields and a `receipt` object:
+
+- `check_index`, `checks_total`, `check_id`: the failing check's position and name.
+- `kind` and `output_source`: an `invocation` check runs the candidate, so its
+  output is `candidate`. An `inspection` check runs the verifier's checker
+  against the result, so its output is `checker`.
+- `argv`, `cwd`: the command and its container working directory. Long values
+  are shortened and marked by `argv_truncated` or `cwd_truncated`.
+- `limit`: `timeout`, `memory_limit`, or `output_limit`; `null` for a mismatch.
+- `mismatched`: which of `exit_code`, `stdout`, and `stderr` differed. It is
+  empty when `limit` is set.
+- `exit_code`: the expected and actual exit codes. The expected code is `null`
+  when `limit` is set.
+- `stdin`: the start of an invocation check's input; `null` for inspections.
+- `stdout`, `stderr`: `first_difference` is the first differing byte offset, or
+  `null` when the streams matched or were not compared. `expected` and `actual`
+  are excerpts around that offset. Unchecked stderr and limit failures show the
+  end of the captured output, with no expected excerpt.
+
+Each excerpt has `offset`, base64 `data_b64`, `captured_bytes`, `total_bytes`,
+`capture_truncated`, and `truncated`. The bytes are exact, including line
+endings, trailing spaces, and invalid UTF-8. `capture_truncated` means the
+validator retained output only up to the check's output limit and discarded the
+rest: the real output was longer, and `total_bytes` is `null`. `truncated` is
+true if captured bytes were omitted from the excerpt or `capture_truncated` is
+true.
+
+A receipt is at most 3 KiB. Excerpts are shortened in a fixed order to fit, and
+a receipt that still does not fit is omitted. A receipt that cannot be
+converted, serialized, or fit on one log line is skipped without affecting
+other records, and the write reports a warning. A storage failure can still
+stop the remaining writes for a round, as described above.
+
+Output after a timeout or memory limit is only what was captured before the
+process stopped. Running the shown command by itself may not reproduce the
+failure, because setup and earlier checks run first in the same workspace.
+Validators already hold the verifier, so receipts show operators nothing new.
 
 ## Scoring interpretation
 
