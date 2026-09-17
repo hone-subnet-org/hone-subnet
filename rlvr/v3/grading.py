@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
+from .feedback import is_bounded_display, render_failed_check
 from .identity import RepositoryTaskIdentity, TerminalScriptTaskIdentity
 from .manifest import (
     Check,
@@ -57,6 +58,7 @@ class EvaluationResult:
     reason_code: MinerReason | RoundReason | None = None
     stage: Stage | None = None
     receipt: CheckReceipt | None = None
+    failed_check: str | None = None
 
     def __post_init__(self) -> None:
         if self.status not in ("passed", "failed", "rejected", "abandoned"):
@@ -74,6 +76,13 @@ class EvaluationResult:
             self.status != "failed" or type(self.receipt) is not CheckReceipt
         ):
             raise ValueError("only a failed evaluation can carry a check receipt")
+        if self.failed_check is not None and (
+            self.status != "failed"
+            or self.reason_code is not MinerReason.CHECK_FAILED
+            or self.stage is not Stage.CHECK
+            or not is_bounded_display(self.failed_check)
+        ):
+            raise ValueError("only a failed check can carry a bounded check display")
 
 
 def _kind(check: Check) -> Literal["invocation", "inspection"]:
@@ -94,6 +103,7 @@ def _stop(
     reason_code: MinerReason | RoundReason,
     stage: Stage,
     receipt: CheckReceipt | None = None,
+    failed_check: str | None = None,
 ) -> EvaluationResult:
     remaining = manifest.checks[len(completed) :]
     return EvaluationResult(
@@ -104,6 +114,7 @@ def _stop(
         reason_code=reason_code,
         stage=stage,
         receipt=receipt,
+        failed_check=failed_check,
     )
 
 
@@ -133,6 +144,14 @@ def _receipt_or_none(**kwargs) -> CheckReceipt | None:
     except Exception:  # noqa: BLE001 - receipts are diagnostics and never change grading
         return None
     return receipt if type(receipt) is CheckReceipt else None
+
+
+def _failed_check_or_none(**kwargs) -> str | None:
+    try:
+        display = render_failed_check(**kwargs)
+        return display if is_bounded_display(display) else None
+    except Exception:  # noqa: BLE001 - explanations are diagnostics and never change grading
+        return None
 
 
 def _work_cwd(base: str, relative: str) -> str:
@@ -346,6 +365,12 @@ def _run_checks(
                         request=request,
                         container=container,
                         limit=None,
+                        expected_stdout=expected_stdout,
+                        expected_stderr=expected_stderr,
+                    ),
+                    failed_check=_failed_check_or_none(
+                        check=check,
+                        request=request,
                         expected_stdout=expected_stdout,
                         expected_stderr=expected_stderr,
                     ),

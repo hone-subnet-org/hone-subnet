@@ -1,4 +1,4 @@
-"""Stable local diagnostic codes, independent of the V3 wire contract."""
+"""Stable evaluation codes for local diagnostics and optional failure feedback."""
 
 from enum import Enum
 

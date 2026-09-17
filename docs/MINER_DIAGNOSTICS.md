@@ -3,8 +3,10 @@
 Validators write one round outcome and one evaluation record for each assigned
 miner to `v3_evaluations.jsonl`, beside the configured score-state file. When a
 miner's check runs and fails, a failure receipt may follow that miner's
-evaluation record. Each line is a JSON object. These records are local to the validator;
-they do not change feedback sent to the problem server.
+evaluation record. Each line is a JSON object. These records are local to the
+validator; they are never sent anywhere. Separately, and on by default, a
+validator sends each failed miner a short notice about its own failure, straight
+to that miner. See "Failure notices sent to miners" below.
 
 ```bash
 tail -f data/v3_evaluations.jsonl
@@ -109,11 +111,15 @@ is handled by the existing round and server logic.
 | `cleanup_failed` | Managed workspace cleanup failed. |
 | `validator_error` | Another validator failure occurred; `stage` identifies the operation. |
 
+The feedback a validator sends the problem server is unchanged: it still carries
+only uid, hotkey, pass or fail and a grading duration, byte for byte as before,
+and the old VALIDATOR_FAILURE_EXPLANATIONS setting no longer exists.
+
 Round outcome and miner evaluation records do not include signed URLs, response
 headers, miner response bodies, check output, expected answers, or verifier
 code. Failure receipts, described below, do include the failing check's command,
-input, and expected and actual output excerpts. Sending receipts to miners
-requires a separate server-coordinated contract.
+input, and expected and actual output excerpts. Receipts stay on the validator.
+Nothing in this log is sent to the problem server or to a miner.
 
 ## Failure receipts
 
@@ -162,6 +168,113 @@ Output after a timeout or memory limit is only what was captured before the
 process stopped. Running the shown command by itself may not reproduce the
 failure, because setup and earlier checks run first in the same workspace.
 Validators already hold the verifier, so receipts show operators nothing new.
+
+## Failure notices sent to miners
+
+When a graded round finishes, the validator sends one small signed message to each
+miner whose submission failed or was rejected, straight to that miner's axon. There
+is no problem server involved and nothing is stored centrally. Two settings control
+it, both on by default:
+
+- `VALIDATOR_FAILURE_NOTICES` sends the notices at all.
+- `VALIDATOR_FAILED_CHECK_DETAILS` adds the failing check's command and expected
+  output. With it off, a miner gets the reason code alone.
+
+A notice is `POST {miner axon}/v3/failure`, signed the same way a task is, and
+carries the protocol version, the fixed message type `failure_notice_v1`, the
+challenge and task ids, the recipient's own uid and hotkey, and a `failure` object
+holding `version`, `reason_code` and an optional `failed_check` display.
+
+The reason codes are the miner and submission codes tabled above. A round or
+infrastructure cause, or a missing code, is reported as the generic
+`evaluation_failed`. The `failed_check` display is only ever attached to
+`check_failed` at the check stage, and it is the same six-line text described
+below. It never contains the miner's own output, the check id, its position, the
+number of checks, or any verifier code.
+
+Delivery is deliberately cheap and forgettable. One attempt per miner, no retries
+and no redirects, at most 8 in flight, 2 seconds for one exchange and 5 seconds for
+the whole batch, at most 1024 recipients. An old miner without the route, an
+offline miner, or a slow one simply gets nothing. Nothing here can change a grade, a
+score or a weight, and the round is already finished when it runs. A notice is sent
+only for a completed round, only to a registration the round actually assigned and
+graded, and only when the score file was written successfully: an operator who
+disables score persistence receives no notices either. The cost is bounded but not
+zero, so a round can take up to five seconds longer when many miners are
+unreachable.
+
+### What a miner does with one
+
+The reference miner adds the route and prints what it receives, for example:
+
+```
+[demo-miner] feedback: check_failed challenge chal-8f21 task 9c4f000000000000
+[demo-miner] feedback:   Command (argv): ["/usr/bin/python3","main.py"]
+[demo-miner] feedback:   Working directory: "/work"
+[demo-miner] feedback:   Stdin: ""
+[demo-miner] feedback:   Required exit code: 0
+[demo-miner] feedback:   Required stdout: "red-fox\n"
+[demo-miner] feedback:   Required stderr: not checked
+```
+
+Nothing is written to disk. Operators who want history should capture the miner's
+stdout, which most process managers do; retention is then whatever that environment
+keeps.
+
+A miner implementing its own receiver should do what the reference does. Refuse
+anything it cannot verify: without a wallet identity or a metagraph view it answers
+403 rather than trusting the sender. Check the signature, that the message was
+signed for this miner, and that the signer is a validator under the same policy the
+miner already applies to tasks, which honours its own stake and permit settings.
+Refuse a replayed request. Refuse a notice addressed to another miner. Then check
+that the notice matches a task this miner actually answered for that validator, with
+the same uid and hotkey: a valid signature proves who sent it, not that they graded
+you. That memory holds 256 tasks for two hours and is lost on restart, so a notice
+about an older task is refused. A repeat for the same task is accepted and ignored.
+The reply is a fixed `{"accepted": true}`, which is an acknowledgement and no more.
+
+Treat the text as untrusted. The reference miner escapes everything that is not
+printable ASCII rather than deleting it, prints the reason before any identifier so
+a long id cannot hide it, never truncates the display, and drops it entirely with a
+short note if it is too large to print. Output runs off the event loop, at most four
+at once, and excess is refused immediately rather than queued, so notices cannot
+interfere with solving.
+
+### What the display can cover
+
+The display describes the FIRST check that failed, in the order the manifest
+already runs them. It is not the shortest or a minimized case, and finding it
+costs no extra grading runs. Later checks never ran and are never named.
+
+Only a narrow shape is rendered at all:
+
+- an invocation check whose command is exactly an allowlisted Python executable,
+  `/usr/bin/python3` or `/usr/local/bin/python3`, followed by one `.py` script
+  path that resolves inside `/work`;
+- no interpreter flags, no script arguments, no shell, no inline code;
+- the stdin and expected streams must decode as UTF-8, and the whole display must
+  fit 2048 bytes measured as an escaped JSON string.
+
+Anything else gets the reason code and no display: inspection checks that run the
+verifier's own checker, suites, other interpreters, compiled languages, build
+steps, and any check whose data is too large or not UTF-8. Compiler and build
+output are never forwarded, and an existing setup or execution failure is never
+relabelled as a compilation failure.
+
+A notice is at most 8192 bytes on the wire, and a miner should refuse anything
+larger.
+
+The display states what the check required. It is not a reproduction recipe:
+setup and any earlier checks run first in the same workspace, so running the
+shown command alone can behave differently.
+
+### Before enabling the display
+
+`VALIDATOR_FAILED_CHECK_DETAILS` shows the expected answer for the failing case.
+That is safe only while a task is never dispatched more than once, which is a
+guarantee from task generation and not something this repository enforces. Turn the
+setting off BEFORE any change that allows a task to be reused. Turning it off later
+cannot unsay what was already shown. Reason-only notices carry no such assumption.
 
 ## Scoring interpretation
 

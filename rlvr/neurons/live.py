@@ -101,6 +101,18 @@ class LiveSolverClient:
         self._http = http
         self._gate = gate or SendGate(settings.validator_send_concurrency)
 
+    @property
+    def gate(self) -> SendGate:
+        """Shared send-start gate, so every outbound call obeys one limit."""
+
+        return self._gate
+
+    @property
+    def url(self) -> str:
+        """Base URL of this miner's axon, without a trailing slash."""
+
+        return self._url
+
     async def solve(self, problem: Problem, prompt: str) -> SolutionResponse:
         artifact = await self.solve_signed(problem, request_id=uuid4().hex)
         return artifact.to_solution(problem.problem_id)

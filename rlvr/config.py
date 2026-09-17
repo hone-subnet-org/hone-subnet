@@ -83,6 +83,8 @@ class Settings(BaseSettings):
     validator_verify_concurrency: int = Field(default=16, ge=1, le=256)
     validator_score_state_file: str = "data/validator_scores.json"
     validator_diagnostics_file: str | None = None
+    validator_failure_notices: bool = True
+    validator_failed_check_details: bool = True
 
     # --- Dataset export ---
     dataset_dir: str = "data/rollouts"

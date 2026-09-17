@@ -26,6 +26,7 @@ from ..v3.client import V3ProblemServerClient
 from ..v3.diagnostics import EvaluationLog
 from ..v3.release import round_policy as v3_round_policy
 from ..v3.round import apply_round_scores, evaluate_round
+from .feedback_sender import send_failure_notices
 from .live import SendGate, _solver_clients
 from .validator import ValidatorNeuron
 
@@ -422,9 +423,16 @@ def _load_scores(engine: EvalEngine, path: str) -> None:
         print(f"[validator] WARN: could not restore local scores ({e})")
 
 
-def _save_scores(engine: EvalEngine, path: str) -> None:
+def _save_scores(engine: EvalEngine, path: str) -> bool:
+    """Persist the score window. Returns True only when the file was replaced.
+
+    Callers that ignore the result behave exactly as before. Failure feedback
+    uses it so that a round whose scores could not be written tells miners
+    nothing about that round.
+    """
+
     if not path:
-        return
+        return False
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         tmp = f"{path}.tmp"
@@ -450,6 +458,8 @@ def _save_scores(engine: EvalEngine, path: str) -> None:
         os.replace(tmp, path)
     except OSError as e:
         print(f"[validator] WARN: could not persist local scores ({e})")
+        return False
+    return True
 
 
 async def _run_decentralized_validator_async(settings: Settings) -> None:
@@ -526,12 +536,23 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
                 v.defer_rounds_until(next_lease_not_before(result.retry_after_s))
             elif result.status == "abandoned":
                 print(f"[validator] WARN: V3 round abandoned ({result.reason})")
-            _save_scores(engine, settings.validator_score_state_file)
+            saved = _save_scores(engine, settings.validator_score_state_file)
             try:
                 if not diagnostics.record_round(result, str(v.wallet.hotkey.ss58_address)):
                     print("[validator] WARN: local evaluation diagnostics could not be written")
             except Exception:  # noqa: BLE001 - diagnostics must not interrupt validation
                 print("[validator] WARN: local evaluation diagnostics could not be written")
+            if saved and settings.validator_failure_notices:
+                try:
+                    await send_failure_notices(
+                        result,
+                        live_solvers,
+                        wallet=v.wallet,
+                        http=http,
+                        include_details=settings.validator_failed_check_details,
+                    )
+                except Exception:  # noqa: BLE001 - feedback never interrupts validation
+                    print("[validator] WARN: failure notices could not be sent")
             print(f"[validator] locally evaluated {completed} challenges")
             return {uid: float(score) for uid, score in enumerate(engine.scores)}
 

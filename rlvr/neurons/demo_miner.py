@@ -17,7 +17,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ..policy import RELEASE_POLICY
 from ..protocol import NonceCache, sign_message, verify_signature
-from ..v3.api import MinerTaskRequest, MinerTaskResponse
+from ..v3.api import (
+    FAILURE_NOTICE_MAX_BYTES,
+    MinerFailureNotice,
+    MinerTaskRequest,
+    MinerTaskResponse,
+)
 from ..v3.canonical import canonical_json_bytes
 from ..v3.miner import upload_miner_result
 from ..v3.miner_workspace import WorkspaceReader, open_miner_workspace
@@ -293,6 +298,139 @@ class BedrockClient:
             await self._http.aclose()
 
 
+SERVED_TASK_LIMIT = 256
+SERVED_TASK_TTL_S = 7_200.0
+NOTICE_PRINT_SLOTS = 4
+FEEDBACK_PRINT_MAX_LINES = 24
+FEEDBACK_PRINT_HEADER_CHARS = 120
+FEEDBACK_PRINT_MAX_CHARS = 2_048
+
+
+class ServedTasks:
+    """Remember which tasks this miner answered, so a later notice can be matched.
+
+    A validator's signature proves who sent a notice, not that it graded us, so a
+    notice is only accepted for a task we actually answered for that validator, and
+    only for the registration that task was assigned to. Kept in memory: a restart
+    drops it and later notices are refused.
+
+    A task is recorded once this miner produced a response for it. That is not proof
+    the validator received the response.
+
+    Times are monotonic seconds, so a wall-clock change cannot extend the expiry.
+    """
+
+    def __init__(self, limit: int = SERVED_TASK_LIMIT, ttl_s: float = SERVED_TASK_TTL_S):
+        self.limit = limit
+        self.ttl_s = ttl_s
+        # key -> (served_at, uid, hotkey); insertion order is least recently used first
+        self.served: dict[tuple[str, str, str], tuple[float, int, str]] = {}
+        self.answered: set[tuple[str, str, str]] = set()
+
+    def _drop_expired(self, now: float) -> None:
+        for key, (served_at, _uid, _hotkey) in list(self.served.items()):
+            if now - served_at >= self.ttl_s:
+                self.served.pop(key, None)
+                self.answered.discard(key)
+
+    def add(
+        self,
+        validator: str,
+        challenge_id: str,
+        task_id: str,
+        uid: int,
+        hotkey: str,
+        now: float,
+    ) -> None:
+        self._drop_expired(now)
+        key = (validator, challenge_id, task_id)
+        self.served.pop(key, None)
+        self.served[key] = (now, uid, hotkey)
+        while len(self.served) > self.limit:
+            oldest = next(iter(self.served))
+            self.served.pop(oldest, None)
+            self.answered.discard(oldest)
+
+    def classify(
+        self,
+        validator: str,
+        challenge_id: str,
+        task_id: str,
+        uid: int,
+        hotkey: str,
+        now: float,
+    ) -> str:
+        """Return "unknown", "duplicate" or "new" for one incoming notice."""
+
+        self._drop_expired(now)
+        key = (validator, challenge_id, task_id)
+        served = self.served.get(key)
+        if served is None or (served[1], served[2]) != (uid, hotkey):
+            return "unknown"
+        # Recognizing a task counts as use, so it survives eviction; its expiry
+        # deliberately keeps the original served-at time.
+        self.served[key] = self.served.pop(key)
+        if key in self.answered:
+            return "duplicate"
+        self.answered.add(key)
+        return "new"
+
+
+def printable(text: str) -> str:
+    """Escape anything that is not plain printable ASCII.
+
+    Escaping, not deleting: removing a byte could silently join two tokens and turn a
+    displayed test into a different one. A validator cannot reach the terminal with
+    escape sequences, and it cannot hide a byte either.
+    """
+
+    out = []
+    for character in text:
+        if " " <= character <= "~":
+            out.append(character)
+        elif ord(character) < 256:
+            out.append(f"\\x{ord(character):02x}")
+        elif ord(character) <= 0xFFFF:
+            out.append(f"\\u{ord(character):04x}")
+        else:
+            # Fixed width: \\u with five digits would be ambiguous.
+            out.append(f"\\U{ord(character):08x}")
+    return "".join(out)
+
+
+def print_feedback(lines: list[str]) -> None:
+    """Write the notice to stdout. Blocking, so callers run it off the event loop."""
+
+    try:
+        print("\n".join(lines), flush=True)
+    except Exception:  # noqa: BLE001, S110 - a broken collector never stops solving
+        pass
+
+
+def feedback_lines(header: str, display: str | None) -> list[str]:
+    """Build every line printed for one notice, header included.
+
+    The header is escaped and cut, since it is only identifiers. The display is
+    escaped but NEVER cut: a shortened expected answer would be a different test, so
+    a display that does not fit is omitted with a reason instead. At most
+    FEEDBACK_PRINT_MAX_LINES lines are returned in total.
+    """
+
+    prefix = "[demo-miner] feedback: "
+    lines = [prefix + printable(header)[:FEEDBACK_PRINT_HEADER_CHARS]]
+    if not display:
+        return lines
+    # Split on LF only. str.splitlines() would also split on CR, VT, FF, NEL and
+    # U+2028, silently swallowing those bytes before printable could escape them.
+    escaped = [printable(line) for line in display.split("\n")]
+    if (
+        len(escaped) > FEEDBACK_PRINT_MAX_LINES - 1
+        or sum(len(line) for line in escaped) > FEEDBACK_PRINT_MAX_CHARS
+    ):
+        return lines + [prefix + "  display omitted: larger than this miner prints"]
+    return lines + [prefix + "  " + line for line in escaped]
+
+
 class DemoMiner:
     """Verify subnet requests and turn them into signed model solutions."""
 
@@ -312,6 +450,9 @@ class DemoMiner:
         self.metagraph = metagraph
         self.nonces = NonceCache(window_ms=8000)
         self.solve_slots = asyncio.Semaphore(settings.miner_max_concurrent_requests)
+        self.served_tasks = ServedTasks()
+        # Separate from solve_slots: a burst of notices must never starve solving.
+        self.printing_notices = 0
 
     @property
     def hotkey_address(self) -> str:
@@ -347,6 +488,80 @@ class DemoMiner:
             except (IndexError, TypeError):
                 return False
         return True
+
+    async def handle_failure_notice(
+        self, headers: Mapping[str, str], body: bytes
+    ) -> tuple[int, dict[str, object]]:
+        """Accept one signed notice about a task this miner answered.
+
+        Fails closed: without a wallet identity or a metagraph view we cannot judge
+        who sent this, so we refuse rather than trust it. A valid validator
+        signature proves the sender, not that it graded us, so the notice must also
+        match a task we answered for that validator and that registration.
+        """
+
+        if len(body) > FAILURE_NOTICE_MAX_BYTES:
+            return 413, {"error": "notice too large"}
+        if self.metagraph is None or not self.hotkey_address:
+            return 403, {"error": "receiver is not configured"}
+        if not verify_signature(headers, body, expected_signed_for=self.hotkey_address):
+            return 401, {"error": "invalid signature"}
+        if not self.nonces.check_and_add(headers.get("Epistula-Uuid", "")):
+            return 409, {"error": "replayed request"}
+        signed_by = headers.get("Epistula-Signed-By", "")
+        if not self.authorize(signed_by):
+            return 403, {"error": "unauthorized signer"}
+        try:
+            notice = MinerFailureNotice.model_validate_json(body)
+        except Exception:  # noqa: BLE001
+            return 400, {"error": "invalid failure notice"}
+        if notice.hotkey != self.hotkey_address:
+            return 403, {"error": "notice is for another miner"}
+
+        # Check admission BEFORE classify, which marks the task answered. Refusing
+        # after marking would leave a notice acknowledged but never printed.
+        if self.printing_notices >= NOTICE_PRINT_SLOTS:
+            return 503, {"error": "busy"}
+        seen = self.served_tasks.classify(
+            signed_by,
+            notice.challenge_id,
+            notice.task_id,
+            notice.uid,
+            notice.hotkey,
+            time.monotonic(),
+        )
+        if seen == "unknown":
+            return 404, {"error": "no such task from this validator"}
+        if seen == "new":
+            reason = notice.failure.reason_code
+            # Reason first: a long identifier must never push it out of the header.
+            header = (
+                f"{getattr(reason, 'value', reason)} "
+                f"challenge {notice.challenge_id[:32]} "
+                f"task {notice.task_id[:16]}"
+            )
+            lines = feedback_lines(header, notice.failure.failed_check)
+            self.printing_notices += 1
+            printing = asyncio.create_task(asyncio.to_thread(print_feedback, lines))
+            # The slot is freed when the write finishes, even if this request is
+            # cancelled first, so a cancelled caller cannot let writes overlap.
+            printing.add_done_callback(self._finished_printing)
+            try:
+                await asyncio.shield(printing)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001, S110 - output failures are ignored
+                pass
+        return 200, {"accepted": True}
+
+    def _finished_printing(self, task: asyncio.Task) -> None:
+        self.printing_notices = max(0, self.printing_notices - 1)
+        if task.cancelled():
+            # task.exception() would raise CancelledError, a BaseException.
+            return
+        # Retrieve and drop it: reporting here would write to the very collector
+        # that just failed, from the event loop we deliberately keep free.
+        task.exception()
 
     async def solve(self, request: MinerTaskRequest, timeout_s: float) -> MinerTaskResponse:
         started = time.monotonic()
@@ -518,6 +733,14 @@ class DemoMiner:
         except Exception as exc:  # noqa: BLE001
             print(f"[demo-miner] solve failed: {type(exc).__name__}")
             return 500, {"error": "solve failed"}
+        self.served_tasks.add(
+            signed_by,
+            request.challenge_id,
+            request.task_id,
+            request.slots.submission.uid,
+            request.slots.submission.hotkey,
+            time.monotonic(),
+        )
         return 200, payload
 
     async def aclose(self) -> None:
@@ -565,8 +788,8 @@ def build_demo_miner_app(miner: DemoMiner):
                 # would trigger another chain RPC while the endpoint is unhealthy.
                 sync_state["last"] = time.monotonic()
 
-    async def read_bounded(request: Request) -> Optional[bytes]:
-        limit = miner.settings.miner_max_request_bytes
+    async def read_bounded(request: Request, limit: int | None = None) -> Optional[bytes]:
+        limit = miner.settings.miner_max_request_bytes if limit is None else limit
         try:
             declared = int(request.headers.get("content-length", "0") or 0)
         except ValueError:
@@ -610,6 +833,26 @@ def build_demo_miner_app(miner: DemoMiner):
                 )
             )
         return response
+
+    @app.post("/v3/failure")
+    async def failure_endpoint(request: Request) -> Response:
+        await maybe_sync_metagraph()
+        body = await read_bounded(
+            request,
+            min(miner.settings.miner_max_request_bytes, FAILURE_NOTICE_MAX_BYTES),
+        )
+        if body is None:
+            return Response(
+                content=b'{"error":"request body too large"}',
+                status_code=413,
+                media_type="application/json",
+            )
+        status, payload = await miner.handle_failure_notice(request.headers, body)
+        return Response(
+            content=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+            status_code=status,
+            media_type="application/json",
+        )
 
     @app.get("/health")
     async def health() -> dict[str, str]:

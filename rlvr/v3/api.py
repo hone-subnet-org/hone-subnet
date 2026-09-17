@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    field_validator,
+    model_validator,
+)
 
 from .artifacts import (
     ArtifactFailure,
@@ -13,19 +21,22 @@ from .artifacts import (
     MinerSlotSet,
 )
 from .canonical import SAFE_INTEGER_MAX, validate_protocol_string
+from .feedback import FAILED_CHECK_MAX_BYTES
 from .identity import TaskIdentity, compute_task_id
+from .reasons import MinerReason
 from .wire import (
+    UID,
     BoundedIdentifier,
     BoundedURL,
     HexDigest,
     Timestamp,
-    UID,
     WireModel,
     exact_int_literal,
 )
 
 ProtocolVersion = exact_int_literal(3)
 VerifierPolicy = Literal["command-gold-digest-v1"]
+FAILURE_NOTICE_MAX_BYTES = 8 * 1024
 
 EPISTULA_HEADERS = (
         "Epistula-Version",
@@ -266,11 +277,54 @@ class CommitRevealResponse(WireModel):
         return self
 
 
+class FailureExplanation(WireModel):
+    version: exact_int_literal(1)
+    reason_code: MinerReason | Literal["evaluation_failed"]
+    failed_check: str | None = None
+
+    @field_validator("failed_check")
+    @classmethod
+    def bound_failed_check(cls, value: str | None) -> str | None:
+        if value is not None and (
+            not value
+            or len(value) > FAILED_CHECK_MAX_BYTES
+            or len(json.dumps(value, ensure_ascii=True).encode("ascii"))
+            > FAILED_CHECK_MAX_BYTES
+        ):
+            raise ValueError("failed check exceeds its display limit")
+        return value
+
+    @model_validator(mode="after")
+    def validate_failed_check_reason(self) -> FailureExplanation:
+        if self.failed_check is not None and self.reason_code != MinerReason.CHECK_FAILED:
+            raise ValueError("only a failed comparison can include a check")
+        return self
+
+
+class MinerFailureNotice(WireModel):
+    protocol_version: ProtocolVersion
+    message_type: Literal["failure_notice_v1"]
+    challenge_id: BoundedIdentifier
+    task_id: HexDigest
+    uid: UID
+    hotkey: BoundedIdentifier
+    failure: FailureExplanation
+
+
 class FeedbackVerdict(WireModel):
     uid: UID
     hotkey: BoundedIdentifier
     passed: StrictBool
     grading_duration_ms: Annotated[int, Field(ge=0, le=SAFE_INTEGER_MAX)]
+    failure: FailureExplanation | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
+    @model_validator(mode="after")
+    def validate_failure(self) -> FeedbackVerdict:
+        if self.passed and self.failure is not None:
+            raise ValueError("a passing verdict cannot include a failure")
+        return self
 
 
 class ChallengeFeedbackRequest(WireModel):
@@ -306,6 +360,16 @@ def serialize_feedback_request(request: ChallengeFeedbackRequest) -> bytes:
         raise TypeError("request must be a V3 feedback request")
     validated = ChallengeFeedbackRequest.model_validate(request.model_dump(mode="python"))
     return validated.model_dump_json().encode("utf-8")
+
+
+def serialize_failure_notice(notice: MinerFailureNotice) -> bytes:
+    if type(notice) is not MinerFailureNotice:
+        raise TypeError("notice must be a V3 miner failure notice")
+    validated = MinerFailureNotice.model_validate(notice.model_dump(mode="python"))
+    body = validated.model_dump_json().encode("utf-8")
+    if len(body) > FAILURE_NOTICE_MAX_BYTES:
+        raise ValueError("failure notice exceeds its byte limit")
+    return body
 
 
 def derive_miner_request_id(challenge_id: str, uid: int, hotkey: str) -> str:

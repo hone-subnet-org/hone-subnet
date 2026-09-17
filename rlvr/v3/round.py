@@ -555,17 +555,19 @@ async def evaluate_round(
                         result.reason_code if isinstance(result.reason_code, RoundReason) else RoundReason.VALIDATOR_ERROR,
                         result.stage,
                     )
-            evaluations.sort(key=lambda item: item.uid)
-            feedback_accepted = await _send_diagnostic_feedback(
-                client,
-                lease.challenge_id,
-                lease.task_id,
-                revealed.submission_grants,
-                evaluations,
-            )
-            if not feedback_accepted:
-                print("[validator] WARN: V3 diagnostic feedback was not accepted")
-            return finish("completed")
+            stage = Stage.CLEANUP
+        stage = Stage.GRADING
+        evaluations.sort(key=lambda item: item.uid)
+        feedback_accepted = await _send_diagnostic_feedback(
+            client,
+            lease.challenge_id,
+            lease.task_id,
+            revealed.submission_grants,
+            evaluations,
+        )
+        if not feedback_accepted:
+            print("[validator] WARN: V3 diagnostic feedback was not accepted")
+        return finish("completed")
     except Exception as error:  # noqa: BLE001 - infrastructure faults abandon atomically
         return finish(
             "abandoned",
