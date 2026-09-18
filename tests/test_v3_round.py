@@ -463,6 +463,11 @@ def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
     assert [item.result.status for item in result.evaluations] == [
         "passed", "failed", "rejected", "rejected"
     ]
+    by_uid = {item.uid: item for item in result.evaluations}
+    for uid in (1, 2, 3):  # granted: the authenticated trajectory reference travels with the evaluation
+        assert by_uid[uid].trajectory is not None
+        assert by_uid[uid].trajectory.artifact_role == "trajectory"
+    assert by_uid[4].trajectory is None  # rejected at commit: no trusted trajectory
     assert not stale_cache.exists()
     assert len(feedback_requests) == 1
     assert {item.uid for item in feedback_requests[0].verdicts} == {1, 2, 3}

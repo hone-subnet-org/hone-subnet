@@ -85,6 +85,10 @@ class Settings(BaseSettings):
     validator_diagnostics_file: str | None = None
     validator_failure_notices: bool = True
     validator_failed_check_details: bool = True
+    # Trajectory spot checks: off until a service URL and its hotkey are set.
+    validator_trace_check_url: str = ""
+    validator_trace_check_hotkey: str = ""
+    validator_trace_check_rate: float = Field(default=0.01, ge=0.0, le=1.0)
 
     # --- Dataset export ---
     dataset_dir: str = "data/rollouts"

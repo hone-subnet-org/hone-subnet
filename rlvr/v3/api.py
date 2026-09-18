@@ -37,6 +37,7 @@ from .wire import (
 ProtocolVersion = exact_int_literal(3)
 VerifierPolicy = Literal["command-gold-digest-v1"]
 FAILURE_NOTICE_MAX_BYTES = 8 * 1024
+TRACE_CHECK_MAX_BYTES = 4 * 1024
 
 EPISTULA_HEADERS = (
         "Epistula-Version",
@@ -311,6 +312,29 @@ class MinerFailureNotice(WireModel):
     failure: FailureExplanation
 
 
+class TraceCheckRequest(WireModel):
+    """Ask the evaluation service to look at one uploaded trajectory.
+
+    Carries a reference only. The service fetches the bytes from storage itself
+    and must verify the sha256 and size against what it fetched.
+    """
+
+    protocol_version: ProtocolVersion
+    message_type: Literal["trace_check_v1"]
+    challenge_id: BoundedIdentifier
+    task_id: HexDigest
+    uid: UID
+    hotkey: BoundedIdentifier
+    trajectory: MinerArtifactRef
+    submission_status: Literal["passed", "failed", "rejected"]
+
+    @model_validator(mode="after")
+    def validate_trajectory_role(self) -> TraceCheckRequest:
+        if self.trajectory.artifact_role != "trajectory":
+            raise ValueError("a trace check must reference a trajectory")
+        return self
+
+
 class FeedbackVerdict(WireModel):
     uid: UID
     hotkey: BoundedIdentifier
@@ -360,6 +384,16 @@ def serialize_failure_notice(notice: MinerFailureNotice) -> bytes:
     body = validated.model_dump_json().encode("utf-8")
     if len(body) > FAILURE_NOTICE_MAX_BYTES:
         raise ValueError("failure notice exceeds its byte limit")
+    return body
+
+
+def serialize_trace_check_request(request: TraceCheckRequest) -> bytes:
+    if type(request) is not TraceCheckRequest:
+        raise TypeError("request must be a V3 trace check request")
+    validated = TraceCheckRequest.model_validate(request.model_dump(mode="python"))
+    body = validated.model_dump_json().encode("utf-8")
+    if len(body) > TRACE_CHECK_MAX_BYTES:
+        raise ValueError("trace check request exceeds its byte limit")
     return body
 
 

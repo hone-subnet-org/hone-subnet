@@ -25,7 +25,7 @@ from .api import (
     validate_commit_reveal,
 )
 from .archive import ArchiveLimits, extract_archive
-from .artifacts import ArtifactGrant
+from .artifacts import ArtifactGrant, MinerArtifactRef
 from .client import V3ProblemServerClient
 from .download import download_artifact
 from .grading import EvaluationResult, evaluate_repository, evaluate_terminal
@@ -113,6 +113,9 @@ class MinerEvaluation:
     latency_ms: int
     result: EvaluationResult
     grading_duration_ms: int = 0
+    # From the miner's signed, slot-matched response; None when the server
+    # rejected the submission at commit and no trusted trajectory exists.
+    trajectory: MinerArtifactRef | None = None
 
 
 @dataclass(frozen=True)
@@ -540,6 +543,7 @@ async def evaluate_round(
                             grant.uid, grant.hotkey,
                             submissions_by_registration[(grant.uid, grant.hotkey)].latency_ms,
                             result, grading_duration_ms,
+                            trajectory=signed.trajectory,
                         )
                     )
                 finally:

@@ -28,6 +28,7 @@ from ..v3.release import round_policy as v3_round_policy
 from ..v3.round import apply_round_scores, evaluate_round
 from .feedback_sender import send_failure_notices
 from .live import SendGate, _solver_clients
+from .trace_check import send_trace_checks
 from .validator import ValidatorNeuron
 
 _WEIGHTS_RATE_LIMIT_MARGIN = 20
@@ -553,6 +554,18 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
                     )
                 except Exception:  # noqa: BLE001 - feedback never interrupts validation
                     print("[validator] WARN: failure notices could not be sent")
+            if saved and settings.validator_trace_check_url:
+                try:
+                    await send_trace_checks(
+                        result,
+                        wallet=v.wallet,
+                        http=http,
+                        url=settings.validator_trace_check_url,
+                        service_hotkey=settings.validator_trace_check_hotkey,
+                        rate=settings.validator_trace_check_rate,
+                    )
+                except Exception:  # noqa: BLE001 - spot checks never interrupt validation
+                    print("[validator] WARN: trace checks could not be sent")
             print(f"[validator] locally evaluated {completed} challenges")
             return {uid: float(score) for uid, score in enumerate(engine.scores)}
 

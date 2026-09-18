@@ -232,6 +232,40 @@ guarantee from task generation and not something this repository enforces. Turn 
 setting off BEFORE any change that allows a task to be reused. Turning it off later
 cannot unsay what was already shown. Reason-only notices carry no such assumption.
 
+## Trajectory spot checks
+
+Every submission comes with a trajectory: the model's reasoning, its chosen tokens
+and their log-probabilities, and the tool calls it made. After a graded round, a
+validator sends a sample of these to an evaluation service for review. Fabricated
+or inconsistent traces may be penalized through a separate mechanism; this
+sender only reports references, and applies no penalty itself.
+
+The validator never holds the trajectory itself. It sends a small signed ticket
+naming the uploaded file, its hash and size, along with the challenge, task and
+miner registration, and the service fetches the file from storage. Every
+submission the server accepted at commit is eligible, whether it then passed,
+failed, or was rejected during grading; a submission rejected at commit has no
+trusted trajectory and is not. The draw is made per submission with local
+randomness.
+
+Three settings control it. It is off until the first two are set:
+
+- `VALIDATOR_TRACE_CHECK_URL`, the service address, HTTPS only.
+- `VALIDATOR_TRACE_CHECK_HOTKEY`, the identity the ticket is signed for. The
+  service should verify the validator's signature against the metagraph exactly
+  as a miner does.
+- `VALIDATOR_TRACE_CHECK_RATE`, the expected fraction of eligible submissions
+  sampled, default 0.01. It is a selection rate, not delivered coverage: a
+  service outage or deadline lowers what arrives.
+
+Delivery is best effort and bounded: one request per sampled submission, no
+retries, at most four in flight, two seconds per request and five for the batch,
+and the reply is not read beyond its status. Nothing about it can change a grade,
+a score or a weight, and the validator reads no result back. The evaluation
+service is not part of this repository; it must fetch by upload id, hold uploads
+long enough to fetch them after the round, bind the stored file to the challenge,
+task, miner and trajectory role, and match the size and hash of what it fetched.
+
 ## Scoring interpretation
 
 An eligible passing miner gets a contribution between the release speed floor
