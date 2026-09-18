@@ -48,7 +48,7 @@ def build_notice(
         and stage == Stage.CHECK
         else None
     )
-    for attempt in (display, None):
+    for attempt in ((display, None) if display is not None else (None,)):
         try:
             return MinerFailureNotice(
                 protocol_version=3,

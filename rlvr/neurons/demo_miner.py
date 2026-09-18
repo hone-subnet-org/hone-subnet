@@ -548,8 +548,6 @@ class DemoMiner:
             printing.add_done_callback(self._finished_printing)
             try:
                 await asyncio.shield(printing)
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001, S110 - output failures are ignored
                 pass
         return 200, {"accepted": True}

@@ -17,7 +17,6 @@ from .manifest import (
 )
 from .patch import PatchLimits, PatchToolError, apply_patch_in_container
 from .reasons import MinerReason, RoundReason, Stage
-from .receipts import CheckReceipt, build_check_receipt
 from .script import ScriptLimits, validate_script
 from .supervisor import (
     ContainerRequest,
@@ -57,7 +56,6 @@ class EvaluationResult:
     script_exit_code: int | None
     reason_code: MinerReason | RoundReason | None = None
     stage: Stage | None = None
-    receipt: CheckReceipt | None = None
     failed_check: str | None = None
 
     def __post_init__(self) -> None:
@@ -72,10 +70,6 @@ class EvaluationResult:
             type(item) is not CheckResult for item in self.checks
         ):
             raise ValueError("evaluation checks must be a tuple")
-        if self.receipt is not None and (
-            self.status != "failed" or type(self.receipt) is not CheckReceipt
-        ):
-            raise ValueError("only a failed evaluation can carry a check receipt")
         if self.failed_check is not None and (
             self.status != "failed"
             or self.reason_code is not MinerReason.CHECK_FAILED
@@ -102,7 +96,6 @@ def _stop(
     script_exit_code: int | None,
     reason_code: MinerReason | RoundReason,
     stage: Stage,
-    receipt: CheckReceipt | None = None,
     failed_check: str | None = None,
 ) -> EvaluationResult:
     remaining = manifest.checks[len(completed) :]
@@ -113,7 +106,6 @@ def _stop(
         script_exit_code=script_exit_code,
         reason_code=reason_code,
         stage=stage,
-        receipt=receipt,
         failed_check=failed_check,
     )
 
@@ -136,14 +128,6 @@ def _resource_reason(result: ContainerResult) -> MinerReason | None:
     if result.stdout_overflow or result.stderr_overflow:
         return MinerReason.OUTPUT_LIMIT
     return None
-
-
-def _receipt_or_none(**kwargs) -> CheckReceipt | None:
-    try:
-        receipt = build_check_receipt(**kwargs)
-    except Exception:  # noqa: BLE001 - receipts are diagnostics and never change grading
-        return None
-    return receipt if type(receipt) is CheckReceipt else None
 
 
 def _failed_check_or_none(**kwargs) -> str | None:
@@ -318,16 +302,6 @@ def _run_checks(
                     script_exit_code=script_exit_code,
                     reason_code=limit,
                     stage=Stage.CHECK,
-                    receipt=_receipt_or_none(
-                        check=check,
-                        check_index=check_index,
-                        checks_total=len(manifest.checks),
-                        request=request,
-                        container=container,
-                        limit=None if limit is None else limit.value,
-                        expected_stdout=None,
-                        expected_stderr=None,
-                    ),
                 )
 
             expected_stdout = (verifier_dir / check.expect.stdout).read_bytes()
@@ -358,16 +332,6 @@ def _run_checks(
                     script_exit_code=script_exit_code,
                     reason_code=MinerReason.CHECK_FAILED,
                     stage=Stage.CHECK,
-                    receipt=_receipt_or_none(
-                        check=check,
-                        check_index=check_index,
-                        checks_total=len(manifest.checks),
-                        request=request,
-                        container=container,
-                        limit=None,
-                        expected_stdout=expected_stdout,
-                        expected_stderr=expected_stderr,
-                    ),
                     failed_check=_failed_check_or_none(
                         check=check,
                         request=request,

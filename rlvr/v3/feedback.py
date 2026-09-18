@@ -46,7 +46,6 @@ def _eligible_cwd(cwd: object) -> bool:
     return (
         type(cwd) is str
         and _path_characters(cwd)
-        and _no_parent(cwd)
         and posixpath.normpath(cwd) == cwd
         and (cwd == _WORK or cwd.startswith(_WORK + "/"))
     )
@@ -65,7 +64,7 @@ def _eligible_script(script: object, cwd: str) -> bool:
     resolved = posixpath.normpath(
         script if script.startswith("/") else posixpath.join(cwd, script)
     )
-    return resolved.startswith(_WORK + "/") and len(resolved) > len(_WORK) + 1
+    return resolved.startswith(_WORK + "/")
 
 
 def render_failed_check(

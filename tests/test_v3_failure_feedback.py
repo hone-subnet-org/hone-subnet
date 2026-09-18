@@ -98,9 +98,8 @@ def send(client, evaluations, *, grants=None, **kwargs):
     )
 
 
-@pytest.mark.parametrize("explicit_null", [False, True])
-def test_absent_failure_keeps_legacy_bytes_in_all_serialization_paths(explicit_null):
-    item = verdict(**({"failure": None} if explicit_null else {}))
+def test_server_feedback_keeps_legacy_bytes_in_all_serialization_paths():
+    item = verdict()
     expected = {"uid": 7, "hotkey": "hk-7", "passed": False, "grading_duration_ms": 23}
     assert item.model_dump() == expected
     assert json.loads(item.model_dump_json()) == expected
@@ -111,18 +110,6 @@ def test_absent_failure_keeps_legacy_bytes_in_all_serialization_paths(explicit_n
     ).encode()
     assert request(item).model_dump_json().encode() == old_wire
     assert serialize_feedback_request(request(item)) == old_wire
-
-
-@pytest.mark.parametrize("reason", [*MinerReason, "evaluation_failed"])
-def test_public_failure_reasons_round_trip_with_explicit_null_test(reason):
-    failure = FailureExplanation(version=1, reason_code=reason)
-    encoded = serialize_feedback_request(request(verdict(failure=failure)))
-    payload = json.loads(encoded)["verdicts"][0]["failure"]
-    assert payload == {"version": 1, "reason_code": reason, "failed_check": None}
-    assert (
-        ChallengeFeedbackRequest.model_validate_json(encoded).verdicts[0].failure
-        == failure
-    )
 
 
 @pytest.mark.parametrize(
@@ -149,14 +136,6 @@ def test_failure_schema_rejects_noncontract_data(changes):
         FailureExplanation(**fields)
 
 
-def test_passing_verdict_cannot_carry_failure():
-    with pytest.raises(ValidationError):
-        verdict(
-            passed=True,
-            failure=FailureExplanation(version=1, reason_code=MinerReason.CHECK_FAILED),
-        )
-
-
 @pytest.mark.parametrize("unit", ["x", "\n", "é", "😀"])
 def test_failed_check_cap_counts_json_escaping_and_quotes(unit):
     per_unit = len(json.dumps(unit, ensure_ascii=True).encode("ascii")) - 2
@@ -168,38 +147,6 @@ def test_failed_check_cap_counts_json_escaping_and_quotes(unit):
         FailureExplanation(
             version=1, reason_code=MinerReason.CHECK_FAILED, failed_check=fitting + unit
         )
-
-
-@pytest.mark.parametrize(
-    "update",
-    [
-        {"version": True},
-        {"reason_code": PRIVATE},
-        {"failed_check": "x" * 2047},
-        {"reason_code": MinerReason.TIMEOUT, "failed_check": DISPLAY},
-    ],
-)
-@pytest.mark.filterwarnings("ignore:Pydantic serializer warnings:UserWarning")
-def test_serializer_revalidates_nested_failure_after_unchecked_copy(update):
-    valid = FailureExplanation(version=1, reason_code=MinerReason.CHECK_FAILED)
-    forged = valid.model_copy(update=update)
-    item = verdict().model_copy(update={"failure": forged})
-    payload = request(verdict()).model_copy(update={"verdicts": [item]})
-    with pytest.raises((ValidationError, ValueError)):
-        serialize_feedback_request(payload)
-
-
-def test_serializer_rejects_unchecked_failure_added_to_passing_verdict():
-    payload = request(verdict(passed=True))
-    item = payload.verdicts[0].model_copy(
-        update={
-            "failure": FailureExplanation(
-                version=1, reason_code=MinerReason.CHECK_FAILED
-            ),
-        }
-    )
-    with pytest.raises((ValidationError, ValueError)):
-        serialize_feedback_request(payload.model_copy(update={"verdicts": [item]}))
 
 
 def test_server_feedback_keeps_legacy_payload_despite_available_display():
@@ -241,16 +188,8 @@ def test_feedback_failure_cannot_change_result_or_payments():
     ) == {7: 0.0, 8: 1.0}
 
 
-def test_enriched_feedback_retries_identical_serialized_bytes():
-    payload = request(
-        verdict(
-            failure=FailureExplanation(
-                version=1,
-                reason_code=MinerReason.CHECK_FAILED,
-                failed_check=DISPLAY,
-            )
-        )
-    )
+def test_feedback_retries_identical_serialized_bytes():
+    payload = request(verdict())
     bodies = []
 
     async def handler(http_request):
@@ -397,30 +336,3 @@ def test_round_directory_cleanup_failure_prevents_feedback_and_score_updates(
         speed_floor=0.95,
     )
     assert repr(engine.histories) == before
-
-
-def test_full_request_budget_includes_escaped_identity_fields():
-    failure = FailureExplanation(
-        version=1,
-        reason_code=MinerReason.CHECK_FAILED,
-        failed_check="x" * 2046,
-    )
-    payload = ChallengeFeedbackRequest(
-        protocol_version=3,
-        challenge_id="\x00" * 128,
-        task_id="a" * 64,
-        verdicts=[
-            verdict(
-                uid=uid,
-                hotkey="\x00" * 124 + f"{uid:04}",
-                grading_duration_ms=2**53 - 1,
-                failure=failure,
-            )
-            for uid in range(1024)
-        ],
-    )
-    # These identifiers are legal in the existing schema and cost six bytes per
-    # control character on the wire. Ordinary printable IDs are not the upper bound.
-    encoded = serialize_feedback_request(payload)
-    assert len(encoded) > 3_000_000
-    assert len(ChallengeFeedbackRequest.model_validate_json(encoded).verdicts) == 1024

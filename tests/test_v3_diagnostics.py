@@ -56,7 +56,7 @@ MINER_KEYS = {
     "round_status", "round_reason_code", "score_effect", "record_id", "record_type",
     "uid", "miner_hotkey", "status", "reason_code", "dispatch_reason_code", "stage",
     "reason", "checks_passed", "checks_executed", "checks_total", "checks_skipped",
-    "grading_duration_ms", "response_latency_ms",
+    "grading_duration_ms", "response_latency_ms", "failed_check",
 }
 
 
@@ -316,6 +316,63 @@ def test_records_are_single_ascii_lines_without_control_bytes(tmp_path):
 # --------------------------------------------------------------------------- #
 # Sink configuration and bounds
 # --------------------------------------------------------------------------- #
+def test_partial_line_from_an_interrupted_write_does_not_swallow_the_next_record(tmp_path):
+    path = tmp_path / "log.jsonl"
+    log = EvaluationLog(str(path))
+    assert log.record_round(completed(challenge="chal-a", evaluations=[evaluation(1, PASSED)]), VALIDATOR)
+    with path.open("ab") as output:
+        output.write(b'{"record_type":"miner_evaluation","uid":9')
+    assert log.record_round(completed(challenge="chal-b", evaluations=[evaluation(1, PASSED)]), VALIDATOR)
+    good = []
+    for line in lines(path):
+        try:
+            good.append(json.loads(line)["challenge_id"])
+        except ValueError:
+            pass  # the interrupted line, skipped as documented
+    assert good == ["chal-a", "chal-a", "chal-b", "chal-b"]
+
+
+DISPLAY = 'Command (argv): ["/usr/bin/python3","main.py"]\nRequired stdout: "red-fox\\n"'
+
+
+def test_failed_check_display_is_logged_when_present():
+    shown = dataclasses.replace(STOPPED, failed_check=DISPLAY)
+    items = records(completed(evaluations=[evaluation(1, shown), evaluation(2, PASSED)]))
+    miners = by_uid(items)
+    assert miners[1]["failed_check"] == DISPLAY
+    assert miners[2]["failed_check"] is None
+
+
+def test_oversized_display_is_dropped_before_the_record_and_later_records_survive(tmp_path):
+    # Bounded identifiers the wire accepts, plus a maximal display, exceed one line.
+    shown = dataclasses.replace(STOPPED, failed_check="x" * 2046)
+    first = MinerEvaluation(1, "\x00" * 128, 10, shown, 5)
+    second = evaluation(2, PASSED)
+    result = completed(challenge="\x00" * 128, evaluations=[first, second])
+    path = tmp_path / "log.jsonl"
+    assert EvaluationLog(str(path)).record_round(result, VALIDATOR) is True
+    items = parsed(path)
+    assert [item["record_type"] for item in items] == [
+        "round_outcome", "miner_evaluation", "miner_evaluation",
+    ]
+    miners = by_uid(items)
+    assert miners[1]["failed_check"] is None and miners[1]["reason"] == STOPPED.reason
+    assert miners[2]["status"] == "passed"
+    assert all(len(line) + 1 <= diagnostics.MAX_RECORD_BYTES for line in lines(path))
+
+
+def test_separator_written_after_a_partial_line_counts_toward_the_file_cap(tmp_path):
+    path = tmp_path / "log.jsonl"
+    cap = diagnostics.MAX_RECORD_BYTES
+    log = EvaluationLog(str(path), max_file_bytes=cap, backup_count=1)
+    result = completed(evaluations=[evaluation(1, PASSED)])
+    first_line = diagnostics._encode(next(round_records(result, VALIDATOR)))
+    path.write_bytes(b"x" * (cap - len(first_line)))  # partial, no newline, exactly fills
+    assert log.record_round(result, VALIDATOR) is True
+    for file in all_files(path):
+        assert file.stat().st_size <= cap
+
+
 def test_empty_path_disables_the_sink(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     log = EvaluationLog("")
@@ -397,36 +454,6 @@ def test_unbounded_validator_hotkey_cannot_produce_an_oversize_line(tmp_path):
     log = EvaluationLog(str(path))
     assert log.record_round(completed(evaluations=[evaluation(1, PASSED)]), "v" * 5_000) is False
     assert not path.exists() or path.read_bytes() == b""
-
-
-def test_interrupted_trailing_write_is_truncated_before_the_next_append(tmp_path):
-    path = tmp_path / "log.jsonl"
-    log = EvaluationLog(str(path))
-    first = completed(challenge="chal-a", evaluations=[evaluation(1, PASSED)])
-    assert log.record_round(first, VALIDATOR)
-    intact = path.read_bytes()
-    with path.open("ab") as output:
-        output.write(b'{"record_type":"miner_evaluation","uid":9')
-    second = completed(challenge="chal-b", evaluations=[evaluation(1, PASSED)])
-    assert log.record_round(second, VALIDATOR) is True
-    assert path.read_bytes().startswith(intact)
-    items = parsed(path)
-    assert [item["challenge_id"] for item in items] == ["chal-a", "chal-a", "chal-b", "chal-b"]
-    assert b'"uid":9' not in path.read_bytes()
-
-
-def test_partial_only_file_is_reset_and_unrepairable_tail_is_harmless(tmp_path):
-    path = tmp_path / "log.jsonl"
-    path.write_bytes(b'{"broken":')
-    log = EvaluationLog(str(path))
-    assert log.record_round(completed(evaluations=[evaluation(1, PASSED)]), VALIDATOR) is True
-    assert [item["record_type"] for item in parsed(path)] == ["round_outcome", "miner_evaluation"]
-
-    garbage = tmp_path / "garbage.jsonl"
-    garbage.write_bytes(b"x" * (diagnostics.MAX_RECORD_BYTES + 1))
-    log = EvaluationLog(str(garbage))
-    assert log.record_round(completed(evaluations=[evaluation(1, PASSED)]), VALIDATOR) is False
-    assert garbage.read_bytes() == b"x" * (diagnostics.MAX_RECORD_BYTES + 1)
 
 
 # --------------------------------------------------------------------------- #

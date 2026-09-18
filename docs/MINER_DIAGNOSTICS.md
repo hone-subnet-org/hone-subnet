@@ -1,9 +1,8 @@
 # Local evaluation diagnostics
 
 Validators write one round outcome and one evaluation record for each assigned
-miner to `v3_evaluations.jsonl`, beside the configured score-state file. When a
-miner's check runs and fails, a failure receipt may follow that miner's
-evaluation record. Each line is a JSON object. These records are local to the
+miner to `v3_evaluations.jsonl`, beside the configured score-state file. Each
+line is a JSON object. These records are local to the
 validator; they are never sent anywhere. Separately, and on by default, a
 validator sends each failed miner a short notice about its own failure, straight
 to that miner. See "Failure notices sent to miners" below.
@@ -29,12 +28,10 @@ round. A missing miner record is not evidence of success, failure, or score cred
 
 The log uses `schema_version: 1`. Consumers should tolerate additional reason
 codes and skip record types they do not recognize. Each serialized line is at
-most 4 KiB; an optional reason is omitted if necessary to meet that cap, and a
-failure receipt that cannot fit is skipped. Readers should skip a malformed final line
-after an interrupted write. The next write repairs an incomplete active-file
-tail. If external corruption leaves more than 4 KiB without a newline at the
-end, writes fail until the operator moves the damaged file aside.
-Run only one validator writer for each log path.
+most 4 KiB; to meet that cap the optional `failed_check` is dropped first, then
+the optional reason. An interrupted write can leave a malformed line anywhere in
+the file, since the next write ends it and carries on; readers should skip any
+line that does not parse. Run only one validator writer for each log path.
 
 ## Reading an outcome
 
@@ -55,6 +52,11 @@ Run only one validator writer for each log path.
   Early stopping is unchanged.
 - `grading_duration_ms` and `response_latency_ms`: describe grading and response
   time when available. They are `null` for miners without an evaluation record.
+- `failed_check`: the six-line description of the failing check that was
+  available for this evaluation, when one could be rendered; otherwise `null`. It
+  states what the check required, never what the miner printed. It is not proof
+  the miner received it: details may be switched off, delivery is best effort,
+  and a partial evaluation from an abandoned round is recorded here too.
 - `score_effect`: `unchanged` for an abandoned round, or `not_reported` for a
   completed round. These are evaluation records, not proof of a credited reward
   or persisted observation for an individual miner. Registration eligibility
@@ -116,58 +118,12 @@ only uid, hotkey, pass or fail and a grading duration, byte for byte as before,
 and the old VALIDATOR_FAILURE_EXPLANATIONS setting no longer exists.
 
 Round outcome and miner evaluation records do not include signed URLs, response
-headers, miner response bodies, check output, expected answers, or verifier
-code. Failure receipts, described below, do include the failing check's command,
-input, and expected and actual output excerpts. Receipts stay on the validator.
-Nothing in this log is sent to the problem server or to a miner.
-
-## Failure receipts
-
-A `failure_receipt` record describes the first check that ran and failed.
-Grading stops there, so later checks never run and are not identified. A
-receipt can be written when the check's exit code, stdout, or stderr did not
-match, or when the check reached a time, memory, or output limit under the
-existing grading rules. `output_source` identifies whose output it shows.
-Setup, script, patch, result-tree, and working-directory failures have no
-receipt, and neither do validator faults.
-
-The record carries the round and miner identity fields and a `receipt` object:
-
-- `check_index`, `checks_total`, `check_id`: the failing check's position and name.
-- `kind` and `output_source`: an `invocation` check runs the candidate, so its
-  output is `candidate`. An `inspection` check runs the verifier's checker
-  against the result, so its output is `checker`.
-- `argv`, `cwd`: the command and its container working directory. Long values
-  are shortened and marked by `argv_truncated` or `cwd_truncated`.
-- `limit`: `timeout`, `memory_limit`, or `output_limit`; `null` for a mismatch.
-- `mismatched`: which of `exit_code`, `stdout`, and `stderr` differed. It is
-  empty when `limit` is set.
-- `exit_code`: the expected and actual exit codes. The expected code is `null`
-  when `limit` is set.
-- `stdin`: the start of an invocation check's input; `null` for inspections.
-- `stdout`, `stderr`: `first_difference` is the first differing byte offset, or
-  `null` when the streams matched or were not compared. `expected` and `actual`
-  are excerpts around that offset. Unchecked stderr and limit failures show the
-  end of the captured output, with no expected excerpt.
-
-Each excerpt has `offset`, base64 `data_b64`, `captured_bytes`, `total_bytes`,
-`capture_truncated`, and `truncated`. The bytes are exact, including line
-endings, trailing spaces, and invalid UTF-8. `capture_truncated` means the
-validator retained output only up to the check's output limit and discarded the
-rest: the real output was longer, and `total_bytes` is `null`. `truncated` is
-true if captured bytes were omitted from the excerpt or `capture_truncated` is
-true.
-
-A receipt is at most 3 KiB. Excerpts are shortened in a fixed order to fit, and
-a receipt that still does not fit is omitted. A receipt that cannot be
-converted, serialized, or fit on one log line is skipped without affecting
-other records, and the write reports a warning. A storage failure can still
-stop the remaining writes for a round, as described above.
-
-Output after a timeout or memory limit is only what was captured before the
-process stopped. Running the shown command by itself may not reproduce the
-failure, because setup and earlier checks run first in the same workspace.
-Validators already hold the verifier, so receipts show operators nothing new.
+headers, miner response bodies, the miner's own check output, or verifier code.
+A miner evaluation's `failed_check` does state the expected output for the
+failing check, exactly as the miner is sent it. The log does not record what the
+miner's program printed or where its output first differed; an operator who
+needs that has to reproduce the check. Nothing in this log is sent to the
+problem server or to a miner.
 
 ## Failure notices sent to miners
 

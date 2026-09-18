@@ -316,15 +316,6 @@ class FeedbackVerdict(WireModel):
     hotkey: BoundedIdentifier
     passed: StrictBool
     grading_duration_ms: Annotated[int, Field(ge=0, le=SAFE_INTEGER_MAX)]
-    failure: FailureExplanation | None = Field(
-        default=None, exclude_if=lambda value: value is None
-    )
-
-    @model_validator(mode="after")
-    def validate_failure(self) -> FeedbackVerdict:
-        if self.passed and self.failure is not None:
-            raise ValueError("a passing verdict cannot include a failure")
-        return self
 
 
 class ChallengeFeedbackRequest(WireModel):

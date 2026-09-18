@@ -7,7 +7,6 @@ import json
 import os
 import stat
 import time
-from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -33,12 +32,7 @@ def _encode(record: dict) -> bytes:
     return json.dumps(record, ensure_ascii=True, separators=(",", ":")).encode() + b"\n"
 
 
-def round_records(
-    result: RoundResult,
-    validator_hotkey: str,
-    *,
-    on_receipt_error: Callable[[], None] | None = None,
-):
+def round_records(result: RoundResult, validator_hotkey: str):
     if result.challenge_id is None or result.task_id is None:
         return
     common = {
@@ -54,7 +48,7 @@ def round_records(
 
     def record(kind, **fields):
         identity = [validator_hotkey, result.challenge_id, result.task_id, kind]
-        if kind in ("miner_evaluation", "failure_receipt"):
+        if kind == "miner_evaluation":
             identity.append(fields["miner_hotkey"])
         encoded = json.dumps(
             identity, ensure_ascii=False, separators=(",", ":")
@@ -103,16 +97,8 @@ def round_records(
             checks_skipped=None if total is None else total - executed,
             grading_duration_ms=None if item is None else item.grading_duration_ms,
             response_latency_ms=None if item is None else item.latency_ms,
+            failed_check=None if evaluation is None else evaluation.failed_check,
         )
-        if evaluation is None or evaluation.receipt is None:
-            continue
-        try:
-            receipt = evaluation.receipt.to_record()
-        except Exception:  # noqa: BLE001 - an optional receipt never costs other records
-            if on_receipt_error is not None:
-                on_receipt_error()
-            continue
-        yield record("failure_receipt", uid=uid, miner_hotkey=hotkey, receipt=receipt)
 
 
 class EvaluationLog:
@@ -161,57 +147,47 @@ class EvaluationLog:
         else:
             self._file(0).unlink(missing_ok=True)
 
-    def _append(self, raw: bytes) -> None:
-        path = self._file(0)
-        descriptor = self._open(path, os.O_RDWR | os.O_CREAT)
+    def _write_if_fits(self, raw: bytes) -> bool:
+        descriptor = self._open(self._file(0), os.O_RDWR | os.O_CREAT)
         with os.fdopen(descriptor, "r+b") as output:
             size = output.seek(0, os.SEEK_END)
+            separator = b""
             if size:
-                output.seek(max(0, size - MAX_RECORD_BYTES))
-                tail = output.read(MAX_RECORD_BYTES)
-                if not tail.endswith(b"\n"):
-                    last_line = tail.rfind(b"\n")
-                    if last_line < 0 and size > MAX_RECORD_BYTES:
-                        raise OSError("diagnostic tail could not be repaired")
-                    size = size - len(tail) + last_line + 1
-                    output.truncate(size)
-            if size + len(raw) <= self.max_file_bytes:
-                output.seek(size)
-                output.write(raw)
-                output.flush()
-                return
+                # An interrupted write leaves a partial line; end it so the record
+                # after it stays readable. Readers skip any line that does not parse.
+                output.seek(size - 1)
+                if output.read(1) != b"\n":
+                    separator = b"\n"
+            if size + len(separator) + len(raw) > self.max_file_bytes:
+                return False
+            output.write(separator + raw)
+            output.flush()
+            return True
+
+    def _append(self, raw: bytes) -> None:
+        if self._write_if_fits(raw):
+            return
         self._rotate()
-        self._append(raw)
+        if not self._write_if_fits(raw):
+            raise OSError("diagnostic record does not fit an empty file")
 
     def record_round(self, result: RoundResult, validator_hotkey: str) -> bool:
         if self.path is None or result.challenge_id is None:
             return True
-        skipped_receipts: list[bool] = []
         try:
             self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            records = round_records(
-                result,
-                validator_hotkey,
-                on_receipt_error=lambda: skipped_receipts.append(True),
-            )
-            for record in records:
-                if record["record_type"] == "failure_receipt":
-                    try:
-                        raw = _encode(record)
-                    except Exception:  # noqa: BLE001 - skip only the optional receipt
-                        skipped_receipts.append(True)
-                        continue
-                    if len(raw) > MAX_RECORD_BYTES:
-                        skipped_receipts.append(True)
-                        continue
-                else:
+            for record in round_records(result, validator_hotkey):
+                raw = _encode(record)
+                # Optional fields go first, so the base record always survives.
+                if len(raw) > MAX_RECORD_BYTES and record.get("failed_check") is not None:
+                    record["failed_check"] = None
                     raw = _encode(record)
-                    if len(raw) > MAX_RECORD_BYTES:
-                        record["reason"] = ""
-                        raw = _encode(record)
-                    if len(raw) > MAX_RECORD_BYTES:
-                        raise ValueError("diagnostic record exceeds its limit")
+                if len(raw) > MAX_RECORD_BYTES:
+                    record["reason"] = ""
+                    raw = _encode(record)
+                if len(raw) > MAX_RECORD_BYTES:
+                    raise ValueError("diagnostic record exceeds its limit")
                 self._append(raw)
-            return not skipped_receipts
+            return True
         except Exception:  # noqa: BLE001 - diagnostics must never change scoring
             return False

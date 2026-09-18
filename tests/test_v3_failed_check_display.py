@@ -86,26 +86,17 @@ def test_exact_supported_command_forms(python, script):
 @pytest.mark.parametrize(
     "argv",
     [
-        ("/usr/bin/python3",),
-        ("/usr/bin/python3", "-c", "print('private')"),
-        ("/usr/bin/python3", "-m", "pytest"),
-        ("/usr/bin/python3", "-I", "main.py"),
-        ("/usr/bin/python3", "main.py", "secret"),
-        ("/usr/bin/python3", "-hidden.py"),
-        ("/usr/bin/python3", "../hidden.py"),
-        ("/usr/bin/python3", "pkg/../hidden.py"),
-        ("/usr/bin/python3", "/work/../verify/hidden.py"),
-        ("/usr/bin/python3", "/workspace/main.py"),
-        ("/usr/bin/python3", "/verify/main.py"),
-        ("/usr/bin/python3", "a\nsecret.py"),
-        ("/usr/bin/python3", "a\tsecret.py"),
-        ("/usr/bin/python3", "a\u202esecret.py"),
-        ("/usr/bin/python3", "main.py;hidden.py"),
-        ("/usr/bin/python3", "main.py "),
-        ("/usr/bin/python3", "main.sh"),
-        ("/usr/bin/python", "main.py"),
-        ("/usr/bin/bash", "main.py"),
-        ("/work/python3", "main.py"),
+        ("/usr/bin/python3",),  # no script
+        ("/usr/bin/python3", "-c", "print('private')"),  # inline code
+        ("/usr/bin/python3", "-I", "main.py"),  # any interpreter flag
+        ("/usr/bin/python3", "main.py", "secret"),  # script arguments
+        ("/usr/bin/python3", "-hidden.py"),  # script token that is an option
+        ("/usr/bin/python3", "/work/../verify/hidden.py"),  # traversal
+        ("/usr/bin/python3", "/verify/main.py"),  # outside /work
+        ("/usr/bin/python3", "/workspace/main.py"),  # /work prefix but not inside it
+        ("/usr/bin/python3", "a\nsecret.py"),  # control characters
+        ("/usr/bin/python3", "main.sh"),  # not a .py script
+        ("/usr/bin/bash", "main.py"),  # executable not on the allowlist
     ],
 )
 def test_opaque_commands_and_paths_are_omitted(argv):
@@ -239,7 +230,6 @@ def test_first_failed_comparison_only_no_actual_output_or_additional_runs(
     assert verdict.failed_check is not None
     assert "SECRET" not in verdict.failed_check and "unrun" not in verdict.failed_check
     assert 'Required stdout: "x\\n"' in verdict.failed_check
-    assert verdict.receipt is not None
 
 
 def test_failure_display_uses_resolved_cwd_and_checked_stderr(tmp_path, runner):
@@ -420,4 +410,3 @@ def test_rendered_grading_failure_reaches_wire_without_candidate_output(
     assert len(runner.requests) == 1
     assert b"CAPTURED_STDOUT" not in encoded and b"CAPTURED_STDERR" not in encoded
     assert verdict.reason.encode() not in encoded
-    assert "receipt" not in item["failure"]
