@@ -41,6 +41,26 @@ class ValidatorPolicy:
     rust_memory: str = "2g"
     rust_tmpfs_bytes: int = 256 * 1024 * 1024
     problem_response_read_bytes: int = 2 * 1024 * 1024
+    v3_artifact_origins: tuple[str, ...] = (
+        "https://rlvr-agentic-v3-private-pilot-artifactbucket-upncfmevdb38.s3.us-east-1.amazonaws.com:443",
+    )
+    v3_execution_profile_id: str = "repo-polyglot-v1"
+    v3_image: str = (
+        "public.ecr.aws/t3h1r6x1/hone-subnet/polyglot-sandbox@sha256:"
+        "87f7ea823a2ffde124040db0f271e59110e666afecfc68106c4b07fddb4eee08"
+    )
+    v3_memory_bytes: int = 4 * 1024**3
+    v3_cpus: int = 2
+    v3_pids_limit: int = 256
+    v3_tmpfs_bytes: int = 1024**3
+    v3_workspace_compressed_bytes: int = 2 * 1024**3
+    v3_workspace_bytes: int = 10 * 1024**3
+    v3_verifier_compressed_bytes: int = 512 * 1024**2
+    v3_verifier_expanded_bytes: int = 2 * 1024**3
+    v3_max_file_bytes: int = 2 * 1024**3
+    v3_patch_bytes: int = 1024**2
+    v3_script_bytes: int = 1024**2
+    v3_problem_response_read_bytes: int = 32 * 1024**2
 
     def __post_init__(self) -> None:
         if not 0.0 < self.dispatch_fraction <= 1.0:
@@ -69,6 +89,28 @@ class ValidatorPolicy:
             raise ValueError("Rust compile limits must be positive")
         if self.rust_tmpfs_bytes <= 0 or self.problem_response_read_bytes <= 0:
             raise ValueError("Rust resource limits must be positive")
+        if not self.v3_artifact_origins or any(
+            not origin.startswith("https://") for origin in self.v3_artifact_origins
+        ):
+            raise ValueError("V3 artifact origins must be pinned HTTPS origins")
+        if "@sha256:" not in self.v3_image:
+            raise ValueError("V3 image must be digest-pinned")
+        for value in (
+            self.v3_memory_bytes,
+            self.v3_cpus,
+            self.v3_pids_limit,
+            self.v3_tmpfs_bytes,
+            self.v3_workspace_compressed_bytes,
+            self.v3_workspace_bytes,
+            self.v3_verifier_compressed_bytes,
+            self.v3_verifier_expanded_bytes,
+            self.v3_max_file_bytes,
+            self.v3_patch_bytes,
+            self.v3_script_bytes,
+            self.v3_problem_response_read_bytes,
+        ):
+            if type(value) is not int or value <= 0:
+                raise ValueError("V3 resource limits must be positive integers")
 
     @property
     def fingerprint(self) -> str:
@@ -78,8 +120,7 @@ class ValidatorPolicy:
     def summary(self) -> str:
         return (
             f"version={self.version} hash={self.fingerprint} "
-            f"dispatch_fraction={self.dispatch_fraction:g} "
-            f"verification_runs={self.verification_runs} "
+            f"protocol=3 execution_profile={self.v3_execution_profile_id} "
             f"score_samples={self.score_window_max_samples} "
             f"startup_samples={self.score_window_min_samples} "
             f"round_blocks={self.round_interval_blocks} "

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Launch the GLM-5.2 demo miner.
+# Launch the Bedrock-backed V3 demo miner.
 
 set -euo pipefail
 
@@ -24,12 +24,12 @@ else
   echo "[start_demo_miner] WARNING: .env not found; using process environment." >&2
 fi
 
-: "${GLM_API_KEY:?set GLM_API_KEY in .env or the process environment}"
+: "${BEDROCK_API_KEY:?set BEDROCK_API_KEY in .env or the process environment}"
 : "${NETUID:?set NETUID in .env or the process environment}"
 : "${WALLET_NAME:?set WALLET_NAME in .env or the process environment}"
 : "${WALLET_HOTKEY:?set WALLET_HOTKEY in .env or the process environment}"
 : "${SUBTENSOR_NETWORK:=test}"
-export GLM_API_KEY NETUID WALLET_NAME WALLET_HOTKEY SUBTENSOR_NETWORK
+export BEDROCK_API_KEY NETUID WALLET_NAME WALLET_HOTKEY SUBTENSOR_NETWORK
 
 echo "[start_demo_miner] netuid=${NETUID} network=${SUBTENSOR_NETWORK} wallet=${WALLET_NAME}/${WALLET_HOTKEY}"
 exec python scripts/run_demo_miner.py

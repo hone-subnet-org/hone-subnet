@@ -73,14 +73,14 @@ def test_setup_pulls_the_configured_immutable_sandbox_image():
     preflight = (SCRIPTS / "preflight_validator.sh").read_text()
     assert 'preflight_validator.sh" --pull' in setup
     assert "docker pull" in preflight
-    assert "@sha256:" in preflight
+    assert "RELEASE_POLICY.v3_image" in preflight
     assert "run_timed 20 docker info" in preflight
     assert "run_timed 45 docker run" in preflight
 
 
 def test_preflight_probes_the_protected_lease_route_without_consuming_a_problem():
     preflight = (SCRIPTS / "preflight_validator.sh").read_text()
-    assert 'f"{base}/v1/challenges/lease"' in preflight
+    assert 'f"{base}/v3/challenges/lease"' in preflight
     assert 'data=b"{}"' in preflight
     assert 'method="POST"' in preflight
     assert "status != 401" in preflight
@@ -93,7 +93,7 @@ def test_preflight_probes_the_protected_lease_route_without_consuming_a_problem(
     [(401, True, True), (200, True, False), (302, True, False), (401, False, False)],
 )
 def test_preflight_requires_an_unsigned_lease_rejection(
-    status, valid_date, succeeds
+    status, valid_date, succeeds, tmp_path
 ):
     received = {}
 
@@ -116,9 +116,17 @@ def test_preflight_requires_an_unsigned_lease_rejection(
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
+        docker = tmp_path / "docker"
+        docker.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = run ]; then printf rlvr-preflight-ok; fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        docker.chmod(0o755)
         env = {
             **os.environ,
-            "EXECUTOR": "local",
+            "PATH": f"{tmp_path}:{os.environ['PATH']}",
             "PROBLEM_SERVER_URL": f"http://127.0.0.1:{server.server_port}",
             "SUBTENSOR_NETWORK": "test",
         }
@@ -136,7 +144,7 @@ def test_preflight_requires_an_unsigned_lease_rejection(
         thread.join(timeout=2)
 
     assert (result.returncode == 0) is succeeds
-    assert received == {"path": "/v1/challenges/lease", "body": b"{}"}
+    assert received == {"path": "/v3/challenges/lease", "body": b"{}"}
 
 
 def test_register_script_is_runbook_only():
@@ -149,11 +157,12 @@ def test_register_script_is_runbook_only():
 def test_docs_describe_the_validator_and_demo_miner_boundary():
     readme = (REPO_ROOT / "README.md").read_text().lower()
     for keyword in (
-        "private problem server",
+        "problem server",
         "validator",
         "demo miner",
         "sandbox",
-        "rewards",
+        "weights",
+        "v3",
     ):
         assert keyword in readme
 
@@ -210,17 +219,12 @@ def test_build_script_never_invents_a_digest():
     assert "policy" in text
 
 
-def test_preflight_validates_rust_image_without_blocking_python_operation():
-    """Staged semantics: the rust section reports readiness truthfully but
-    NEVER fails a python-only validator by default; --require-rust exists
-    for operators who expect the custom image to be live. The checks name
-    the policy pin and the real toolchain probe."""
+def test_preflight_validates_the_v3_image():
     preflight = (SCRIPTS / "preflight_validator.sh").read_text(encoding="utf-8")
 
-    assert "RELEASE_POLICY.rust_image" in preflight
-    assert "rustc --version" in preflight
-    assert "--require-rust" in preflight
-    assert "python-only" in preflight.lower()
+    assert "RELEASE_POLICY.v3_image" in preflight
+    assert "git --version" in preflight
+    assert "--require-rust" not in preflight
 
 
 def test_benchmark_covers_the_rust_matrix():
@@ -269,10 +273,3 @@ def test_rust_sandbox_image_provides_the_full_supervisor_stdlib():
     assert "tempfile" in text, (
         "build must import-check the supervisor's stdlib surface"
     )
-
-
-def test_preflight_checks_rust_memory_requirement():
-    preflight = (SCRIPTS / "preflight_validator.sh").read_text(encoding="utf-8")
-
-    assert "MemTotal" in preflight
-    assert "VALIDATOR_VERIFY_CONCURRENCY" in preflight

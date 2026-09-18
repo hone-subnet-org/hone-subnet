@@ -8,17 +8,15 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
 pull_image=false
-require_rust=false
 while (( $# )); do
   case "$1" in
     --pull) pull_image=true ;;
-    --require-rust) require_rust=true ;;
-    *) echo "[preflight] ERROR: usage: $0 [--pull] [--require-rust]" >&2; exit 2 ;;
+    *) echo "[preflight] ERROR: usage: $0 [--pull]" >&2; exit 2 ;;
   esac
   shift
 done
 if (( $# != 0 )); then
-  echo "[preflight] ERROR: usage: $0 [--pull] [--require-rust]" >&2
+  echo "[preflight] ERROR: usage: $0 [--pull]" >&2
   exit 2
 fi
 
@@ -59,50 +57,45 @@ raise SystemExit(completed.returncode)
 PY
 }
 
-: "${EXECUTOR:=docker}"
 : "${PROBLEM_SERVER_URL:?set PROBLEM_SERVER_URL in .env}"
 
 if [[ "${SUBTENSOR_NETWORK:-}" == "finney" && "${NETUID:-}" != "5" ]]; then
   echo "[preflight] ERROR: this Finney release is configured for NETUID=5." >&2
   exit 1
 fi
-if [[ "${SUBTENSOR_NETWORK:-}" == "finney" && "${EXECUTOR}" != "docker" ]]; then
-  echo "[preflight] ERROR: Finney validation requires EXECUTOR=docker." >&2
+v3_image="$("${python_bin}" - <<'PY'
+from rlvr.policy import RELEASE_POLICY
+print(RELEASE_POLICY.v3_image)
+PY
+)"
+command -v docker >/dev/null 2>&1 || {
+  echo "[preflight] ERROR: Docker CLI not found. Install and start Docker." >&2
+  exit 1
+}
+command -v chmod >/dev/null 2>&1 && command -v rm >/dev/null 2>&1 || {
+  echo "[preflight] ERROR: chmod and rm are required for workspace cleanup." >&2
+  exit 1
+}
+run_timed 20 docker info >/dev/null
+if [[ "${pull_image}" == true ]]; then
+  echo "[preflight] pulling sandbox image ${v3_image}"
+  run_timed 900 docker pull "${v3_image}"
+elif ! run_timed 20 docker image inspect "${v3_image}" >/dev/null 2>&1; then
+  echo "[preflight] ERROR: sandbox image is missing; rerun ./setup_validator.sh." >&2
   exit 1
 fi
-if [[ "${EXECUTOR}" != "docker" ]]; then
-  echo "[preflight] development executor=${EXECUTOR}; Docker check skipped"
-else
-  : "${DOCKER_IMAGE:?set DOCKER_IMAGE in .env}"
-  if [[ ! "${DOCKER_IMAGE}" =~ @sha256:[0-9a-f]{64}$ ]]; then
-    echo "[preflight] ERROR: DOCKER_IMAGE must use an immutable sha256 digest." >&2
-    exit 1
-  fi
-  command -v docker >/dev/null 2>&1 || {
-    echo "[preflight] ERROR: Docker CLI not found. Install and start Docker." >&2
-    exit 1
-  }
-  run_timed 20 docker info >/dev/null
-  if [[ "${pull_image}" == true ]]; then
-    echo "[preflight] pulling sandbox image ${DOCKER_IMAGE}"
-    run_timed 600 docker pull "${DOCKER_IMAGE}"
-  elif ! run_timed 20 docker image inspect "${DOCKER_IMAGE}" >/dev/null 2>&1; then
-    echo "[preflight] ERROR: sandbox image is missing; rerun ./setup_validator.sh." >&2
-    exit 1
-  fi
 
-  smoke="$(
-    run_timed 45 docker run --rm --pull=never --network=none --read-only \
-      --cap-drop=ALL --security-opt=no-new-privileges \
-      --user=65534:65534 "${DOCKER_IMAGE}" \
-      sh -ec 'command -v timeout >/dev/null; timeout 5 python -I -S -c "print(\"rlvr-preflight-ok\")"'
-  )"
-  if [[ "${smoke}" != "rlvr-preflight-ok" ]]; then
-    echo "[preflight] ERROR: sandbox Python/GNU timeout smoke test failed." >&2
-    exit 1
-  fi
-  echo "[preflight] sandbox image ready"
+smoke="$(
+  run_timed 45 docker run --rm --pull=never --network=none --read-only \
+    --cap-drop=ALL --security-opt=no-new-privileges \
+    --user=65534:65534 "${v3_image}" \
+    sh -ec 'git --version >/dev/null; command -v timeout >/dev/null; printf rlvr-preflight-ok'
+)"
+if [[ "${smoke}" != "rlvr-preflight-ok" ]]; then
+  echo "[preflight] ERROR: V3 sandbox smoke test failed." >&2
+  exit 1
 fi
+echo "[preflight] sandbox image ready"
 
 "${python_bin}" - <<'PY'
 import email.utils
@@ -116,7 +109,7 @@ base = os.environ["PROBLEM_SERVER_URL"].rstrip("/")
 parsed = urllib.parse.urlparse(base)
 if os.environ.get("SUBTENSOR_NETWORK") == "finney" and parsed.scheme != "https":
     raise SystemExit("[preflight] ERROR: Finney problem server must use HTTPS")
-url = f"{base}/v1/challenges/lease"
+url = f"{base}/v3/challenges/lease"
 request = urllib.request.Request(
     url,
     data=b"{}",
@@ -161,62 +154,3 @@ if skew > 5:
     )
 print("[preflight] problem server reachable; unsigned lease rejected; clock synchronized")
 PY
-
-rust_image="$("${python_bin}" - <<'PY'
-from rlvr.policy import RELEASE_POLICY
-print(RELEASE_POLICY.rust_image)
-PY
-)"
-if [[ "${EXECUTOR}" == "docker" ]]; then
-  rust_capacity="$("${python_bin}" - <<'PY'
-from rlvr.config import get_settings
-from rlvr.neurons.decentralized import _host_memory_bytes, _rust_verify_concurrency
-
-settings = get_settings()
-print(
-    _host_memory_bytes(),
-    settings.validator_verify_concurrency,
-    _rust_verify_concurrency(settings),
-)
-PY
-)"
-  read -r host_memory_bytes VALIDATOR_VERIFY_CONCURRENCY effective_rust_slots \
-    <<<"${rust_capacity}"
-  echo "[preflight] rust memory MemTotal=${host_memory_bytes} configured_slots=${VALIDATOR_VERIFY_CONCURRENCY} effective_slots=${effective_rust_slots}"
-  rust_required_memory=$((14 * 1024 * 1024 * 1024))
-  if (( host_memory_bytes < rust_required_memory )); then
-    if [[ "${require_rust}" == true ]]; then
-      echo "[preflight] ERROR: Rust grading requires a nominal 16 GiB host." >&2
-      exit 1
-    fi
-    echo "[preflight] WARN: Rust grading requires a nominal 16 GiB host." >&2
-  fi
-fi
-rust_ready=false
-if [[ "${EXECUTOR}" == "docker" ]]; then
-  if [[ "${pull_image}" == true ]]; then
-    run_timed 600 docker pull "${rust_image}" >/dev/null 2>&1 || true
-  fi
-  if run_timed 20 docker image inspect "${rust_image}" >/dev/null 2>&1 \
-    && run_timed 20 docker run --rm --pull=never --network=none --read-only \
-      --cap-drop=ALL --security-opt=no-new-privileges \
-      "${rust_image}" sh -ec 'rustc --version; command -v python3; command -v timeout' \
-      >/dev/null 2>&1 \
-    && run_timed 120 "${python_bin}" - <<'PY'
-from rlvr.config import get_settings
-from rlvr.neurons.decentralized import _rust_ready
-raise SystemExit(0 if _rust_ready(get_settings()) else 1)
-PY
-  then
-    rust_ready=true
-  fi
-fi
-
-if [[ "${rust_ready}" == true ]]; then
-  echo "[preflight] rust ready; validator will advertise rust support"
-elif [[ "${require_rust}" == true ]]; then
-  echo "[preflight] ERROR: rust sandbox is not ready: ${rust_image}" >&2
-  exit 1
-else
-  echo "[preflight] rust not ready; continuing in python-only mode"
-fi
