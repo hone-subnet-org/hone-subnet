@@ -203,6 +203,7 @@ class BedrockClient:
             "reasoning_effort": self.settings.bedrock_reasoning_effort,
             "logprobs": True,
             "top_logprobs": 5,
+            "include_reasoning": True,
         }
         request_body = json.dumps(
             request, ensure_ascii=False, separators=(",", ":")
@@ -273,8 +274,10 @@ class BedrockClient:
                     )
                 if not tokens:
                     raise ValueError("Bedrock returned no token records")
-                if bytes(generated) != content.encode("utf-8"):
-                    raise ValueError("Bedrock token bytes do not match the completion")
+                # The token records cover the whole generation: reasoning,
+                # the reasoning delimiter, the answer and the end-of-turn token.
+                if content.strip().encode("utf-8") not in generated:
+                    raise ValueError("Bedrock token bytes do not contain the completion")
                 return ModelCompletion(
                     request_body=request_body,
                     response_body=response_body,

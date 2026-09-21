@@ -97,6 +97,7 @@ async def test_provider_response_records_exact_bodies_and_five_alternatives():
     async def handler(request):
         body = json.loads(request.content)
         assert body["logprobs"] is True and body["top_logprobs"] == 5
+        assert body["include_reasoning"] is True
         return httpx.Response(
             200,
             json={"choices": [{"finish_reason": "stop", "message": {"content": "x", "reasoning_content": "r"}, "logprobs": {"content": [token]}}]},
@@ -111,6 +112,46 @@ async def test_provider_response_records_exact_bodies_and_five_alternatives():
     assert result.generated_bytes == b"x"
     assert len(result.tokens[0]["top_logprobs"]) == 5
     assert json.loads(result.request_body)["model"] == "moonshotai.kimi-k2.5"
+
+
+def _records(pieces: list[str]) -> list[dict]:
+    alternatives = [{"token": "a", "bytes": [97], "token_id": 1, "logprob": -1.0}] * 5
+    return [
+        {"token": piece, "bytes": list(piece.encode()), "token_id": 1, "logprob": -0.5, "top_logprobs": alternatives}
+        for piece in pieces
+    ]
+
+
+async def _complete_with(records: list[dict], content: str = " 391"):
+    async def handler(request):
+        return httpx.Response(
+            200,
+            json={"choices": [{"finish_reason": "stop", "message": {"content": content, "reasoning": " thinking"}, "logprobs": {"content": records}}]},
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = BedrockClient(settings(bedrock_base_url="https://provider.invalid"), http=http)
+    try:
+        return await client.complete([{"role": "user", "content": "x"}], timeout_s=10)
+    finally:
+        await http.aclose()
+
+
+async def test_provider_tokens_cover_reasoning_and_answer():
+    result = await _complete_with(_records(["thinking", "</think>", "391", "<|im_end|>"]))
+    assert result.generated_bytes == b"thinking</think>391<|im_end|>"
+    assert result.output == " 391" and result.reasoning == " thinking"
+
+
+async def test_provider_tokens_cover_a_multiword_answer():
+    records = _records(["thinking", "</think>", "the", " answer", " is", " 391", "<|im_end|>"])
+    result = await _complete_with(records, content=" the answer is 391\n")
+    assert result.output == " the answer is 391\n"
+
+
+async def test_provider_tokens_missing_the_answer_are_rejected():
+    with pytest.raises(RuntimeError, match="invalid response"):
+        await _complete_with(_records(["thinking", "</think>", "392", "<|im_end|>"]))
 
 
 async def test_demo_uploads_submission_and_genuine_canonical_trajectory(monkeypatch, tmp_path):
