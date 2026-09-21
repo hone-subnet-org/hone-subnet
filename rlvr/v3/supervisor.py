@@ -50,6 +50,7 @@ class SupervisorPolicy:
     tmpfs_bytes: int
     max_file_bytes: int
     watchdog_slack_s: int
+    max_workspace_bytes: int
     trusted_uid: int = 65_534
     trusted_gid: int = 65_534
 
@@ -71,6 +72,7 @@ class SupervisorPolicy:
             self.tmpfs_bytes,
             self.max_file_bytes,
             self.watchdog_slack_s,
+            self.max_workspace_bytes,
         ):
             if not _positive_int(value):
                 raise ValueError("supervisor limits must be positive integers")
@@ -242,6 +244,28 @@ def _run_process(
     )
 
 
+def _allocated_bytes(root: Path) -> int:
+    """Disk actually allocated under root, without following symlinks."""
+    total = 0
+    for directory, _dirs, files in os.walk(root):
+        for path in (directory, *(os.path.join(directory, name) for name in files)):
+            try:
+                total += os.lstat(path).st_blocks * 512
+            except OSError:
+                continue
+    return total
+
+
+def _guard_workspace(
+    docker: str, name: str, roots: list[Path], budget: int, stop: threading.Event
+) -> None:
+    """Enforce the workspace budget while the container runs, not only after."""
+    while not stop.wait(1.0):
+        over = sum(_allocated_bytes(root) for root in roots) > budget
+        if over and not stop.is_set() and _control([docker, "kill", name]).returncode == 0:
+            return
+
+
 def _control(command: list[str]) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
@@ -327,7 +351,21 @@ def run_container(
     run_started = False
     pending_error: SupervisorError | None = None
     result: ContainerResult | None = None
+    writable = [mount.host for mount in request.mounts if not mount.read_only]
+    stop_guard = threading.Event()
+    guard: threading.Thread | None = None
     try:
+        if writable:
+            thread = threading.Thread(
+                target=_guard_workspace,
+                args=(str(docker), request.name, writable, policy.max_workspace_bytes, stop_guard),
+                daemon=True,
+            )
+            try:
+                thread.start()
+            except RuntimeError:
+                raise SupervisorError("workspace guard is unavailable") from None
+            guard = thread  # joined only once it has started
         run_started = True
         _, stdout, stderr, stdout_overflow, stderr_overflow, watchdog = _run_process(
             command,
@@ -336,6 +374,7 @@ def run_container(
             request.max_stderr_bytes,
             request.timeout_s + policy.watchdog_slack_s,
         )
+        stop_guard.set()
         if watchdog:
             _control([str(docker), "kill", request.name])
         inspected = _control(
@@ -371,6 +410,9 @@ def run_container(
     except SupervisorError as exc:
         pending_error = exc
     finally:
+        stop_guard.set()
+        if guard is not None:
+            guard.join(timeout=10)
         if run_started:
             cleanup = _control([str(docker), "rm", "-f", request.name])
             if cleanup.returncode != 0:

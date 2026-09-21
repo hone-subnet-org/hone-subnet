@@ -55,6 +55,7 @@ def policy() -> SupervisorPolicy:
         tmpfs_bytes=64 << 20,
         max_file_bytes=16 << 20,
         watchdog_slack_s=5,
+        max_workspace_bytes=1 << 30,
     )
 
 

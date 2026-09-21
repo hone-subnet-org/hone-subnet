@@ -206,6 +206,7 @@ def policy(tmp_path):
             tmpfs_bytes=64 << 20,
             max_file_bytes=1 << 20,
             watchdog_slack_s=2,
+            max_workspace_bytes=1 << 30,
         ),
         docker_binary=str(tmp_path / "docker"),
         artifact_origins=frozenset({"https://uploads.invalid:443"}),

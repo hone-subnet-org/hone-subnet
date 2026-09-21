@@ -4,7 +4,7 @@
         never contain host paths, secrets, container names or URLs.
     SupervisorPolicy(image, candidate_uid, candidate_gid, memory_bytes, cpus,
                      pids_limit, tmpfs_bytes, max_file_bytes, watchdog_slack_s,
-                     trusted_uid=65534, trusted_gid=65534)   frozen
+                     max_workspace_bytes, trusted_uid=65534, trusted_gid=65534)   frozen
         image must be ``name@sha256:<64 hex>`` — an audited profile image.  The
         runner cannot clear ENV baked into an image; the policy only pins a
         digest and makes NO claim to scrub image ENV.  All uids/gids >= 1
@@ -59,7 +59,8 @@ def _mod():
 
 def policy(**over):
     base = dict(image=IMAGE, candidate_uid=65534, candidate_gid=65534, memory_bytes=256 << 20, cpus=1,
-                pids_limit=128, tmpfs_bytes=64 << 20, max_file_bytes=16 << 20, watchdog_slack_s=5)
+                pids_limit=128, tmpfs_bytes=64 << 20, max_file_bytes=16 << 20, watchdog_slack_s=5,
+                max_workspace_bytes=64 << 20)
     return _mod().SupervisorPolicy(**{**base, **over})
 
 
@@ -87,8 +88,9 @@ def fake_docker(root: Path, *, run_cmd="", run_rc=0, inspect_out="exited 0 false
         "#!/bin/sh\n"
         f'/usr/bin/printf "%s\\n" "$*" >> "{log}"\n'
         'case "$1" in\n'
-        f'  run) /usr/bin/env > "{root / "env"}"; {stdin_cmd} {run_cmd}\n'
+        f'  run) /usr/bin/env > "{root / "env"}"; /usr/bin/printf "%s" "$$" > "{root / "run.pid"}"; {stdin_cmd} {run_cmd}\n'
         f"       exit {run_rc};;\n"
+        f'  kill) /bin/kill -TERM -- -"$(/bin/cat "{root / "run.pid"}")"; exit 0;;\n'
         f'  inspect) /usr/bin/printf "%s\\n" "{inspect_out}"; exit {inspect_rc};;\n'
         f"  rm) exit {rm_rc};;\n"
         "esac\nexit 2\n"
@@ -226,6 +228,35 @@ def test_host_watchdog_fires_at_deadline_plus_slack_then_inspects_and_cleans_up(
     assert [c[0] for c in calls(tmp_path)] == ["run", "kill", "inspect", "rm"]
 
 
+def test_workspace_budget_is_enforced_while_the_container_runs(tmp_path):
+    fill = tmp_path / "work" / "fill"
+    docker = fake_docker(tmp_path, run_cmd=f'/usr/bin/head -c 65536 /dev/zero > "{fill}"; /bin/sleep 30',
+                         inspect_out="exited 137 false")
+    started = time.monotonic()
+    result = run(tmp_path, docker, request(tmp_path, timeout_s=20), policy(max_workspace_bytes=4096))
+    assert time.monotonic() - started < 10
+    assert result.timed_out is True and result.oom_killed is False
+    assert [c[0] for c in calls(tmp_path)] == ["run", "kill", "inspect", "rm"]
+
+
+def test_workspace_within_budget_is_left_alone(tmp_path):
+    fill = tmp_path / "work" / "fill"
+    docker = fake_docker(tmp_path, run_cmd=f'/usr/bin/head -c 1024 /dev/zero > "{fill}"; /bin/sleep 2')
+    result = run(tmp_path, docker, request(tmp_path, timeout_s=20), policy(max_workspace_bytes=64 << 10))
+    assert result.exit_code == 0 and result.timed_out is False
+    assert [c[0] for c in calls(tmp_path)] == ["run", "inspect", "rm"]
+
+
+def test_read_only_mounts_do_not_count_against_the_workspace_budget(tmp_path):
+    verify = mount(tmp_path, "verify", "/verify", True)
+    (verify.host / "big").write_bytes(b"x" * 65536)
+    docker = fake_docker(tmp_path, run_cmd="/bin/sleep 2")
+    result = run(tmp_path, docker, request(tmp_path, trusted=True, mounts=(verify,)),
+                 policy(max_workspace_bytes=4096))
+    assert result.exit_code == 0
+    assert [c[0] for c in calls(tmp_path)] == ["run", "inspect", "rm"]
+
+
 def test_large_stdin_ignored_by_candidate_does_not_stall_the_host(tmp_path):
     """Regression: feeding stdin must be covered by the host watchdog.  A candidate that never reads
     a 1 MiB stdin must not block run_container beyond timeout_s + watchdog_slack_s."""
@@ -292,7 +323,7 @@ def test_policy_validation_and_defaults():
     for over in (dict(image="ghcr.io/hone/profile-python:latest"), dict(image="ghcr.io/hone/profile-python@sha256:abc"),
                  dict(image=IMAGE.upper()), dict(candidate_uid=0), dict(candidate_gid=0), dict(trusted_uid=0),
                  dict(trusted_gid=-1), dict(memory_bytes=0), dict(cpus=0), dict(pids_limit=-1), dict(tmpfs_bytes=True),
-                 dict(max_file_bytes=0),
+                 dict(max_file_bytes=0), dict(max_workspace_bytes=0),
                  dict(watchdog_slack_s="5")):
         with pytest.raises(ValueError):
             policy(**over)
@@ -316,3 +347,21 @@ def test_mount_validation(tmp_path):
                  dict(host=str(host), container="/work")):
         with pytest.raises(ValueError):
             m.Mount(read_only=False, **args)
+
+
+def test_guard_thread_start_failure_is_a_supervisor_error_with_no_container(tmp_path, monkeypatch):
+    def cannot_start(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(_mod().threading.Thread, "start", cannot_start)
+    docker = fake_docker(tmp_path)
+    exc = fails(tmp_path, docker)
+    _assert_clean(exc, str(tmp_path))
+    assert not (tmp_path / "log").exists()  # docker was never invoked
+
+
+def test_empty_directories_count_against_the_workspace_budget(tmp_path):
+    root = tmp_path / "tree"
+    for index in range(64):
+        (root / f"d{index}").mkdir(parents=True)
+    assert _mod()._allocated_bytes(root) >= 64 * 4096

@@ -62,6 +62,7 @@ def round_policy(policy: ValidatorPolicy, *, dispatch_concurrency: int) -> Round
             tmpfs_bytes=policy.v3_tmpfs_bytes,
             max_file_bytes=policy.v3_max_file_bytes,
             watchdog_slack_s=5,
+            max_workspace_bytes=policy.v3_workspace_bytes,
         ),
         docker_binary=str(os.path.realpath(docker_binary)),
         artifact_origins=frozenset(policy.v3_artifact_origins),
