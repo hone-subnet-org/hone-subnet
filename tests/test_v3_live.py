@@ -137,7 +137,7 @@ async def test_v3_live_transport_clamps_oversized_miner_response_to_failure():
         await http.aclose()
     assert parsed is None
     assert committed.response_body == "" and committed.response_headers == {}
-    assert committed.error
+    assert "exceeds byte limit" in committed.error
 
 
 async def test_v3_live_transport_has_a_total_response_deadline(monkeypatch):

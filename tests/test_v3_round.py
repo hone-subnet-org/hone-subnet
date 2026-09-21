@@ -497,6 +497,27 @@ def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
     assert all(engine.histories[uid][-1][1] == 0.0 for uid in (2, 3, 4))
 
 
+def test_payments_reward_relative_speed_among_passing_miners():
+    def passed(uid, latency_ms):
+        return MinerEvaluation(uid, f"hk-{uid}", latency_ms, EvaluationResult("passed", "", (), None))
+
+    failed = MinerEvaluation(4, "hk-4", 1, EvaluationResult("failed", "x", (), None))
+    result = RoundResult(
+        "completed", "",
+        (passed(1, 1_000), passed(2, 1_000 + 180_000), passed(3, 1_000 + 360_000), failed),
+    )
+    payments = compute_round_payments(result, speed_half_life_ms=180_000, speed_floor=0.5)
+    assert payments[1] == 1.0  # fastest passing miner, not the fastest miner
+    assert payments[2] == pytest.approx(0.75)  # one half-life behind: floor + half the rest
+    assert payments[3] == pytest.approx(0.625)  # two half-lives behind
+    assert payments[4] == 0.0
+    assert payments[1] > payments[2] > payments[3] > payments[4]
+
+    far_behind = RoundResult("completed", "", (passed(1, 1), passed(2, 10**9)))
+    slow = compute_round_payments(far_behind, speed_half_life_ms=180_000, speed_floor=0.95)
+    assert slow[2] == pytest.approx(0.95)  # the floor bounds what slowness can cost
+
+
 def test_scoring_ignores_stale_or_unknown_registrations():
     engine = EvalEngine(4, 1, 200, 4)
     engine.set_hotkeys({1: "current-1", 2: "current-2"})

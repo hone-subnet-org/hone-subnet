@@ -217,14 +217,18 @@ class BedrockClient:
             if remaining <= 0:
                 raise TimeoutError("Bedrock request deadline exceeded")
             try:
-                response = await self._http.post(
-                    self.completion_url,
-                    headers={
-                        "Authorization": f"Bearer {self.settings.bedrock_api_key}",
-                        "Content-Type": "application/json",
-                        "Accept-Language": "en-US,en",
-                    },
-                    content=request_body,
+                # httpx's timeout bounds inactivity; wait_for bounds the whole call.
+                response = await asyncio.wait_for(
+                    self._http.post(
+                        self.completion_url,
+                        headers={
+                            "Authorization": f"Bearer {self.settings.bedrock_api_key}",
+                            "Content-Type": "application/json",
+                            "Accept-Language": "en-US,en",
+                        },
+                        content=request_body,
+                        timeout=remaining,
+                    ),
                     timeout=remaining,
                 )
                 if response.status_code == 429 or response.status_code >= 500:

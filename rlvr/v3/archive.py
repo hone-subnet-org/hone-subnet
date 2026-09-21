@@ -158,11 +158,10 @@ def _inspect_members(
         paths[segments] = is_file
         members.append(member)
 
-    for path, is_file in paths.items():
-        if not is_file:
-            continue
-        if any(other[: len(path)] == path and len(other) > len(path) for other in paths):
-            raise ArchiveError("archive file is used as a parent directory")
+    for path in paths:
+        for depth in range(1, len(path)):
+            if paths.get(path[:depth]):
+                raise ArchiveError("archive file is used as a parent directory")
     return members, file_bytes
 
 

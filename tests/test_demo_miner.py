@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import subprocess
+import time
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
@@ -304,3 +306,17 @@ async def test_workspace_reads_share_one_model_deadline(tmp_path, monkeypatch):
     with pytest.raises(TimeoutError):
         await miner._generate(task(), WorkspaceReader(tmp_path), 100)
     assert len(budgets) == 2
+
+
+async def test_provider_call_is_bounded_by_total_time(monkeypatch):
+    async def handler(request):
+        await asyncio.sleep(5)
+        return httpx.Response(200, json={})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = BedrockClient(settings(bedrock_base_url="https://provider.invalid", bedrock_max_retries=0), http=http)
+    started = time.monotonic()
+    with pytest.raises(asyncio.TimeoutError):
+        await client.complete([{"role": "user", "content": "x"}], timeout_s=0.2)
+    await http.aclose()
+    assert time.monotonic() - started < 2

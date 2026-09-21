@@ -175,7 +175,7 @@ async def test_signing_waits_for_shared_send_gate_and_releases_it(monkeypatch):
 
 async def test_per_recipient_deadline_bounds_a_stalled_exchange(monkeypatch):
     monkeypatch.setattr(sender, "NOTICE_TIMEOUT_S", 0.03)
-    monkeypatch.setattr(sender, "NOTICE_BATCH_DEADLINE_S", 0.6)
+    monkeypatch.setattr(sender, "NOTICE_BATCH_DEADLINE_S", 30.0)
     cancelled = []
 
     async def handler(_):
@@ -186,7 +186,7 @@ async def test_per_recipient_deadline_bounds_a_stalled_exchange(monkeypatch):
 
     start = time.monotonic()
     await deliver(outcome(evaluation()), handler)
-    assert time.monotonic() - start < 0.3
+    assert time.monotonic() - start < 5.0  # the per-recipient deadline fired, not the batch one
     assert cancelled == [True]
 
 
@@ -241,16 +241,16 @@ async def test_concurrent_requests_are_bounded():
     assert maximum == 8 and active == 0
 
 
-async def test_batch_caps_unique_recipient_count():
+async def test_batch_caps_unique_recipient_count(monkeypatch):
+    monkeypatch.setattr(sender, "NOTICE_MAX_RECIPIENTS", 5)
     requests = []
 
     async def handler(request):
         requests.append(request)
         return httpx.Response(200)
 
-    await deliver(outcome(*(evaluation(uid) for uid in range(1030))), handler)
-    assert len(requests) <= 1024
-    assert len(requests) > 0
+    await deliver(outcome(*(evaluation(uid) for uid in range(1, 40))), handler)
+    assert len(requests) == 5
 
 
 async def test_cancelling_sender_cleans_up_requests_and_shared_gate():

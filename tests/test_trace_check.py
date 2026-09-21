@@ -312,13 +312,12 @@ async def test_callback_sends_only_after_a_successful_score_save(tmp_path, monke
         validator_trace_check_url=URL, validator_trace_check_hotkey=SERVICE,
     )
     outcome = completed([evaluation(1, "passed")], assigned=((1, "hk-1"),))
-    calls, returned = [], []
+    calls, returned, saved_first = [], [], []
 
     async def fake_send(result, **kwargs):
-        # Record first, so a wrongly invoked sender is visible even if the
-        # assertion below raises; then require scores already on disk.
         calls.append((result, kwargs))
-        assert json.loads(score_file.read_text())["histories"]
+        # Observe here, assert outside: the callback swallows sender errors.
+        saved_first.append(score_file.exists() and bool(json.loads(score_file.read_text())["histories"]))
         if case == "sender_raises":
             raise RuntimeError("service exploded")
         return 1
@@ -362,6 +361,7 @@ async def test_callback_sends_only_after_a_successful_score_save(tmp_path, monke
         assert calls == []  # nothing is sent when the score file was not written
     else:
         assert len(calls) == 1 and calls[0][0] is outcome
+        assert saved_first == [True]  # scores were on disk before the sender ran
         assert calls[0][1] == {"wallet": WALLET, "http": calls[0][1]["http"], "url": URL,
                                "service_hotkey": SERVICE, "rate": 0.01}
 
