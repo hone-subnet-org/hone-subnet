@@ -55,4 +55,4 @@ fi
 : "${LOGLEVEL:=info}"
 export LOGLEVEL
 echo "[start_validator] netuid=${NETUID} network=${SUBTENSOR_NETWORK} wallet=${WALLET_NAME}/${WALLET_HOTKEY}"
-exec python scripts/run_validator.py
+exec python -u scripts/run_validator.py

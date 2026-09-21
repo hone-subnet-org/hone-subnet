@@ -32,4 +32,4 @@ fi
 export BEDROCK_API_KEY NETUID WALLET_NAME WALLET_HOTKEY SUBTENSOR_NETWORK
 
 echo "[start_demo_miner] netuid=${NETUID} network=${SUBTENSOR_NETWORK} wallet=${WALLET_NAME}/${WALLET_HOTKEY}"
-exec python scripts/run_demo_miner.py
+exec python -u scripts/run_demo_miner.py
