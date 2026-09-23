@@ -116,12 +116,20 @@ def test_schema_version_rejects_boolean_one():
         Trajectory.model_validate(value)
 
 
-def test_empty_reasoning_is_accepted_unless_required(monkeypatch):
+@pytest.mark.parametrize("missing", ["reasoning", "tokens"])
+def test_missing_evidence_is_accepted_unless_required(monkeypatch, missing):
     from rlvr.v3 import trajectory as module
 
     value = fixture()
-    value["events"][0]["reasoning"] = ""
+    value["events"][0][missing] = "" if missing == "reasoning" else []
     Trajectory.model_validate(value)
-    monkeypatch.setattr(module, "REASONING_REQUIRED", True)
-    with pytest.raises(ValueError, match="requires reasoning"):
+    monkeypatch.setattr(module, "TRACE_EVIDENCE_REQUIRED", True)
+    with pytest.raises(ValueError, match="requires"):
+        Trajectory.model_validate(value)
+
+
+def test_present_tokens_must_still_reproduce_generated_bytes():
+    value = fixture()
+    value["events"][0]["generated_bytes_b64"] = b64(b"y")
+    with pytest.raises(ValueError, match="reproduce"):
         Trajectory.model_validate(value)

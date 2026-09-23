@@ -23,8 +23,7 @@ Requirements:
 
 - Python 3.10–3.12
 - a funded hotkey registered on the subnet
-- an Amazon Bedrock API key for a Chat Completions model that returns five
-  token alternatives per token
+- an Amazon Bedrock API key for a Chat Completions model
 - a public TCP port reachable by validators
 
 ```bash
@@ -62,7 +61,7 @@ permit. `MINER_MIN_STAKE`, `MINER_MAX_CONCURRENT_REQUESTS`, and
 `MINER_REQUIRE_VALIDATOR_PERMIT` control who can spend the model account's
 quota.
 
-The provider must return selected-token log probabilities and exactly five
-alternatives per token. Reasoning text is recorded when the provider returns
-it. The miner fails closed when the required fields are absent; it never
-fabricates trajectory evidence.
+Reasoning text and selected-token log probabilities with five alternatives
+per token are recorded when the provider returns them. Log probabilities that
+are present but malformed are rejected; the miner never fabricates trajectory
+evidence.

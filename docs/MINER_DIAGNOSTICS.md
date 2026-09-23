@@ -234,9 +234,9 @@ cannot unsay what was already shown. Reason-only notices carry no such assumptio
 
 ## Trajectory spot checks
 
-Every submission comes with a trajectory: the model's chosen tokens and their
-log-probabilities, the tool calls it made, and its reasoning when the provider
-returns it. After a graded round, a
+Every submission comes with a trajectory: the model turns and the tool calls it
+made, with the model's reasoning and per-token log-probabilities when the
+provider returns them. After a graded round, a
 validator sends a sample of these to an evaluation service for review. Fabricated
 or inconsistent traces may be penalized through a separate mechanism; this
 sender only reports references, and applies no penalty itself.

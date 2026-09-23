@@ -124,15 +124,15 @@ def _records(pieces: list[str]) -> list[dict]:
     ]
 
 
-async def _complete_with(records: list[dict], content: str = " 391", reasoning: str | None = " thinking"):
+async def _complete_with(records: list[dict] | None, content: str = " 391", reasoning: str | None = " thinking"):
     async def handler(request):
         message = {"content": content}
         if reasoning is not None:
             message["reasoning"] = reasoning
-        return httpx.Response(
-            200,
-            json={"choices": [{"finish_reason": "stop", "message": message, "logprobs": {"content": records}}]},
-        )
+        choice = {"finish_reason": "stop", "message": message}
+        if records is not None:
+            choice["logprobs"] = {"content": records}
+        return httpx.Response(200, json={"choices": [choice]})
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     client = BedrockClient(settings(bedrock_base_url="https://provider.invalid"), http=http)
@@ -333,3 +333,21 @@ async def test_provider_reply_without_reasoning_is_recorded_with_empty_reasoning
 async def test_malformed_reasoning_is_rejected_not_blanked():
     with pytest.raises(RuntimeError, match="invalid response"):
         await _complete_with(_records(["391", "<|im_end|>"]), content=" 391", reasoning=False)
+
+
+async def test_provider_reply_without_logprobs_is_recorded_without_tokens():
+    result = await _complete_with(None, content=" 391")
+    assert result.tokens == [] and result.generated_bytes == b"" and result.output == " 391"
+
+
+async def test_present_but_malformed_logprobs_are_still_rejected():
+    records = _records(["391"])
+    records[0]["top_logprobs"] = records[0]["top_logprobs"][:3]
+    with pytest.raises(RuntimeError, match="invalid response"):
+        await _complete_with(records, content=" 391")
+
+
+@pytest.mark.parametrize("records", [{}, "", 0])
+async def test_logprobs_with_wrong_type_content_are_rejected(records):
+    with pytest.raises(RuntimeError, match="invalid response"):
+        await _complete_with(records, content=" 391")

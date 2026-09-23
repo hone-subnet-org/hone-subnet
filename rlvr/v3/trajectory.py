@@ -82,9 +82,9 @@ class GeneratedToken(TrajectoryModel):
         return value
 
 
-# Chain of thought is recorded when the provider returns it, not required.
-# Flip this to require a non-empty reasoning field on every model turn.
-REASONING_REQUIRED = False
+# Chain of thought and token log probabilities are recorded when the provider
+# returns them, not required. Flip this to require both on every model turn.
+TRACE_EVIDENCE_REQUIRED = False
 
 
 class ModelTurn(TrajectoryModel):
@@ -95,20 +95,24 @@ class ModelTurn(TrajectoryModel):
     generated_bytes_b64: Base64Text
     reasoning: Annotated[str, Field(max_length=64 * 1024**2)]
     output: Annotated[str, Field(max_length=64 * 1024**2)]
-    tokens: Annotated[list[GeneratedToken], Field(min_length=1, max_length=250_000)]
+    tokens: Annotated[list[GeneratedToken], Field(max_length=250_000)]
 
     _base64 = field_validator(
         "request_body_b64", "response_body_b64", "generated_bytes_b64"
     )(_canonical_base64)
 
     @model_validator(mode="after")
-    def validate_reasoning(self):
-        if REASONING_REQUIRED and not self.reasoning:
+    def validate_evidence(self):
+        if TRACE_EVIDENCE_REQUIRED and not self.reasoning:
             raise ValueError("model turn requires reasoning")
+        if TRACE_EVIDENCE_REQUIRED and not self.tokens:
+            raise ValueError("model turn requires token log probabilities")
         return self
 
     @model_validator(mode="after")
     def validate_generated_bytes(self):
+        if not self.tokens:
+            return self
         chosen = b"".join(
             base64.b64decode(token.token_bytes_b64) for token in self.tokens
         )

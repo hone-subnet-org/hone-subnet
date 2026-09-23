@@ -251,7 +251,10 @@ class BedrockClient:
                     raise ValueError("Bedrock returned an empty completion")
                 if type(reasoning) is not str:
                     raise ValueError("Bedrock returned invalid reasoning")
-                token_records = choice["logprobs"]["content"]
+                logprobs = choice.get("logprobs")
+                token_records = [] if logprobs is None else logprobs["content"]
+                if type(token_records) is not list:
+                    raise ValueError("Bedrock returned invalid token records")
                 tokens: list[dict[str, Any]] = []
                 generated = bytearray()
                 for record in token_records:
@@ -279,11 +282,9 @@ class BedrockClient:
                             ],
                         }
                     )
-                if not tokens:
-                    raise ValueError("Bedrock returned no token records")
                 # The token records cover the whole generation: reasoning,
                 # the reasoning delimiter, the answer and the end-of-turn token.
-                if content.strip().encode("utf-8") not in generated:
+                if tokens and content.strip().encode("utf-8") not in generated:
                     raise ValueError("Bedrock token bytes do not contain the completion")
                 return ModelCompletion(
                     request_body=request_body,

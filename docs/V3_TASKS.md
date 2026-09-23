@@ -11,7 +11,7 @@ An optional manifest setup step runs after applying a repository patch, or befor
 Trajectories use the strict `trajectory_v1` JCS JSON schema and bind the recorded model and tool events to the uploaded submission hash.
 V3 does not write the legacy local rollout shards.
 
-The reference miner requires a provider response containing chosen-token log probabilities and exactly five alternatives per token. Reasoning text is recorded when the provider returns it.
+The reference miner records reasoning text and chosen-token log probabilities with five alternatives per token when the provider returns them. Neither is required.
 
 Artifact hashes, compressed sizes, and decompressed tar-stream sizes are checked exactly. Archives reject links, special files, duplicate paths, path traversal, and decompression beyond the advertised limit. Artifact URLs must use an HTTPS origin pinned by the release.
 
