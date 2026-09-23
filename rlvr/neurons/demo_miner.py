@@ -243,11 +243,14 @@ class BedrockClient:
                     raise ValueError("Bedrock completion did not finish normally")
                 message = choice["message"]
                 content = message["content"]
-                reasoning = message.get("reasoning_content") or message.get("reasoning")
+                reasoning = next(
+                    (message[key] for key in ("reasoning_content", "reasoning") if message.get(key) is not None),
+                    "",
+                )
                 if not isinstance(content, str) or not content.strip():
                     raise ValueError("Bedrock returned an empty completion")
-                if not isinstance(reasoning, str) or not reasoning:
-                    raise ValueError("Bedrock did not return recorded reasoning")
+                if type(reasoning) is not str:
+                    raise ValueError("Bedrock returned invalid reasoning")
                 token_records = choice["logprobs"]["content"]
                 tokens: list[dict[str, Any]] = []
                 generated = bytearray()

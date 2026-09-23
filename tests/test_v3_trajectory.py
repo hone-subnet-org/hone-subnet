@@ -114,3 +114,14 @@ def test_schema_version_rejects_boolean_one():
     value["schema_version"] = True
     with pytest.raises(ValueError):
         Trajectory.model_validate(value)
+
+
+def test_empty_reasoning_is_accepted_unless_required(monkeypatch):
+    from rlvr.v3 import trajectory as module
+
+    value = fixture()
+    value["events"][0]["reasoning"] = ""
+    Trajectory.model_validate(value)
+    monkeypatch.setattr(module, "REASONING_REQUIRED", True)
+    with pytest.raises(ValueError, match="requires reasoning"):
+        Trajectory.model_validate(value)
