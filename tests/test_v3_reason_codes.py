@@ -330,7 +330,6 @@ def test_container_post_apply_unsafe_tree_is_result_tree_invalid(tmp_path, monke
     pytest.param(SupervisorError("no docker"), id="supervisor-error"),
     pytest.param(result(exit_code=127, stdout=b"", stderr=b""), id="git-missing-127"),
     pytest.param(result(exit_code=126, stdout=b"", stderr=b""), id="git-not-executable-126"),
-    pytest.param(result(timed_out=True, exit_code=124), id="check-timeout"),
 ])
 def test_container_tool_faults_raise_patch_tool_error_not_a_miner_code(tmp_path, monkeypatch, first):
     with pytest.raises(PatchToolError):
@@ -340,11 +339,13 @@ def test_container_tool_faults_raise_patch_tool_error_not_a_miner_code(tmp_path,
 @pytest.mark.parametrize("first", [
     pytest.param(result(stderr_overflow=True), id="check-stderr-overflow"),
     pytest.param(result(stdout_overflow=True), id="check-stdout-overflow"),
+    pytest.param(result(timed_out=True, exit_code=124), id="check-timeout"),
+    pytest.param(result(oom_killed=True, exit_code=137), id="check-oom"),
 ])
-def test_container_check_output_flood_rejects_the_miner_without_abandoning(tmp_path, monkeypatch, first):
+def test_container_check_limit_hits_reject_the_miner_without_abandoning(tmp_path, monkeypatch, first):
     outcome, fake = container_apply(tmp_path, monkeypatch, first)
     assert (outcome.status, outcome.reason_code) == ("rejected", MinerReason.PATCH_APPLY_FAILED)
-    assert outcome.reason == "git check output exceeded its limit"
+    assert outcome.reason == "git check exceeded its limits"
     assert [request.name for request in fake.requests] == [f"{RUN}-patch-check"]
 
 

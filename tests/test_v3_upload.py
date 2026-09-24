@@ -167,8 +167,11 @@ async def test_errors_never_include_the_presigned_url():
             await upload_artifact(
                 http, slot(), b"x", allowed_origins=frozenset({ORIGIN})
             )
+    import traceback
+
     assert "secret" not in str(caught.value)
     assert caught.value.__cause__ is None
+    assert "secret" not in "".join(traceback.format_exception(caught.value))
 
 
 @pytest.mark.asyncio

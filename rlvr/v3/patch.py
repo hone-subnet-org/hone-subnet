@@ -250,11 +250,11 @@ def apply_patch_in_container(
         checked = invoke(
             "check", ("/usr/bin/git", "apply", "--check", "-p1", "/submission.diff")
         )
-        if checked.timed_out or checked.oom_killed:
-            raise PatchToolError("git check exceeded its limits")
-        if checked.stdout_overflow or checked.stderr_overflow:
-            # The patch decides how much git prints; a flood is the miner's fault.
-            return _rejected("git check output exceeded its limit", MinerReason.PATCH_APPLY_FAILED)
+        if checked.timed_out or checked.oom_killed or checked.stdout_overflow or checked.stderr_overflow:
+            # The patch decides how much work git does and how much it prints,
+            # so a limit hit during the check is the miner's failure, not the
+            # validator's: one miner is rejected and the round goes on.
+            return _rejected("git check exceeded its limits", MinerReason.PATCH_APPLY_FAILED)
         if checked.exit_code in (126, 127):
             raise PatchToolError("git is unavailable in the sandbox")
         if checked.exit_code != 0:

@@ -89,7 +89,10 @@ def _decompress_archive(
             ).decompressobj()
             written = 0
             with target.open("wb") as expanded:
-                for compressed_chunk in iter(lambda: compressed.read(1 << 10), b""):
+                # Small input reads bound how much one decompress call can
+                # produce (zstd expands at most ~32 KiB per input byte), so the
+                # size guard below also bounds memory, not only the file.
+                for compressed_chunk in iter(lambda: compressed.read(64), b""):
                     chunk = decompressor.decompress(compressed_chunk)
                     if chunk:
                         written += len(chunk)

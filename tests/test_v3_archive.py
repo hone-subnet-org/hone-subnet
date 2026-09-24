@@ -275,6 +275,34 @@ def test_expanded_cap_stops_decompression_bomb(tmp_path):
     assert_rejected(tmp_path, zeros, limits)
 
 
+def test_understated_size_stops_decoding_at_the_advertised_size(tmp_path, monkeypatch):
+    import zstandard
+
+    zeros = make_tar([("zeros", "file", b"\0" * (32 << 20), 0o644)])
+    limits = _limits(max_expanded_bytes=64 << 20, max_file_bytes=64 << 20, max_compressed_bytes=1 << 20)
+    produced = []
+    real_decompressobj = zstandard.ZstdDecompressor.decompressobj
+
+    def counting_decompressobj(self, *args, **kwargs):
+        inner = real_decompressobj(self, *args, **kwargs)
+
+        class Counting:
+            def decompress(self, data):
+                out = inner.decompress(data)
+                produced.append(len(out))
+                return out
+
+            def __getattr__(self, name):
+                return getattr(inner, name)
+
+        return Counting()
+
+    monkeypatch.setattr(zstandard.ZstdDecompressor, "decompressobj", counting_decompressobj)
+    advertised = 1 << 20  # the archive really expands to 32 MiB plus tar headers
+    assert_rejected(tmp_path, zeros, limits, expanded_size_bytes=advertised)
+    assert sum(produced) < 4 * advertised  # decoding stopped early, not after the whole bomb
+
+
 @pytest.mark.parametrize("difference", [-1, 1])
 def test_advertised_expanded_size_must_match_exactly(tmp_path, difference):
     tar_bytes = make_tar(good_entries())
