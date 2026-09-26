@@ -5,7 +5,7 @@ ManifestError(ValueError); frozen dataclasses Expectation, SetupStep,
 InvocationCheck, InspectionCheck, VerifierManifest (see golden test).
 Rules: manifest_version == 1; task_type matches caller; setup may be null for
 either task type; 1..64 checks, unique ids ^[a-z0-9][a-z0-9_-]{0,31}$; argv
-1..64 strings of 1..4096 bytes, no NUL, argv[0] absolute+normalized (inspection
+1..64 strings of 1..65536 bytes, no NUL, argv[0] absolute+normalized (inspection
 additionally forbids /result and /verify); timeouts 1..300; byte caps 1..8 MiB;
 exit_code 0..255; cwd relative, stdin "inputs/...", stdout/stderr "gold/...".
 parse_manifest(raw, *, task_type): strict JSON, exact key sets, no coercion.
@@ -138,9 +138,10 @@ def test_check_list_and_ids_are_bounded_and_unique():
 @pytest.mark.parametrize("build", TARGETS.values(), ids=TARGETS.keys())
 def test_argv_common_rules(build):
     for argv in ([], [PY] * 65, ["python3"], ["/usr/bin/../bin/python3"], ["/usr/bin/"], ["//usr/bin/python3"],
-                 [PY, ""], [PY, "a\0b"], [PY, "x" * 4097], [PY, 1], PY):
+                 [PY, ""], [PY, "a\0b"], [PY, "x" * 65537], [PY, 1], PY):
         rejected(build(argv=argv))
-    parse(build(argv=[PY] + ["x" * 4096] * 63))
+    parse(build(argv=[PY] + ["x" * 65536] * 15))  # 64 KiB per argument, under the 1 MiB manifest cap
+    parse(build(argv=[PY] + ["x"] * 63))  # 64 arguments
     parse(build(argv=[PY, "/result/out", "/verify/x", "/work"]))  # reserved roots only matter for argv[0]
 
 def test_only_inspection_argv0_is_kept_out_of_result_and_verify():

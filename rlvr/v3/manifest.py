@@ -105,7 +105,7 @@ def _argv(value: object, *, inspection: bool = False) -> tuple[str, ...]:
     for item in value:
         if (
             type(item) is not str
-            or not 1 <= len(item.encode("utf-8")) <= 4_096
+            or not 1 <= len(item.encode("utf-8")) <= 65_536
             or "\x00" in item
         ):
             raise ManifestError("manifest argument is invalid")
