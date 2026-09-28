@@ -70,3 +70,12 @@ def test_now_defaults_to_the_current_monotonic_reading():
 
     # Monotonic never goes backwards, so a later call is never an earlier deadline.
     assert second >= first
+
+
+def test_validator_bounds_a_server_directed_pause():
+    from rlvr.neurons.decentralized import MAX_LEASE_DEFERRAL_S, lease_deferral_s
+
+    assert lease_deferral_s(None) is None
+    assert lease_deferral_s(45) == 45
+    assert lease_deferral_s(1_209_600) == MAX_LEASE_DEFERRAL_S  # two weeks is asked again in minutes
+    assert lease_deferral_s(-5) == 0

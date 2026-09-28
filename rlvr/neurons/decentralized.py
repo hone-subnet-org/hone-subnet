@@ -551,8 +551,14 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
                     speed_half_life_ms=policy.payment_speed_half_life_ms,
                     speed_floor=policy.payment_speed_floor,
                 )
-            elif result.status == "unavailable" and result.retry_after_s is not None:
-                v.defer_rounds_until(next_lease_not_before(result.retry_after_s))
+            elif result.status == "unavailable":
+                wait = lease_deferral_s(result.retry_after_s)
+                print(
+                    f"[validator] no lease: {result.reason or result.reason_code} "
+                    + (f"(next attempt in {wait}s)" if wait is not None else "(next attempt at the next round)")
+                )
+                if wait is not None:
+                    v.defer_rounds_until(next_lease_not_before(wait))
             elif result.status == "abandoned":
                 print(f"[validator] WARN: V3 round abandoned ({result.reason})")
             saved = _save_scores(engine, settings.validator_score_state_file)
@@ -603,6 +609,19 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
         validator.set_round_callback(round_callback)
         validator.set_weight_setter(weight_setter)
         await validator.run()
+
+
+# The longest a server "retry later" reply may silence leasing. A server that
+# wants a longer pause is simply asked again after this; obeying an arbitrary
+# value once left a validator idle for hours while its weight loop looked fine.
+MAX_LEASE_DEFERRAL_S = 900
+
+
+def lease_deferral_s(retry_after_s: int | None) -> int | None:
+    """How long to defer the next lease for a server-directed pause, or None."""
+    if retry_after_s is None:
+        return None
+    return max(0, min(int(retry_after_s), MAX_LEASE_DEFERRAL_S))
 
 
 def run_decentralized_validator(settings: Optional[Settings] = None) -> None:

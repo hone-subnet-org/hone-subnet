@@ -146,3 +146,54 @@ def test_next_offer_without_a_previous_order_is_a_fresh_shuffle():
     eligible = [(uid, f"hk-{uid}") for uid in range(1, 50)]
     assert next_offer(None, eligible, rng=random.Random(1)) != next_offer(None, eligible, rng=random.Random(2))
     assert eligible_miners([(0, "owner"), (1, "a")]) == [(1, "a")]
+
+
+async def test_round_callback_logs_and_bounds_a_lease_pause(tmp_path, monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    from rlvr.config import Settings
+    from rlvr.neurons import decentralized
+    from rlvr.neurons.decentralized import MAX_LEASE_DEFERRAL_S
+    from rlvr.v3.reasons import RoundReason, Stage
+    from rlvr.v3.round import RoundResult
+
+    settings = Settings(_env_file=None, problem_server_url="https://problems.invalid",
+                        validator_score_state_file=str(tmp_path / "scores.json"))
+    deferrals = []
+
+    class Validator:
+        def __init__(self, *_args, **_kwargs):
+            self.wallet = SimpleNamespace(hotkey=SimpleNamespace(ss58_address="validator"))
+            self.subtensor = object()
+            self.metagraph = SimpleNamespace(hotkeys=["owner", "hk-1"], sync=lambda **_: None)
+
+        def setup_bittensor(self):
+            pass
+
+        def set_round_callback(self, callback):
+            self.callback = callback
+
+        def set_weight_setter(self, _setter):
+            pass
+
+        def defer_rounds_until(self, deadline):
+            deferrals.append(deadline)
+
+        async def run(self):
+            await self.callback(self)
+
+    async def evaluate(*_a, **_k):
+        return RoundResult("unavailable", "service paused", (), retry_after_s=1_209_600,
+                           reason_code=RoundReason.LEASE_UNAVAILABLE, stage=Stage.LEASE)
+
+    import time
+
+    monkeypatch.setattr(decentralized, "ValidatorNeuron", Validator)
+    monkeypatch.setattr(decentralized, "_apply_weights_rate_limit", lambda *_: None)
+    monkeypatch.setattr(decentralized, "v3_round_policy", lambda *_a, **_k: object())
+    monkeypatch.setattr(decentralized, "_solver_clients", lambda *_a, **_k: [SimpleNamespace(uid=1, hotkey="hk-1")])
+    monkeypatch.setattr(decentralized, "evaluate_round", evaluate)
+    before = time.monotonic()
+    await decentralized._run_decentralized_validator_async(settings)
+    assert len(deferrals) == 1 and deferrals[0] - before <= MAX_LEASE_DEFERRAL_S + 5
+    assert "no lease: service paused (next attempt in 900s)" in capsys.readouterr().out
