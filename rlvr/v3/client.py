@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Optional
 from uuid import uuid4
@@ -19,6 +20,7 @@ from .api import (
     CommitRevealResponse,
     LeaseRequest,
     LeaseResponse,
+    MinerCandidate,
     serialize_commit_request,
     serialize_feedback_request,
 )
@@ -38,8 +40,11 @@ class V3ProblemServerClient:
     def __init__(self, *args, **kwargs):
         self._transport = ProblemServerClient(*args, **kwargs)
 
-    async def lease(self) -> V3LeaseOutcome:
-        body = LeaseRequest(request_id=uuid4().hex).model_dump_json().encode("utf-8")
+    async def lease(self, candidates: Sequence[tuple[int, str]]) -> V3LeaseOutcome:
+        body = LeaseRequest(
+            request_id=uuid4().hex,
+            candidates=[MinerCandidate(uid=uid, hotkey=hotkey) for uid, hotkey in candidates],
+        ).model_dump_json().encode("utf-8")
         post = await self._transport.post_result("/v3/challenges/lease", body)
         response = post.response
         if response is None:

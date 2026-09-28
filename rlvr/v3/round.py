@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
@@ -101,12 +102,15 @@ class RoundPolicy:
     verifier_policy: str
     dispatch_concurrency: int
     grading_concurrency: int = 1
+    miners_per_task: int = 32
 
     def __post_init__(self) -> None:
         if type(self.dispatch_concurrency) is not int or self.dispatch_concurrency < 1:
             raise ValueError("dispatch concurrency must be positive")
         if type(self.grading_concurrency) is not int or self.grading_concurrency < 1:
             raise ValueError("grading concurrency must be positive")
+        if type(self.miners_per_task) is not int or not 1 <= self.miners_per_task <= 1_024:
+            raise ValueError("miners per task must be between 1 and 1024")
 
 
 class _Abandon(Exception):
@@ -278,8 +282,17 @@ async def evaluate_round(
     *,
     cache_dir: str | Path,
     work_dir: str | Path,
+    candidates: Sequence[tuple[int, str]],
 ) -> RoundResult:
-    outcome = await client.lease()
+    # The validator offers these miners, in its own random order. The server
+    # must issue slots for exactly the first N of them, N being its setting.
+    offered = list(candidates)
+    if not offered:
+        return RoundResult(
+            "unavailable", "no eligible miners to offer", (),
+            reason_code=RoundReason.LEASE_UNAVAILABLE, stage=Stage.LEASE,
+        )
+    outcome = await client.lease(offered)
     lease = outcome.challenge
     if lease is None:
         reason = outcome.detail or outcome.category.value
@@ -317,6 +330,13 @@ async def evaluate_round(
         )
 
     try:
+        pool = {(slots.submission.uid, slots.submission.hotkey) for slots in lease.slot_pool}
+        expected = min(policy.miners_per_task, len(offered))
+        if len(pool) != expected or pool != set(offered[:expected]):
+            # Not exactly the first N offered, N fixed by release policy: the
+            # server added, skipped, substituted, widened or narrowed, any of
+            # which would let it steer selection.
+            return finish("abandoned", "lease pool is not the first miners the validator offered", RoundReason.SLOT_POOL_MISMATCH)
         if lease.identity.execution_profile_id != policy.execution_profile_id:
             return finish("abandoned", "unsupported execution profile", RoundReason.UNSUPPORTED_PROFILE)
         if lease.identity.verifier_policy != policy.verifier_policy:

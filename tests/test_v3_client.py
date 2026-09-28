@@ -35,7 +35,7 @@ def test_v3_client_uses_v3_lease_route_and_parses_strict_response():
         seen["body"] = await request.aread()
         return httpx.Response(200, content=LeaseResponse(**lease()).model_dump_json())
 
-    outcome = run(handler, lambda client: client.lease())
+    outcome = run(handler, lambda client: client.lease([(7, "hk-7"), (3, "hk-3")]))
     assert outcome.category is LeaseCategory.LEASED
     assert outcome.challenge is not None
     assert seen["path"] == "/v3/challenges/lease"
@@ -44,7 +44,7 @@ def test_v3_client_uses_v3_lease_route_and_parses_strict_response():
 
 def test_v3_client_reports_pacing_without_collapsing_it():
     handler = lambda request: httpx.Response(429, headers={"Retry-After": "9"})
-    outcome = run(handler, lambda client: client.lease())
+    outcome = run(handler, lambda client: client.lease([(7, "hk-7"), (3, "hk-3")]))
     assert outcome.category is LeaseCategory.PACED and outcome.retry_after_s == 9
 
 

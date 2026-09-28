@@ -72,4 +72,5 @@ def round_policy(
         verifier_policy="command-gold-digest-v1",
         dispatch_concurrency=dispatch_concurrency,
         grading_concurrency=grading_concurrency,
+        miners_per_task=policy.v3_miners_per_task,
     )

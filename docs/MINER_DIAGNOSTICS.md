@@ -101,6 +101,7 @@ is handled by the existing round and server logic.
 | `lease_unavailable` | No usable challenge was leased; there is no per-miner log record. |
 | `unsupported_profile`, `unsupported_verifier_policy`, `unsupported_task` | The leased contract is unsupported. |
 | `insufficient_storage` | A free-space check failed. |
+| `slot_pool_mismatch` | The lease pool was not exactly the first miners the validator offered. |
 | `quorum_not_met` | Too few signed responses were available to commit. |
 | `commit_failed`, `reveal_mismatch` | Commit/reveal failed or did not match the lease. |
 | `grading_expired` | The grading window expired. |

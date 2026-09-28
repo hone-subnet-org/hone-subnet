@@ -55,8 +55,28 @@ def _utf8_size(value: str, maximum: int, field: str) -> str:
     return value
 
 
+CANDIDATE_LIMIT = 256
+
+
+class MinerCandidate(WireModel):
+    uid: UID
+    hotkey: BoundedIdentifier
+
+
 class LeaseRequest(WireModel):
+    """The validator asks for a task and names, in its own random order, the
+    miners it is willing to send it to. The server issues slots only for
+    miners in this list."""
+
     request_id: BoundedIdentifier
+    candidates: Annotated[list[MinerCandidate], Field(min_length=1, max_length=CANDIDATE_LIMIT)]
+
+    @model_validator(mode="after")
+    def validate_candidates(self) -> LeaseRequest:
+        uids = [item.uid for item in self.candidates]
+        if len(set(uids)) != len(uids):
+            raise ValueError("candidates must not repeat a uid")
+        return self
 
 
 class LeaseResponse(WireModel):

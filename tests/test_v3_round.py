@@ -225,6 +225,7 @@ def policy(tmp_path):
         "cleanup", "quorum", "commit", "reveal", "expired", "verifier_download",
         "manifest", "workspace_download", "workspace_extract", "materialize",
         "format", "grant", "grade_infrastructure", "grade_exception", "temporary_directory",
+        "pool_mismatch", "pool_skip", "pool_short",
     )],
     (False, False, "grade_exception", 3),
 ])
@@ -283,10 +284,13 @@ def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
     )
     leased = LeaseResponse(**lease_fields)
     feedback_requests = []
+    lease_bodies = []
 
     async def handler(request):
         path = request.url.path
         if request.method == "POST" and path == "/v3/challenges/lease":
+            body = json.loads(await request.aread())
+            lease_bodies.append(body)
             return httpx.Response(200, content=leased.model_dump_json())
         if request.method == "POST" and path == "/v3/challenges/commit":
             if round_fault == "commit":
@@ -425,14 +429,27 @@ def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
                 dataclasses.replace(policy(tmp_path), grading_concurrency=grading_concurrency),
                 cache_dir=tmp_path / "cache",
                 work_dir=tmp_path / "work",
+                # uid 4 is offered but not serving. "pool_mismatch": uid 4 not offered at all.
+                # "pool_skip": uid 9 offered first, so a pool of 1-4 means the server skipped it.
+                candidates=(
+                    [(uid, f"hk-{uid}") for uid in range(1, 4)] if round_fault == "pool_mismatch"
+                    else [(9, "hk-9"), *((uid, f"hk-{uid}") for uid in range(1, 5))] if round_fault == "pool_skip"
+                    else [*((uid, f"hk-{uid}") for uid in range(1, 5)), (9, "hk-9")] if round_fault == "pool_short"
+                    else [(uid, f"hk-{uid}") for uid in range(1, 5)]
+                ),
             )
 
     result = asyncio.run(go())
+    expected_offer = {"pool_mismatch": [1, 2, 3], "pool_skip": [9, 1, 2, 3, 4], "pool_short": [1, 2, 3, 4, 9]}.get(round_fault, [1, 2, 3, 4])
+    assert [c["uid"] for c in lease_bodies[0]["candidates"]] == expected_offer
     if not (round_fault or submission_download_fails or checker_times_out):
         assert peak[0] == min(grading_concurrency, 3)  # three graded miners, bounded by the pool
     if round_fault:
         expected = {
             "cleanup": (RoundReason.CLEANUP_FAILED, Stage.CLEANUP),
+            "pool_mismatch": (RoundReason.SLOT_POOL_MISMATCH, Stage.LEASE),
+            "pool_skip": (RoundReason.SLOT_POOL_MISMATCH, Stage.LEASE),
+            "pool_short": (RoundReason.SLOT_POOL_MISMATCH, Stage.LEASE),  # 5 offered, policy says 32, only 4 issued
             "quorum": (RoundReason.QUORUM_NOT_MET, Stage.DISPATCH),
             "commit": (RoundReason.COMMIT_FAILED, Stage.COMMIT),
             "reveal": (RoundReason.REVEAL_MISMATCH, Stage.COMMIT),

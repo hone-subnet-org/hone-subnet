@@ -61,6 +61,9 @@ class ValidatorPolicy:
     v3_patch_bytes: int = 1024**2
     v3_script_bytes: int = 1024**2
     v3_problem_response_read_bytes: int = 32 * 1024**2
+    # Miners each task is offered to. Fixed here, not per lease, so the problem
+    # server cannot widen or narrow the pool around a particular miner.
+    v3_miners_per_task: int = 32
 
     def __post_init__(self) -> None:
         if not 0.0 < self.dispatch_fraction <= 1.0:
@@ -107,6 +110,7 @@ class ValidatorPolicy:
             self.v3_max_file_bytes,
             self.v3_patch_bytes,
             self.v3_script_bytes,
+            self.v3_miners_per_task,
             self.v3_problem_response_read_bytes,
         ):
             if type(value) is not int or value <= 0:

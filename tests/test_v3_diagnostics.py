@@ -574,7 +574,8 @@ class LeaseOnlyClient:
     def __init__(self, outcome):
         self.outcome = outcome
 
-    async def lease(self):
+    async def lease(self, candidates):
+        self.candidates = list(candidates)
         return self.outcome
 
     async def commit(self, request):  # pragma: no cover - must never be reached here
@@ -585,9 +586,16 @@ class LeaseOnlyClient:
 
 
 def run_round(tmp_path, client, round_policy, solvers=()):
+    # Offer exactly the miners the fixture lease names, so these tests keep
+    # exercising the stage they were written for rather than the pool check.
+    challenge = getattr(getattr(client, "outcome", None), "challenge", None)
+    offered = (
+        [(slots.submission.uid, slots.submission.hotkey) for slots in challenge.slot_pool]
+        if challenge is not None else [(1, "hk-1")]
+    )
     return asyncio.run(evaluate_round(
         client, None, list(solvers), round_policy,
-        cache_dir=tmp_path / "cache", work_dir=tmp_path / "work",
+        cache_dir=tmp_path / "cache", work_dir=tmp_path / "work", candidates=offered,
     ))
 
 

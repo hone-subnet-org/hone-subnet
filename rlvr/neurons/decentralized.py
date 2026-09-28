@@ -26,6 +26,7 @@ from ..v3.client import V3ProblemServerClient
 from ..v3.diagnostics import EvaluationLog
 from ..v3.release import round_policy as v3_round_policy
 from ..v3.round import apply_round_scores, evaluate_round
+from ..v3.selection import eligible_miners, next_offer
 from .feedback_sender import send_failure_notices
 from .live import SendGate, _solver_clients
 from .trace_check import send_trace_checks
@@ -503,6 +504,7 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
         )
         dispatch_policy_logged = False
         send_gate = SendGate(settings.validator_send_concurrency)
+        offer_state: dict[str, list[tuple[int, str]] | None] = {"order": None}
 
         async def round_callback(v: ValidatorNeuron) -> dict[int, float]:
             nonlocal dispatch_policy_logged
@@ -510,22 +512,36 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
             engine.resize(len(v.metagraph.hotkeys))
             engine.sync({uid: hk for uid, hk in enumerate(v.metagraph.hotkeys)})
             live_solvers = _solver_clients(v, v.wallet, settings, http, gate=send_gate)
-            if not live_solvers:
+            eligible = eligible_miners(
+                [(solver.uid, solver.hotkey) for solver in live_solvers],
+                validator_permits=getattr(v.metagraph, "validator_permit", None),
+            )
+            offered = next_offer(offer_state["order"], eligible)
+            offer_state["order"] = offered  # reused until a round completes
+            if not offered:
                 return {}
+            offered_set = set(offered)
+            solvers = [s for s in live_solvers if (s.uid, s.hotkey) in offered_set]
             if not dispatch_policy_logged:
                 print(
-                    "[validator] V3 dispatch uses the server-assigned slot pool; "
-                    f"serving miners={len(live_solvers)}"
+                    "[validator] V3 dispatch offers a random subset of serving miners; "
+                    f"serving={len(live_solvers)} offered={len(offered)}"
                 )
                 dispatch_policy_logged = True
             result = await evaluate_round(
                 client,
                 http,
-                live_solvers,
+                solvers,
                 grading_policy,
                 cache_dir=state_dir / "v3-workspace-cache",
                 work_dir=state_dir / "v3-rounds",
+                candidates=offered,
             )
+            if result.status == "completed":
+                # Only a completed round earns a fresh draw. An abandoned or
+                # rejected lease keeps the order, so nothing the server does
+                # to a lease can buy it a different one.
+                offer_state["order"] = None
             completed = int(result.status == "completed")
             if result.status == "completed":
                 apply_round_scores(
