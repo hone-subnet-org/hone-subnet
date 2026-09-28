@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import traceback
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -124,7 +125,7 @@ class DemoMinerSettings(BaseSettings):
     axon_port: int = Field(default=8091, ge=1, le=65_535)
     axon_external_ip: str = ""
     miner_max_concurrent_requests: int = Field(default=4, ge=1, le=256)
-    miner_max_workspace_tool_calls: int = Field(default=24, ge=1, le=128)
+    miner_max_workspace_tool_calls: int = Field(default=48, ge=1, le=128)
     miner_max_request_bytes: int = Field(default=1_000_000, ge=1, le=10_000_000)
     miner_metagraph_sync_s: float = Field(default=300.0, gt=0.0)
     miner_min_stake: float = Field(default=0.0, ge=0.0)
@@ -848,7 +849,17 @@ class DemoMiner:
                 ])
                 continue
             if calls_made + len(calls) > budget:
-                raise ValueError("workspace tool call limit exceeded")
+                # Over budget: do not run the calls; ask for the submission
+                # instead, a bounded number of times, then give up.
+                if reasks == SUBMISSION_REASK_LIMIT:
+                    raise ValueError("workspace tool call limit exceeded")
+                reasks += 1
+                messages.extend([
+                    {"role": "assistant", "content": completion.output or "(tool call)"},
+                    {"role": "user", "content": "The workspace tool budget is exhausted; that call was not run. "
+                                                "Reply with only the final submission now."},
+                ])
+                continue
             results = []
             for call_id, name, arguments_text in calls:
                 try:
@@ -982,7 +993,8 @@ class DemoMiner:
             print(f"[demo-miner] model or upload failed: HTTP {exc.response.status_code}")
             return 502, {"error": "upstream request failed"}
         except Exception as exc:  # noqa: BLE001
-            print(f"[demo-miner] solve failed: {type(exc).__name__}")
+            print(f"[demo-miner] solve failed: {type(exc).__name__}: {exc}")
+            traceback.print_exc()
             return 500, {"error": "solve failed"}
         self.served_tasks.add(
             signed_by,

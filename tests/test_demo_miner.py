@@ -698,3 +698,39 @@ async def test_reask_then_tool_call_then_timeout_still_uploads_the_checked_reply
     _, events, submission = await miner._generate(task(), WorkspaceReader(tmp_path), time.monotonic() + 10)
     assert submission == extract_submission(bad)
     assert [e["event_type"] for e in events] == ["model_turn"]
+
+
+async def test_over_budget_tool_call_reasks_for_the_submission_instead_of_failing(tmp_path):
+    (tmp_path / "a.txt").write_text("a\n")
+    call = completion_for('```workspace\n{"tool":"read_file","path":"a.txt","offset":0}\n```')
+    diff = completion_for("```diff\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+b\n```")
+    replies = [call, call, diff]  # second call is over a budget of one
+    prompts = []
+
+    class Provider:
+        async def complete(self, messages, *, timeout_s, tools=()):
+            prompts.append(messages[-1]["content"])
+            return replies.pop(0)
+
+    import time
+
+    miner = DemoMiner(settings(miner_max_workspace_tool_calls=1), Provider())
+    _, events, submission = await miner._generate(task(), WorkspaceReader(tmp_path), time.monotonic() + 10)
+    assert submission.startswith(b"--- a/a.txt")
+    assert sum(1 for e in events if e["event_type"] == "tool_call") == 1  # the over-budget call was not run
+    assert sum(1 for e in events if e["event_type"] == "model_turn") == 3  # every model reply is still recorded
+    assert "budget is exhausted" in prompts[-1]
+
+
+async def test_over_budget_tool_calls_fail_after_the_reask_limit(tmp_path):
+    call = completion_for('```workspace\n{"tool":"list_files","path":".","offset":0}\n```')
+
+    class Provider:
+        async def complete(self, messages, *, timeout_s, tools=()):
+            return call  # never stops calling tools
+
+    import time
+
+    miner = DemoMiner(settings(miner_max_workspace_tool_calls=1), Provider())
+    with pytest.raises(ValueError, match="tool call limit"):
+        await miner._generate(task(), WorkspaceReader(tmp_path), time.monotonic() + 10)

@@ -11,7 +11,7 @@ limited to 32 KiB per call and directory listings to 200 entries per page. The
 miner does not execute repository code. Temporary workspace files are removed
 after generation.
 
-`MINER_MAX_WORKSPACE_TOOL_CALLS` defaults to 24, followed by one final model turn.
+`MINER_MAX_WORKSPACE_TOOL_CALLS` defaults to 48. A call over the budget is not run; the model is asked for its submission instead.
 Workspace preparation and all model turns share the solve deadline, reserving
 `BEDROCK_UPLOAD_RESERVE_S` for uploads. More file reads can increase model cost and
 solve latency. The miner needs local disk space for the compressed archive, its
