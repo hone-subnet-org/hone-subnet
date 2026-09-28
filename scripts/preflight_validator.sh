@@ -57,7 +57,14 @@ raise SystemExit(completed.returncode)
 PY
 }
 
-: "${PROBLEM_SERVER_URL:?set PROBLEM_SERVER_URL in .env}"
+if [[ ! -v PROBLEM_SERVER_URL ]]; then
+  # Unset means the release default, the production V3 problem server.
+  PROBLEM_SERVER_URL="$("${python_bin}" -c 'from rlvr.config import Settings; print(Settings.model_fields["problem_server_url"].default)')"
+  export PROBLEM_SERVER_URL
+elif [[ -z "${PROBLEM_SERVER_URL}" ]]; then
+  echo "[preflight] ERROR: PROBLEM_SERVER_URL is set but empty; unset it for the default or set a server." >&2
+  exit 1
+fi
 
 if [[ "${SUBTENSOR_NETWORK:-}" == "finney" && "${NETUID:-}" != "5" ]]; then
   echo "[preflight] ERROR: this Finney release is configured for NETUID=5." >&2

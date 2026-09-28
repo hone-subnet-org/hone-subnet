@@ -62,7 +62,8 @@ class Settings(BaseSettings):
     reward_partial_credit: bool = False
 
     # --- Private problem-source client ---
-    problem_server_url: str = ""
+    # The production V3 problem server. Override only for a private or test server.
+    problem_server_url: str = "https://d344p1xue0u9qs.cloudfront.net"
     # HTTPS authenticates problem-server responses; Epistula authenticates
     # validator requests. Plain HTTP is local-test only.
     problem_server_allow_insecure_http: bool = False

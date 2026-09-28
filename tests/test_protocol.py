@@ -271,6 +271,7 @@ def test_settings_fail_closed_to_docker_and_validate_difficulty_band():
     assert settings.docker_memory == "256m"
     assert settings.validator_dispatch_concurrency == 256
     assert settings.solve_deadline_s == 3600.0  # the lease expiry, not this default, bounds a task
+    assert settings.problem_server_url == "https://d344p1xue0u9qs.cloudfront.net"  # production V3 server
     assert settings.validator_send_concurrency == 32
     assert settings.validator_verify_concurrency == 16
     assert settings.problem_server_request_timeout_s == 60
