@@ -23,6 +23,31 @@ READ_BYTES = 32 * 1024
 LIST_ENTRIES = 200
 
 
+def _files_under(root: Path, *, limit: int) -> list[Path]:
+    """Regular files under root in directory order: entries of each directory
+    by name, descending into a directory when its name comes up. The order is
+    fixed for a given tree, so pages are consistent; the walk stops at limit."""
+    found: list[Path] = []
+    pending = [root]
+    while pending and len(found) < limit:
+        directory = pending.pop()
+        try:
+            entries = sorted(directory.iterdir(), key=lambda item: item.name)
+        except OSError:
+            continue
+        later: list[Path] = []
+        for entry in entries:
+            info = entry.lstat()
+            if stat.S_ISDIR(info.st_mode):
+                later.append(entry)
+            elif stat.S_ISREG(info.st_mode):
+                found.append(entry)
+                if len(found) >= limit:
+                    break
+        pending.extend(reversed(later))
+    return found[:limit]
+
+
 class WorkspaceReader:
     """Expose bounded reads without executing code from the workspace."""
 
@@ -49,7 +74,16 @@ class WorkspaceReader:
                     "path must be a string and offset a nonnegative integer"
                 )
             path = self._path(relative)
-            if arguments["tool"] == "list_files":
+            if arguments["tool"] == "find_files":
+                if not path.is_dir():
+                    raise ValueError("find_files requires a directory")
+                found = _files_under(path, limit=offset + LIST_ENTRIES + 1)
+                page = found[offset : offset + LIST_ENTRIES]
+                value = {
+                    "files": [item.relative_to(self.root).as_posix() for item in page],
+                    "next_offset": offset + len(page) if len(found) > offset + len(page) else None,
+                }
+            elif arguments["tool"] == "list_files":
                 entries = sorted(path.iterdir(), key=lambda item: item.name)
                 page = entries[offset : offset + LIST_ENTRIES]
                 value = {

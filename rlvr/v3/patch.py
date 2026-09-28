@@ -74,6 +74,11 @@ def _rejected(
     return PatchResult("rejected", (first_line or "patch rejected")[:_REASON_LIMIT], code)
 
 
+def static_rejection(patch: bytes, limits: PatchLimits) -> PatchResult | None:
+    """The rejection a validator would issue before running git, or None."""
+    return _static_rejection(patch, limits)
+
+
 def _static_rejection(patch: bytes, limits: PatchLimits) -> PatchResult | None:
     if len(patch) > limits.max_patch_bytes:
         return _rejected("patch exceeds the policy byte limit")

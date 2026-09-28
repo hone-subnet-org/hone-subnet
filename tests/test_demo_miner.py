@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
 import json
 import subprocess
 import time
@@ -39,6 +40,13 @@ def settings(**updates) -> DemoMinerSettings:
     return DemoMinerSettings(_env_file=None, bedrock_api_key="key", **updates)
 
 
+@pytest.fixture(autouse=True)
+def _no_reasks_by_default(request, monkeypatch):
+    # Loop tests that predate the pre-upload check use empty diffs; keep them focused.
+    if "reask" not in request.node.name:
+        monkeypatch.setattr("rlvr.neurons.demo_miner.SUBMISSION_REASK_LIMIT", 0)
+
+
 def task(hotkey="miner") -> MinerTaskRequest:
     value = lease()
     return MinerTaskRequest(
@@ -60,6 +68,8 @@ def test_prompt_and_submission_are_v3_shapes():
     assert extract_submission("```diff\n--- a/a\n+++ b/a\n```") == b"--- a/a\n+++ b/a\n"
     assert extract_submission("```diff\n context line \n```") == b" context line \n"
     assert extract_submission("```diff\n+value\r\n```") == b"+value\r\n"
+    assert extract_submission(" --- a/a\n+++ b/a\n") == b"--- a/a\n+++ b/a\n"  # provider-added leading space
+    assert extract_submission("  #!/bin/bash\necho hi\n") == b"#!/bin/bash\necho hi\n"
 
 
 def test_extracted_repository_patch_remains_git_applicable(tmp_path):
@@ -207,7 +217,7 @@ async def test_demo_uploads_submission_and_genuine_canonical_trajectory(monkeypa
     class Provider:
         calls = 0
 
-        async def complete(self, messages, *, timeout_s):
+        async def complete(self, messages, *, timeout_s, tools=()):
             self.calls += 1
             if self.calls == 1:
                 assert "Task working directory" in messages[-1]["content"]
@@ -296,7 +306,7 @@ async def test_workspace_tool_budget_allows_one_final_turn(tmp_path, keep_callin
     class Provider:
         calls = 0
 
-        async def complete(self, messages, *, timeout_s):
+        async def complete(self, messages, *, timeout_s, tools=()):
             self.calls += 1
             if self.calls == 2:
                 assert "Tool budget exhausted" in messages[-1]["content"]
@@ -312,7 +322,7 @@ async def test_workspace_tool_budget_allows_one_final_turn(tmp_path, keep_callin
         with pytest.raises(ValueError, match="tool call limit"):
             await miner._generate(task(), WorkspaceReader(tmp_path), time.monotonic() + 10)
     else:
-        completion, _ = await miner._generate(task(), WorkspaceReader(tmp_path), time.monotonic() + 10)
+        completion, _, _ = await miner._generate(task(), WorkspaceReader(tmp_path), time.monotonic() + 10)
         assert extract_submission(completion.output) == b""
     assert provider.calls == 2
 
@@ -323,7 +333,7 @@ async def test_workspace_reads_share_one_model_deadline(tmp_path, monkeypatch):
     budgets = []
 
     class Provider:
-        async def complete(self, messages, *, timeout_s):
+        async def complete(self, messages, *, timeout_s, tools=()):
             budgets.append(timeout_s)
             clock[0] += 25
             if len(budgets) == 1:
@@ -363,6 +373,25 @@ async def test_malformed_reasoning_is_rejected_not_blanked():
         await _complete_with(_records(["391", "<|im_end|>"]), content=" 391", reasoning=False)
 
 
+async def test_empty_reply_is_recorded_and_the_loop_reasks(tmp_path):
+    import time
+
+    empty = await _complete_with(None, content="", reasoning="thinking only")
+    assert empty.output == "" and empty.tool_calls == ()
+    replies = [empty, completion_for("```diff\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+b\n```")]
+    (tmp_path / "a.txt").write_text("a\n")
+    prompts = []
+
+    class Provider:
+        async def complete(self, messages, *, timeout_s, tools=()):
+            prompts.append(messages[-1]["content"])
+            return replies.pop(0)
+
+    miner = DemoMiner(settings(), Provider())
+    _, _, submission = await miner._generate(task(), WorkspaceReader(tmp_path), time.monotonic() + 10)
+    assert submission.startswith(b"--- a/a.txt") and prompts[-1].startswith("That reply was not accepted:")
+
+
 async def test_provider_reply_without_logprobs_is_recorded_without_tokens():
     result = await _complete_with(None, content=" 391")
     assert result.tokens == [] and result.generated_bytes == b"" and result.output == " 391"
@@ -379,3 +408,293 @@ async def test_present_but_malformed_logprobs_are_still_rejected():
 async def test_logprobs_with_wrong_type_content_are_rejected(records):
     with pytest.raises(RuntimeError, match="invalid response"):
         await _complete_with(records, content=" 391")
+
+
+def _tool_call_message(*calls):
+    return {"content": "", "tool_calls": [
+        {"id": f"call_{i}", "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
+        for i, (name, args) in enumerate(calls)
+    ]}
+
+
+async def test_provider_tool_calls_are_parsed_and_the_request_declares_tools():
+    seen = {}
+
+    async def handler(request):
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": _tool_call_message(("list_files", {"path": ".", "offset": 0}))}]})
+
+    from rlvr.neurons.demo_miner import WORKSPACE_TOOLS
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = BedrockClient(settings(bedrock_base_url="https://provider.invalid"), http=http)
+    result = await client.complete([{"role": "user", "content": "x"}], timeout_s=10, tools=WORKSPACE_TOOLS)
+    await http.aclose()
+    assert result.tool_calls == (("call_0", "list_files", '{"path": ".", "offset": 0}'),)
+    assert result.output == "" and result.tokens == []
+    assert [tool["function"]["name"] for tool in seen["body"]["tools"]] == ["list_files", "find_files", "read_file"]
+
+
+def completion_with_calls(*calls):
+    base = completion_for("")
+    return dataclasses.replace(base, tool_calls=tuple((f"call_{i}", name, json.dumps(args)) for i, (name, args) in enumerate(calls)))
+
+
+async def test_loop_executes_provider_tool_calls_and_answers_in_tool_messages(tmp_path):
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "a.txt").write_text("hello")
+    replies = [
+        completion_with_calls(("find_files", {"path": ".", "offset": 0}), ("read_file", {"path": "sub/a.txt", "offset": 0})),
+        completion_for("```diff\n\n```"),
+    ]
+    seen_messages = []
+
+    class Provider:
+        async def complete(self, messages, *, timeout_s, tools=()):
+            seen_messages.append([dict(m) for m in messages])
+            return replies.pop(0)
+
+    import time
+
+    miner = DemoMiner(settings(miner_max_workspace_tool_calls=2), Provider())
+    completion, events, _ = await miner._generate(task(), WorkspaceReader(tmp_path), time.monotonic() + 10)
+    assert extract_submission(completion.output) == b""
+    second = seen_messages[1]
+    assistant = next(m for m in second if m["role"] == "assistant")
+    assert [c["id"] for c in assistant["tool_calls"]] == ["call_0", "call_1"]
+    tool_replies = [m for m in second if m["role"] == "tool"]
+    assert [m["tool_call_id"] for m in tool_replies] == ["call_0", "call_1"]
+    assert json.loads(tool_replies[0]["content"])["files"] == ["sub/a.txt"]
+    assert json.loads(tool_replies[1]["content"])["content"] == "hello"
+    assert "Tool budget exhausted" in second[-1]["content"]  # both calls used the budget of two
+    call_ids = [e["call_id"] for e in events if e["event_type"] == "tool_call"]
+    assert call_ids == ["workspace-0", "workspace-1"]
+
+
+async def test_loop_reasks_when_the_submission_is_not_a_valid_patch(tmp_path):
+    (tmp_path / "a.txt").write_text("a\n")
+    bad = "```diff\n<|tool_call_begin|> functions.read_file:0 {\"path\": \"a.txt\"}\n```"
+    good = "```diff\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+b\n```"
+    replies = [completion_for(bad), completion_for(good)]
+    prompts = []
+
+    class Provider:
+        async def complete(self, messages, *, timeout_s, tools=()):
+            prompts.append(messages[-1]["content"])
+            return replies.pop(0)
+
+    import time
+
+    miner = DemoMiner(settings(), Provider())
+    _, _, submission = await miner._generate(task(), WorkspaceReader(tmp_path), time.monotonic() + 10)
+    assert submission.startswith(b"--- a/a.txt")
+    assert prompts[-1].startswith("That reply was not accepted:")
+
+
+async def test_loop_reask_gives_up_after_the_limit_and_uploads_the_last_reply(tmp_path):
+    bad = completion_for("```diff\nnot a diff\n```")
+
+    class Provider:
+        calls = 0
+
+        async def complete(self, messages, *, timeout_s, tools=()):
+            self.calls += 1
+            return bad
+
+    import time
+
+    provider = Provider()
+    miner = DemoMiner(settings(), provider)
+    completion, _, submission = await miner._generate(task(), WorkspaceReader(tmp_path), time.monotonic() + 10)
+    assert completion is bad and provider.calls == 3  # first try plus two re-asks
+    assert submission == b"not a diff\n"  # uploaded as is
+
+
+@pytest.mark.skipif(__import__("shutil").which("git") is None, reason="git required")
+async def test_check_submission_uses_git_and_repairs_only_what_git_accepts(tmp_path):
+    import time
+
+    (tmp_path / "a.txt").write_text("a\n")
+    miner = DemoMiner(settings(), object())
+    deadline = time.monotonic() + 30
+    good = "```diff\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+b\n```"
+    wrong_context = "```diff\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-zzz\n+b\n```"
+    assert await miner._check_submission(task(), good, WorkspaceReader(tmp_path), deadline) == (extract_submission(good), None)
+    submission, problem = await miner._check_submission(task(), wrong_context, WorkspaceReader(tmp_path), deadline)
+    assert submission == extract_submission(wrong_context) and problem and "error" in problem
+    assert (await miner._check_submission(task(), "```diff\n\x00\n```", WorkspaceReader(tmp_path), deadline))[1] == "patch contains a NUL byte"
+
+
+@pytest.mark.skipif(__import__("shutil").which("git") is None, reason="git required")
+async def test_check_submission_ignores_git_config_inside_the_workspace(tmp_path):
+    import time
+
+    (tmp_path / "a.txt").write_text("a\n")
+    (tmp_path / ".gitattributes").write_text("* filter=evil\n")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text(f'[filter "evil"]\n\tclean = touch {tmp_path}/FILTER_RAN\n')
+    (tmp_path / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    miner = DemoMiner(settings(), object())
+    good = "```diff\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+b\n```"
+    assert (await miner._check_submission(task(), good, WorkspaceReader(tmp_path), time.monotonic() + 30))[1] is None
+    assert not (tmp_path / "FILTER_RAN").exists()
+
+
+def test_find_files_is_recursive_in_directory_order_and_paged(tmp_path, monkeypatch):
+    from rlvr.v3 import miner_workspace
+
+    for name in ("b/z.txt", "b/a/x.txt", "a.txt"):
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x")
+    (tmp_path / "link").symlink_to(tmp_path / "b")
+    monkeypatch.setattr(miner_workspace, "LIST_ENTRIES", 2)
+    reader = WorkspaceReader(tmp_path)
+    # a directory's files come before its subdirectories; the symlink is skipped
+    first = json.loads(reader.execute({"tool": "find_files", "path": ".", "offset": 0}))
+    assert first == {"files": ["a.txt", "b/z.txt"], "next_offset": 2}
+    second = json.loads(reader.execute({"tool": "find_files", "path": ".", "offset": 2}))
+    assert second == {"files": ["b/a/x.txt"], "next_offset": None}
+    assert "error" in json.loads(reader.execute({"tool": "find_files", "path": "a.txt", "offset": 0}))
+
+
+@pytest.mark.parametrize("header, body, expected", [
+    ("@@ -1,8 +1,17 @@", [" a", "-b", "+c", "+d"], "@@ -1,2 +1,3 @@"),
+    ("@@ -1 +1 @@ fn main()", ["-a", "+b"], "@@ -1,1 +1,1 @@ fn main()"),
+    ("@@ -3,2 +3,2 @@", [" x", "-y", "+z", "\\ No newline at end of file"], "@@ -3,2 +3,2 @@"),
+])
+def test_recount_hunks_fixes_only_the_counts(header, body, expected):
+    from rlvr.neurons.demo_miner import recount_hunks
+
+    patch = "--- a/f\n+++ b/f\n" + header + "\n" + "\n".join(body) + "\n"
+    fixed = recount_hunks(patch.encode()).decode()
+    assert fixed == "--- a/f\n+++ b/f\n" + expected + "\n" + "\n".join(body) + "\n"
+
+
+@pytest.mark.skipif(__import__("shutil").which("git") is None, reason="git required")
+async def test_recount_is_applied_only_when_git_accepts_the_repair(tmp_path):
+    import time
+
+    (tmp_path / "a.txt").write_text("one\ntwo\nthree\n")
+    miner = DemoMiner(settings(), object())
+    miscounted = "```diff\n--- a/a.txt\n+++ b/a.txt\n@@ -1,9 +1,12 @@\n one\n-two\n+TWO\n+more\n three\n```"
+    submission, problem = await miner._check_submission(task(), miscounted, WorkspaceReader(tmp_path), time.monotonic() + 30)
+    assert problem is None and submission.startswith(b"--- a/a.txt\n+++ b/a.txt\n@@ -1,3 +1,4 @@\n")
+
+
+def test_recount_leaves_a_multi_file_diff_without_git_headers_alone_when_valid():
+    from rlvr.neurons.demo_miner import recount_hunks
+
+    # Two files, no "diff --git" lines: the second file's headers start with - and +.
+    patch = b"--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n--- a/y\n+++ b/y\n@@ -1 +1 @@\n-c\n+d\n"
+    assert recount_hunks(patch) != patch  # the naive recount would change it ...
+    # ... which is why the miner only uses a recount that git has accepted.
+
+
+async def test_a_repair_is_not_used_when_git_could_not_run(tmp_path, monkeypatch):
+    import time
+
+    (tmp_path / "a.txt").write_text("one\ntwo\nthree\n")
+    miscounted = "```diff\n--- a/a.txt\n+++ b/a.txt\n@@ -1,9 +1,12 @@\n one\n-two\n+TWO\n+more\n three\n```"
+    calls = []
+
+    def fake_git_check(git, patch, workspace, timeout):
+        calls.append(patch)
+        if len(calls) == 1:
+            return True, "error: corrupt patch at line 3"
+        raise_timeout = __import__("subprocess").TimeoutExpired
+        raise raise_timeout(cmd="git", timeout=timeout)
+
+    def guarded(git, patch, workspace, timeout):
+        try:
+            return fake_git_check(git, patch, workspace, timeout)
+        except __import__("subprocess").SubprocessError:
+            return False, None
+
+    monkeypatch.setattr("rlvr.neurons.demo_miner.shutil.which", lambda _: "/usr/bin/git")
+    monkeypatch.setattr("rlvr.neurons.demo_miner._git_check", guarded)
+    miner = DemoMiner(settings(), object())
+    submission, problem = await miner._check_submission(task(), miscounted, WorkspaceReader(tmp_path), time.monotonic() + 30)
+    assert submission == extract_submission(miscounted)  # the raw bytes, not the unverified repair
+    assert problem == "error: corrupt patch at line 3"
+    assert len(calls) == 2
+
+
+async def test_no_git_check_runs_when_the_deadline_has_passed(tmp_path, monkeypatch):
+    import time
+
+    (tmp_path / "a.txt").write_text("a\n")
+    monkeypatch.setattr("rlvr.neurons.demo_miner.shutil.which", lambda _: "/usr/bin/git")
+    monkeypatch.setattr("rlvr.neurons.demo_miner._git_check", lambda *a: (_ for _ in ()).throw(AssertionError("must not run")))
+    miner = DemoMiner(settings(), object())
+    bad = "```diff\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-zzz\n+b\n```"
+    assert await miner._check_submission(task(), bad, WorkspaceReader(tmp_path), time.monotonic() - 1) == (extract_submission(bad), None)
+
+
+async def test_reask_is_skipped_and_the_reply_uploaded_when_time_runs_out(tmp_path, monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr("rlvr.neurons.demo_miner.time", SimpleNamespace(monotonic=lambda: clock[0]))
+    (tmp_path / "a.txt").write_text("a\n")
+    bad = "```diff\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-zzz\n+b\n```"
+    calls = []
+
+    class Provider:
+        async def complete(self, messages, *, timeout_s, tools=()):
+            calls.append(timeout_s)
+            clock[0] += 60  # the model reply consumed the rest of the budget
+            return completion_for(bad)
+
+    async def failing_check(request, output, reader, deadline):
+        return extract_submission(output), "error: patch failed: a.txt:1"
+
+    miner = DemoMiner(settings(), Provider())
+    monkeypatch.setattr(miner, "_check_submission", failing_check)
+    _, _, submission = await miner._generate(task(), WorkspaceReader(tmp_path), 150)
+    assert submission == extract_submission(bad) and calls == [50]  # no second call, no TimeoutError
+
+
+async def test_reask_call_timeout_uploads_the_previous_reply(tmp_path, monkeypatch):
+    (tmp_path / "a.txt").write_text("a\n")
+    bad = "```diff\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-zzz\n+b\n```"
+    calls = []
+
+    class Provider:
+        async def complete(self, messages, *, timeout_s, tools=()):
+            calls.append(len(messages))
+            if len(calls) == 1:
+                return completion_for(bad)
+            raise TimeoutError("Bedrock request deadline exceeded")
+
+    async def failing_check(request, output, reader, deadline):
+        return extract_submission(output), "error: patch failed: a.txt:1"
+
+    import time
+
+    miner = DemoMiner(settings(), Provider())
+    monkeypatch.setattr(miner, "_check_submission", failing_check)
+    _, events, submission = await miner._generate(task(), WorkspaceReader(tmp_path), time.monotonic() + 10)
+    assert submission == extract_submission(bad) and len(calls) == 2
+    assert [e["event_type"] for e in events] == ["model_turn"]  # the failed correction attempt left no event
+
+
+async def test_reask_then_tool_call_then_timeout_still_uploads_the_checked_reply(tmp_path, monkeypatch):
+    (tmp_path / "a.txt").write_text("a\n")
+    bad = "```diff\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-zzz\n+b\n```"
+    replies = [completion_for(bad), completion_for('```workspace\n{"tool":"read_file","path":"a.txt","offset":0}\n```')]
+
+    class Provider:
+        async def complete(self, messages, *, timeout_s, tools=()):
+            if replies:
+                return replies.pop(0)
+            raise TimeoutError("Bedrock request deadline exceeded")
+
+    async def failing_check(request, output, reader, deadline):
+        return extract_submission(output), "error: patch failed: a.txt:1"
+
+    import time
+
+    miner = DemoMiner(settings(), Provider())
+    monkeypatch.setattr(miner, "_check_submission", failing_check)
+    _, events, submission = await miner._generate(task(), WorkspaceReader(tmp_path), time.monotonic() + 10)
+    assert submission == extract_submission(bad)
+    assert [e["event_type"] for e in events] == ["model_turn"]

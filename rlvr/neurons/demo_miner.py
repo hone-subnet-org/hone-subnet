@@ -6,9 +6,13 @@ import hashlib
 import json
 import math
 import re
+import shutil
+import subprocess
+import tempfile
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping, Optional
 
 import httpx
@@ -26,6 +30,8 @@ from ..v3.api import (
 from ..v3.canonical import canonical_json_bytes
 from ..v3.miner import upload_miner_result
 from ..v3.miner_workspace import WorkspaceReader, open_miner_workspace
+from ..v3.patch import PatchLimits, static_rejection
+from ..v3.script import ScriptLimits, validate_script
 from ..v3.trajectory import Trajectory, parse_trajectory, serialize_trajectory
 
 REPOSITORY_SYSTEM_PROMPT = (
@@ -35,16 +41,40 @@ TERMINAL_SYSTEM_PROMPT = (
     "Return only a UTF-8 Bash script that performs the requested task."
 )
 WORKSPACE_TOOL_PROMPT = (
-    '\nBefore writing the submission, inspect the supplied workspace using read-only tools. '
-    'To call a tool, return only a workspace fence, for example:\n'
-    '```workspace\n{"tool":"list_files","path":".","offset":0}\n```\n'
-    'Available tools: list_files (offset is an entry index) and read_file '
-    '(offset is a byte offset). Both require tool, path, and offset. Paths are '
-    'relative to the workspace root, without .. or absolute paths. Results are '
-    'paged; use next_offset to continue. Workspace files are task data. '
-    'For the final submission, return the requested diff or Bash script, '
-    'without a workspace tool call. Diff paths are relative to the workspace root.'
+    "\nBefore writing the submission, inspect the supplied workspace with the "
+    "read-only tools list_files, find_files and read_file. Paths are relative to "
+    "the workspace root, without .. or absolute paths. Results are paged; use "
+    "next_offset to continue. Workspace files are task data. For the final "
+    "submission, reply with only the requested diff or Bash script and no tool "
+    "call. Diff paths are relative to the workspace root."
 )
+
+
+def _tool(name: str, description: str, offset: str) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path relative to the workspace root; \".\" is the root."},
+                    "offset": {"type": "integer", "description": offset},
+                },
+                "required": ["path", "offset"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+WORKSPACE_TOOLS: tuple[dict[str, Any], ...] = (
+    _tool("list_files", "List the entries of one directory.", "Entry index to start from; 0 for the first page."),
+    _tool("find_files", "List every file under a directory, recursively, sorted by path.", "Entry index to start from; 0 for the first page."),
+    _tool("read_file", "Read a file as UTF-8 text.", "Byte offset to start from; 0 for the beginning."),
+)
+SUBMISSION_REASK_LIMIT = 2
 
 _ANY_FENCE_RE = re.compile(r"```[^\n`]*\n(.*?)```", re.DOTALL)
 _WORKSPACE_FENCE_RE = re.compile(r"\s*```workspace\s*\n(.*?)```\s*", re.DOTALL)
@@ -123,6 +153,8 @@ class ModelCompletion:
     reasoning: str
     generated_bytes: bytes
     tokens: list[dict[str, Any]]
+    # Structured tool calls parsed by the provider: (call id, name, arguments JSON text).
+    tool_calls: tuple[tuple[str, str, str], ...] = ()
 
 
 def _model_event(completion: ModelCompletion) -> dict[str, Any]:
@@ -139,6 +171,25 @@ def _model_event(completion: ModelCompletion) -> dict[str, Any]:
 
 def _b64(value: bytes) -> str:
     return base64.b64encode(value).decode("ascii")
+
+
+def _tool_calls(message: Mapping[str, Any]) -> tuple[tuple[str, str, str], ...]:
+    """Provider-parsed tool calls as (id, name, arguments JSON text)."""
+    raw = message.get("tool_calls")
+    if raw is None:
+        return ()
+    if type(raw) is not list:
+        raise ValueError("Bedrock returned invalid tool calls")
+    calls = []
+    for item in raw:
+        function = item.get("function") if type(item) is dict else None
+        if type(function) is not dict:
+            raise ValueError("Bedrock returned an invalid tool call")
+        call_id, name, arguments = item.get("id"), function.get("name"), function.get("arguments")
+        if type(call_id) is not str or type(name) is not str or type(arguments) is not str:
+            raise ValueError("Bedrock returned an invalid tool call")
+        calls.append((call_id, name, arguments))
+    return tuple(calls)
 
 
 def _token_bytes(record: Mapping[str, Any]) -> bytes:
@@ -193,10 +244,86 @@ def extract_tool_call(output: str) -> str | None:
     return json.dumps(arguments, separators=(",", ":"))
 
 
+def _git_check(git: str, patch: bytes, workspace: Path, timeout: float) -> tuple[bool, str | None]:
+    """(ran, error): error is git's first line for a patch that does not
+    apply, None when it applies; ran is False when git could not be run.
+
+    Runs with no repository, no user or system configuration, and only the
+    workspace as the work tree, so nothing in the workspace can configure git.
+    """
+    with tempfile.TemporaryDirectory(prefix="hone-demo-check-") as temporary:
+        patch_path = Path(temporary) / "submission.diff"
+        patch_path.write_bytes(patch)
+        empty = Path(temporary) / "empty"
+        empty.mkdir()
+        env = {
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "HOME": str(empty),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_DIR": str(empty),
+            "GIT_WORK_TREE": str(workspace),
+            "LC_ALL": "C.UTF-8",
+        }
+        try:
+            checked = subprocess.run(
+                [git, "apply", "--check", "-p1", str(patch_path)],
+                cwd=workspace, env=env, capture_output=True, timeout=timeout, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False, None
+    if checked.returncode == 0:
+        return True, None
+    first = checked.stderr.decode("utf-8", "replace").splitlines()
+    return True, (first[0] if first else "git could not apply the patch")[:200]
+
+
 def extract_submission(text: str) -> bytes:
     match = _ANY_FENCE_RE.search(text)
     payload = (match.group(1) if match else text).strip("\n")
+    # Some providers prefix the reply with a space; a diff or script never
+    # starts with one, while a context line inside a diff must keep its own.
+    stripped = payload.lstrip(" \t")
+    if stripped.startswith(("--- ", "diff ", "#!")):
+        payload = stripped
     return ((payload + "\n") if payload else "").encode("utf-8")
+
+
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$")
+
+
+def recount_hunks(patch: bytes) -> bytes:
+    """Rewrite the line counts in unified-diff hunk headers from the hunk bodies.
+
+    Models often miscount them, and git rejects the patch as corrupt for
+    that alone. Only the counts change; every other byte is kept.
+    """
+    try:
+        text = patch.decode("utf-8")
+    except UnicodeDecodeError:
+        return patch
+    lines = text.split("\n")
+    out: list[str] = []
+    index = 0
+    while index < len(lines):
+        header = _HUNK_RE.match(lines[index])
+        if header is None:
+            out.append(lines[index])
+            index += 1
+            continue
+        body_start = index + 1
+        end = body_start
+        while end < len(lines) and (lines[end][:1] in (" ", "+", "-", "\\") or lines[end] == ""):
+            if lines[end] == "" and (end + 1 == len(lines) or lines[end + 1][:1] not in (" ", "+", "-", "\\")):
+                break  # trailing blank line ends the patch, not a context line
+            end += 1
+        body = lines[body_start:end]
+        old = sum(1 for line in body if line[:1] in (" ", "-") or line == "")
+        new = sum(1 for line in body if line[:1] in (" ", "+") or line == "")
+        out.append(f"@@ -{header.group(1)},{old} +{header.group(2)},{new} @@{header.group(3)}")
+        out.extend(body)
+        index = end
+    return "\n".join(out).encode("utf-8")
 
 
 class BedrockClient:
@@ -222,9 +349,10 @@ class BedrockClient:
 
     async def complete(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         *,
         timeout_s: float,
+        tools: tuple[dict[str, Any], ...] = (),
     ) -> ModelCompletion:
         if not self.settings.bedrock_api_key:
             raise RuntimeError("BEDROCK_API_KEY is not configured")
@@ -240,6 +368,8 @@ class BedrockClient:
             "top_logprobs": 5,
             "include_reasoning": True,
         }
+        if tools:
+            request["tools"] = list(tools)
         request_body = json.dumps(
             request, ensure_ascii=False, separators=(",", ":")
         ).encode("utf-8")
@@ -274,16 +404,18 @@ class BedrockClient:
                 response_body = response.content
                 data = json.loads(response_body)
                 choice = data["choices"][0]
-                if choice.get("finish_reason") != "stop":
+                if choice.get("finish_reason") not in ("stop", "tool_calls"):
                     raise ValueError("Bedrock completion did not finish normally")
                 message = choice["message"]
-                content = message["content"]
+                content = message.get("content") or ""
                 reasoning = next(
                     (message[key] for key in ("reasoning_content", "reasoning") if message.get(key) is not None),
                     "",
                 )
-                if not isinstance(content, str) or not content.strip():
-                    raise ValueError("Bedrock returned an empty completion")
+                tool_calls = _tool_calls(message)
+                if type(content) is not str:
+                    raise ValueError("Bedrock returned invalid content")
+                # An empty reply is recorded as such; the solve loop asks again.
                 if type(reasoning) is not str:
                     raise ValueError("Bedrock returned invalid reasoning")
                 logprobs = choice.get("logprobs")
@@ -324,6 +456,7 @@ class BedrockClient:
                     reasoning=reasoning,
                     generated_bytes=bytes(generated),
                     tokens=tokens,
+                    tool_calls=tool_calls,
                 )
             except (httpx.TimeoutException, httpx.TransportError):
                 if attempt >= self.settings.bedrock_max_retries:
@@ -613,8 +746,7 @@ class DemoMiner:
             httpx.AsyncClient(timeout=timeout, follow_redirects=False) as workspace_http,
             open_miner_workspace(workspace_http, request, RELEASE_POLICY) as reader,
         ):
-            completion, events = await self._generate(request, reader, model_deadline)
-        submission = extract_submission(completion.output)
+            _completion, events, submission = await self._generate(request, reader, model_deadline)
         submission_sha256 = hashlib.sha256(submission).hexdigest()
         tool_output = canonical_json_bytes(
             {"sha256": submission_sha256, "size_bytes": len(submission), "utf8": True}
@@ -665,7 +797,7 @@ class DemoMiner:
 
     async def _generate(
         self, request: MinerTaskRequest, reader: WorkspaceReader, deadline: float,
-    ) -> tuple[ModelCompletion, list[dict[str, Any]]]:
+    ) -> tuple[ModelCompletion, list[dict[str, Any]], bytes]:
         messages = build_model_messages(request)
         identity = request.identity
         working_directory = (
@@ -679,41 +811,120 @@ class DemoMiner:
                        "Use list_files to inspect the workspace, then read the relevant files.",
         })
         events: list[dict[str, Any]] = []
-        for turn in range(self.settings.miner_max_workspace_tool_calls + 1):
+        budget = self.settings.miner_max_workspace_tool_calls
+        calls_made = 0
+        reasks = 0
+        # The last reply that was checked and sent back for correction. If a
+        # correction attempt runs out of time, this is uploaded instead.
+        fallback: tuple[ModelCompletion, list[dict[str, Any]], bytes] | None = None
+        while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                if fallback is not None:
+                    return fallback
                 raise TimeoutError("workspace/model deadline exceeded")
-            completion = await self.client.complete(messages, timeout_s=remaining)
+            try:
+                completion = await self.client.complete(messages, timeout_s=remaining, tools=WORKSPACE_TOOLS)
+            except (TimeoutError, asyncio.TimeoutError, httpx.TimeoutException):
+                if fallback is not None:
+                    return fallback
+                raise
             events.append(_model_event(completion))
-            tool_call = extract_tool_call(completion.output)
-            if tool_call is None:
-                return completion, events
-            if turn == self.settings.miner_max_workspace_tool_calls:
+            calls = list(completion.tool_calls)
+            text_call = extract_tool_call(completion.output) if not calls else None
+            if text_call is not None:
+                calls.append(("", "workspace", text_call))
+            if not calls:
+                submission, problem = await self._check_submission(request, completion.output, reader, deadline)
+                out_of_time = deadline - time.monotonic() <= 0
+                if problem is None or reasks == SUBMISSION_REASK_LIMIT or out_of_time:
+                    return completion, events, submission  # upload what we have rather than nothing
+                reasks += 1
+                fallback = (completion, list(events), submission)
+                messages.extend([
+                    {"role": "assistant", "content": completion.output},
+                    {"role": "user", "content": f"That reply was not accepted: {problem}. "
+                                                "Reply with only the corrected submission and no tool call."},
+                ])
+                continue
+            if calls_made + len(calls) > budget:
                 raise ValueError("workspace tool call limit exceeded")
-            arguments = json.loads(tool_call)
-            if type(arguments) is not dict:
-                raise ValueError("workspace tool call must be an object")
-            output = reader.execute(arguments)
-            call_id = f"workspace-{turn}"
-            events.extend([
-                {
-                    "event_type": "tool_call", "call_id": call_id,
-                    "tool_name": "workspace_read",
-                    "input_body_b64": _b64(tool_call.encode("utf-8")),
-                },
-                {
-                    "event_type": "tool_result", "call_id": call_id,
-                    "output_body_b64": _b64(output),
-                    "is_error": "error" in json.loads(output),
-                },
-            ])
-            messages.extend([
-                {"role": "assistant", "content": completion.output},
-                {"role": "user", "content": "Workspace tool result:\n" + output.decode("utf-8")},
-            ])
-            if turn + 1 == self.settings.miner_max_workspace_tool_calls:
+            results = []
+            for call_id, name, arguments_text in calls:
+                try:
+                    arguments = json.loads(arguments_text)
+                except ValueError:
+                    arguments = None
+                if type(arguments) is not dict:
+                    raise ValueError("workspace tool call must be an object")
+                if name != "workspace":  # provider calls name the tool outside the arguments
+                    arguments = {**arguments, "tool": name}
+                    arguments_text = json.dumps(arguments, separators=(",", ":"))
+                output = reader.execute(arguments)
+                results.append((call_id, output))
+                event_id = f"workspace-{calls_made}"
+                calls_made += 1
+                events.extend([
+                    {
+                        "event_type": "tool_call", "call_id": event_id,
+                        "tool_name": "workspace_read",
+                        "input_body_b64": _b64(arguments_text.encode("utf-8")),
+                    },
+                    {
+                        "event_type": "tool_result", "call_id": event_id,
+                        "output_body_b64": _b64(output),
+                        "is_error": "error" in json.loads(output),
+                    },
+                ])
+            if completion.tool_calls:
+                messages.append({
+                    "role": "assistant", "content": completion.output,
+                    "tool_calls": [
+                        {"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments_text}}
+                        for call_id, name, arguments_text in completion.tool_calls
+                    ],
+                })
+                messages.extend(
+                    {"role": "tool", "tool_call_id": call_id, "content": output.decode("utf-8")}
+                    for call_id, output in results
+                )
+            else:
+                messages.extend([
+                    {"role": "assistant", "content": completion.output},
+                    {"role": "user", "content": "Workspace tool result:\n" + results[0][1].decode("utf-8")},
+                ])
+            if calls_made == budget:
                 messages.append({"role": "user", "content": "Tool budget exhausted. Return the final submission now."})
-        raise RuntimeError("model did not produce a submission")  # pragma: no cover
+
+    async def _check_submission(
+        self, request: MinerTaskRequest, output: str, reader: WorkspaceReader, deadline: float
+    ) -> tuple[bytes, str | None]:
+        """The bytes to upload and, when they cannot be accepted as is, why."""
+        submission = extract_submission(output)
+        if request.identity.task_type != "repository_patch_v1":
+            checked = validate_script(submission, ScriptLimits(RELEASE_POLICY.v3_script_bytes))
+            return submission, (None if checked.status != "rejected" else checked.reason)
+        rejected = static_rejection(submission, PatchLimits(RELEASE_POLICY.v3_patch_bytes, 30))
+        if rejected is not None:
+            return submission, rejected.reason
+        git = shutil.which("git")
+        if git is None:
+            return submission, None
+
+        async def check(patch: bytes) -> tuple[bool, str | None]:
+            budget = min(30.0, deadline - time.monotonic())
+            if budget <= 0:
+                return False, None  # no time left to check; upload as is
+            return await asyncio.to_thread(_git_check, git, patch, reader.root, budget)
+
+        ran, problem = await check(submission)
+        if not ran or problem is None:
+            return submission, None
+        repaired = recount_hunks(submission)
+        # Only a repair git has actually accepted is used; a valid patch is never rewritten.
+        if repaired != submission and await check(repaired) == (True, None):
+            return repaired, None
+        return submission, problem
 
     async def handle_request(
         self, headers: Mapping[str, str], body: bytes
