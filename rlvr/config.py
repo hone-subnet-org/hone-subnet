@@ -26,7 +26,10 @@ class Settings(BaseSettings):
     # full response; HTTPX's own timeout is only a per-phase inactivity bound.
     # Too-short deadlines zero out honest miners on exactly the in-band-hard
     # problems the curriculum targets.
-    solve_deadline_s: float = Field(default=300.0, gt=0.0, le=3600.0)
+    # Upper bound on how long a validator waits for one miner. The validator
+    # waits the shorter of this and the lease expiry, so with the default the
+    # lease expiry set by the problem server is the per-task limit.
+    solve_deadline_s: float = Field(default=3600.0, gt=0.0, le=3600.0)
     # --- Difficulty classification ---
     band_low: float = Field(default=0.35, ge=0.0, le=1.0)
     band_high: float = Field(default=0.65, ge=0.0, le=1.0)
