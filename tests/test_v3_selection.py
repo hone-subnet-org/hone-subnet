@@ -11,19 +11,28 @@ from rlvr.v3.selection import choose_candidates, eligible_miners, next_offer
 SERVING = [(uid, f"hk-{uid}") for uid in range(10)]
 
 
-def test_owner_and_permit_holders_are_never_offered():
+def test_owner_and_validating_uids_are_never_offered():
     permits = [False] * 10
     permits[3] = permits[7] = True
+    trust = [0.0] * 10
+    trust[3] = 0.4  # uid 3 validates; uid 7 only holds a permit (a well-staked miner)
+    eligible = eligible_miners(SERVING, validator_permits=permits, validator_trust=trust)
+    assert {uid for uid, _ in eligible} == {1, 2, 4, 5, 6, 7, 8, 9}
+    # without a trust list the permit alone decides, conservatively
     chosen = choose_candidates(SERVING, validator_permits=permits, rng=random.Random(1))
     assert {uid for uid, _ in chosen} == {1, 2, 4, 5, 6, 8, 9}
+    # a trust list too short to cover a permit holder: that UID is treated as validating
+    short = eligible_miners(SERVING, validator_permits=permits, validator_trust=[0.0] * 5)
+    assert {uid for uid, _ in short} == {1, 2, 4, 5, 6, 8, 9}
 
 
 def test_permits_may_arrive_as_an_array():
     import numpy
 
     permits = numpy.array([False, False, False, True, False, False, False, True, False, False])
-    chosen = choose_candidates(SERVING, validator_permits=permits, rng=random.Random(1))
-    assert {uid for uid, _ in chosen} == {1, 2, 4, 5, 6, 8, 9}
+    trust = numpy.array([0.0, 0.0, 0.0, 0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    eligible = eligible_miners(SERVING, validator_permits=permits, validator_trust=trust)
+    assert {uid for uid, _ in eligible} == {1, 2, 4, 5, 6, 7, 8, 9}
 
 
 def test_missing_permit_list_only_excludes_the_owner():
@@ -81,7 +90,8 @@ async def test_round_callback_offers_a_filtered_random_subset_and_dispatches_onl
             self.subtensor = object()
             self.metagraph = SimpleNamespace(
                 hotkeys=[f"hk-{uid}" for uid in range(4)],
-                validator_permit=[False, False, True, False],  # uid 2 is a validator
+                validator_permit=[False, False, True, False],  # uid 2 holds a permit ...
+                validator_trust=[0.0, 0.0, 0.5, 0.0],  # ... and validates
                 sync=lambda **_: None,
             )
 
@@ -214,7 +224,8 @@ async def test_round_callback_says_so_when_no_miner_is_eligible(tmp_path, monkey
             self.wallet = SimpleNamespace(hotkey=SimpleNamespace(ss58_address="validator"))
             self.subtensor = object()
             # the only serving miner holds a validator permit
-            self.metagraph = SimpleNamespace(hotkeys=["owner", "hk-1"], validator_permit=[False, True], sync=lambda **_: None)
+            self.metagraph = SimpleNamespace(hotkeys=["owner", "hk-1"], validator_permit=[False, True],
+                                             validator_trust=[0.0, 0.2], sync=lambda **_: None)
 
         def setup_bittensor(self):
             pass

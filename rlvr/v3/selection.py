@@ -2,8 +2,9 @@
 
 The validator, not the problem server, chooses. It offers the serving miners
 in a random order, and the server must issue slots for exactly the first N of
-them, N fixed by release policy. Validators (permit holders) and the owner
-UID 0 are never offered. The order is kept until a round completes, so a
+them, N fixed by release policy. UIDs that are validating (a permit with
+non-zero validator trust) and the owner UID 0 are never offered. The order
+is kept until a round completes, so a
 rejected lease never earns the server a fresh draw.
 """
 
@@ -19,15 +20,31 @@ def eligible_miners(
     serving: Iterable[tuple[int, str]],
     *,
     validator_permits: Sequence[bool] | None = None,
+    validator_trust: Sequence[float] | None = None,
 ) -> list[tuple[int, str]]:
-    """Serving miners minus the owner and validator permit holders."""
-    # The metagraph hands this back as an array; never truth-test it as a whole.
+    """Serving miners minus the owner and the UIDs that are validating.
+
+    A UID is validating when it holds a validator permit and has non-zero
+    validator trust, that is, it sets weights. A permit alone is not enough:
+    permits go to the top stakes, so a well-staked miner holds one too. When
+    the trust list is unavailable, or has no entry for a UID, the permit alone
+    decides for that UID, conservatively. Trust measures weights that survive
+    consensus, so a validator whose weights are all clipped has none; such a
+    UID is offered a task only if it also serves a miner axon, in which case
+    it is a miner as well.
+    """
+    # The metagraph hands these back as arrays; never truth-test them as a whole.
     permits = [] if validator_permits is None else [bool(item) for item in validator_permits]
-    return [
-        (uid, hotkey)
-        for uid, hotkey in serving
-        if uid != 0 and not (uid < len(permits) and bool(permits[uid]))
-    ]
+    trust = None if validator_trust is None else [float(item) for item in validator_trust]
+
+    def validating(uid: int) -> bool:
+        if not (uid < len(permits) and permits[uid]):
+            return False
+        if trust is None or uid >= len(trust):
+            return True  # permit with unknown trust: treat as validating
+        return trust[uid] > 0.0
+
+    return [(uid, hotkey) for uid, hotkey in serving if uid != 0 and not validating(uid)]
 
 
 def next_offer(
