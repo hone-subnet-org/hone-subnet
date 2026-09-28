@@ -123,7 +123,7 @@ async def test_provider_response_records_exact_bodies_and_five_alternatives():
     await http.aclose()
     assert result.generated_bytes == b"x"
     assert len(result.tokens[0]["top_logprobs"]) == 5
-    assert json.loads(result.request_body)["model"] == "moonshotai.kimi-k2.5"
+    assert json.loads(result.request_body)["model"] == "us.moonshotai.kimi-k3"
 
 
 def _records(pieces: list[str]) -> list[dict]:

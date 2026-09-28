@@ -103,7 +103,7 @@ class DemoMinerSettings(BaseSettings):
     bedrock_base_url: str = (
         "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1"
     )
-    bedrock_model: str = "moonshotai.kimi-k2.5"
+    bedrock_model: str = "us.moonshotai.kimi-k3"
     bedrock_max_tokens: int = Field(default=16_384, ge=1, le=131_072)
     bedrock_temperature: float = Field(default=1.0, ge=0.0, le=1.0)
     bedrock_reasoning_effort: str = Field(

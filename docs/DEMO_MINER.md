@@ -38,7 +38,7 @@ Set:
 ```dotenv
 BEDROCK_API_KEY=<your-key>
 BEDROCK_BASE_URL=https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1
-BEDROCK_MODEL=moonshotai.kimi-k2.5
+BEDROCK_MODEL=us.moonshotai.kimi-k3
 
 NETUID=<subnet-id>
 SUBTENSOR_NETWORK=test
