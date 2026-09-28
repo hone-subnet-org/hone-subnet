@@ -21,9 +21,10 @@ def test_owner_and_validating_uids_are_never_offered():
     # without a trust list the permit alone decides, conservatively
     chosen = choose_candidates(SERVING, validator_permits=permits, rng=random.Random(1))
     assert {uid for uid, _ in chosen} == {1, 2, 4, 5, 6, 8, 9}
-    # a trust list too short to cover a permit holder: that UID is treated as validating
+    # a trust list too short to cover uid 7: its permit alone decides, so it is excluded;
+    # uid 3 has a zero entry and stays eligible
     short = eligible_miners(SERVING, validator_permits=permits, validator_trust=[0.0] * 5)
-    assert {uid for uid, _ in short} == {1, 2, 4, 5, 6, 8, 9}
+    assert {uid for uid, _ in short} == {1, 2, 3, 4, 5, 6, 8, 9}
 
 
 def test_permits_may_arrive_as_an_array():
