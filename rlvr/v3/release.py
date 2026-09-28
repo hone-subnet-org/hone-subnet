@@ -13,7 +13,9 @@ from .supervisor import SupervisorPolicy
 from .tree import TreeLimits
 
 
-def round_policy(policy: ValidatorPolicy, *, dispatch_concurrency: int) -> RoundPolicy:
+def round_policy(
+    policy: ValidatorPolicy, *, dispatch_concurrency: int, grading_concurrency: int = 1
+) -> RoundPolicy:
     candidate_uid = os.getuid()
     candidate_gid = os.getgid()
     if candidate_uid == 0 or candidate_gid == 0:
@@ -69,4 +71,5 @@ def round_policy(policy: ValidatorPolicy, *, dispatch_concurrency: int) -> Round
         execution_profile_id=policy.v3_execution_profile_id,
         verifier_policy="command-gold-digest-v1",
         dispatch_concurrency=dispatch_concurrency,
+        grading_concurrency=grading_concurrency,
     )

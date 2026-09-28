@@ -481,7 +481,9 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
     )
     _load_scores(engine, settings.validator_score_state_file)
     grading_policy = v3_round_policy(
-        policy, dispatch_concurrency=settings.validator_dispatch_concurrency
+        policy,
+        dispatch_concurrency=settings.validator_dispatch_concurrency,
+        grading_concurrency=settings.validator_grading_concurrency,
     )
     state_dir = Path(settings.validator_score_state_file).parent
     diagnostics = EvaluationLog(

@@ -100,10 +100,34 @@ class RoundPolicy:
     execution_profile_id: str
     verifier_policy: str
     dispatch_concurrency: int
+    grading_concurrency: int = 1
 
     def __post_init__(self) -> None:
         if type(self.dispatch_concurrency) is not int or self.dispatch_concurrency < 1:
             raise ValueError("dispatch concurrency must be positive")
+        if type(self.grading_concurrency) is not int or self.grading_concurrency < 1:
+            raise ValueError("grading concurrency must be positive")
+
+
+class _Abandon(Exception):
+    """One miner's grading hit a validator-side fault that ends the round.
+
+    Carries that miner's evaluation when grading had already produced one,
+    so diagnostics still record it.
+    """
+
+    def __init__(
+        self,
+        reason: str,
+        code: RoundReason,
+        stage: Stage,
+        evaluation: MinerEvaluation | None = None,
+    ) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.code = code
+        self.stage = stage
+        self.evaluation = evaluation
 
 
 @dataclass(frozen=True)
@@ -421,7 +445,7 @@ async def evaluate_round(
             verifier_space = (
                 revealed.verifier.compressed_size_bytes
                 + 2 * revealed.verifier.expanded_size_bytes
-                + policy.tree.max_total_file_bytes
+                + policy.tree.max_total_file_bytes * policy.grading_concurrency
             )
             if shutil.disk_usage(round_dir).free < verifier_space:
                 return finish("abandoned", "insufficient verifier storage", RoundReason.INSUFFICIENT_STORAGE)
@@ -464,20 +488,37 @@ async def evaluate_round(
                         ),
                     )
                 )
-            for index, grant in enumerate(revealed.submission_grants):
-                stage = Stage.COMMIT
-                expected_format = (
-                    "unified_diff_v1"
-                    if lease.identity.task_type == "repository_patch_v1"
-                    else "bash_script_v1"
-                )
+            stage = Stage.COMMIT
+            expected_format = (
+                "unified_diff_v1"
+                if lease.identity.task_type == "repository_patch_v1"
+                else "bash_script_v1"
+            )
+            for grant in revealed.submission_grants:
                 if grant.format != expected_format:
                     return finish("abandoned", "submission format did not match the task", RoundReason.SUBMISSION_FORMAT_MISMATCH)
-                signed = signed_responses.get((grant.uid, grant.hotkey))
-                if not _grant_matches_signed_response(grant, signed):
+                if not _grant_matches_signed_response(grant, signed_responses.get((grant.uid, grant.hotkey))):
                     return finish("abandoned", "submission grant did not match the signed response", RoundReason.SUBMISSION_GRANT_MISMATCH)
+
+            challenge_tag = hashlib.sha256(
+                lease.challenge_id.encode("utf-8")
+            ).hexdigest()[:12]
+            grading_slots = asyncio.Semaphore(policy.grading_concurrency)
+            round_dead = asyncio.Event()  # set on the first fault; no new grading starts after it
+
+            async def grade(index: int, grant: ArtifactGrant) -> MinerEvaluation | None:
+                async with grading_slots:
+                    if round_dead.is_set():
+                        return None
+                    try:
+                        return await grade_one(index, grant)
+                    except BaseException:
+                        round_dead.set()
+                        raise
+
+            async def grade_one(index: int, grant: ArtifactGrant) -> MinerEvaluation:
+                registration = (grant.uid, grant.hotkey)
                 try:
-                    stage = Stage.SUBMISSION_DOWNLOAD
                     submission_path = await fetch_submission(
                         http,
                         grant,
@@ -487,23 +528,24 @@ async def evaluate_round(
                     )
                     submission_bytes = submission_path.path.read_bytes()
                 except Exception:  # noqa: BLE001 - post-commit storage is infrastructure
-                    return finish("abandoned", "submission download failed", RoundReason.SUBMISSION_DOWNLOAD_FAILED)
-                stage = Stage.WORKSPACE_MATERIALIZATION
+                    raise _Abandon("submission download failed", RoundReason.SUBMISSION_DOWNLOAD_FAILED, Stage.SUBMISSION_DOWNLOAD) from None
                 if revealed.grading_expires_at <= int(time.time()):
-                    return finish("abandoned", "grading window expired", RoundReason.GRADING_EXPIRED)
+                    raise _Abandon("grading window expired", RoundReason.GRADING_EXPIRED, Stage.WORKSPACE_MATERIALIZATION)
                 if shutil.disk_usage(round_dir).free < policy.tree.max_total_file_bytes:
-                    return finish("abandoned", "insufficient grading storage", RoundReason.INSUFFICIENT_STORAGE)
+                    raise _Abandon("insufficient grading storage", RoundReason.INSUFFICIENT_STORAGE, Stage.WORKSPACE_MATERIALIZATION)
                 grading_started = time.monotonic()
-                miner_workspace: Path | None = None
-                challenge_tag = hashlib.sha256(
-                    lease.challenge_id.encode("utf-8")
-                ).hexdigest()[:12]
                 run_prefix = f"v3-{challenge_tag}-{grant.uid}"
+                evaluation: MinerEvaluation | None = None
                 try:
                     miner_workspace = materialize_workspace(
                         cached, round_dir / f"miner-{grant.uid}"
                     )
-                    stage = Stage.GRADING
+                except Exception as error:  # noqa: BLE001 - workspace copies are infrastructure
+                    raise _Abandon(
+                        f"validator failed during workspace materialization ({type(error).__name__})",
+                        RoundReason.WORKSPACE_MATERIALIZATION_FAILED, Stage.WORKSPACE_MATERIALIZATION,
+                    ) from None
+                try:
                     if isinstance(lease.identity, RepositoryTaskIdentity):
                         result = await asyncio.to_thread(
                             evaluate_repository,
@@ -533,32 +575,54 @@ async def evaluate_round(
                             run_prefix,
                         )
                     else:  # pragma: no cover - discriminated identity is closed
-                        return finish("abandoned", "unsupported task identity", RoundReason.UNSUPPORTED_TASK)
+                        raise _Abandon("unsupported task identity", RoundReason.UNSUPPORTED_TASK, Stage.GRADING)
                     grading_duration_ms = min(
                         2**53 - 1,
                         int((time.monotonic() - grading_started) * 1000),
                     )
-                    evaluations.append(
-                        MinerEvaluation(
-                            grant.uid, grant.hotkey,
-                            submissions_by_registration[(grant.uid, grant.hotkey)].latency_ms,
-                            result, grading_duration_ms,
-                            trajectory=signed.trajectory,
-                        )
+                    evaluation = MinerEvaluation(
+                        grant.uid, grant.hotkey,
+                        submissions_by_registration[registration].latency_ms,
+                        result, grading_duration_ms,
+                        trajectory=signed_responses[registration].trajectory,
                     )
                 finally:
-                    if miner_workspace is not None:
-                        previous_stage = stage
-                        stage = Stage.CLEANUP
+                    try:
                         _remove_tree(miner_workspace)
-                        stage = previous_stage
-                stage = Stage.GRADING
+                    except Exception as error:  # noqa: BLE001 - a leftover workspace ends the round
+                        raise _Abandon(
+                            f"validator failed during cleanup ({type(error).__name__})",
+                            RoundReason.CLEANUP_FAILED, Stage.CLEANUP, evaluation,
+                        ) from None
                 if result.status == "abandoned":
-                    return finish(
-                        "abandoned", result.reason,
+                    raise _Abandon(
+                        result.reason,
                         result.reason_code if isinstance(result.reason_code, RoundReason) else RoundReason.VALIDATOR_ERROR,
-                        result.stage,
+                        result.stage, evaluation,
                     )
+                return evaluation
+
+            stage = Stage.GRADING
+            outcomes = await asyncio.gather(
+                *(grade(index, grant) for index, grant in enumerate(revealed.submission_grants)),
+                return_exceptions=True,
+            )
+            # Every grading task has finished and cleaned up. Graded miners are
+            # recorded for diagnostics even when the round is abandoned, and
+            # the first grading fault in grant order decides. Grant format and
+            # signature mismatches were checked for every grant before any
+            # grading started, so they take precedence over grading faults.
+            evaluations.extend(
+                outcome.evaluation if isinstance(outcome, _Abandon) else outcome
+                for outcome in outcomes
+                if isinstance(outcome, MinerEvaluation)
+                or (isinstance(outcome, _Abandon) and outcome.evaluation is not None)
+            )
+            for outcome in outcomes:
+                if isinstance(outcome, _Abandon):
+                    return finish("abandoned", outcome.reason, outcome.code, outcome.stage)
+                if isinstance(outcome, BaseException):
+                    raise outcome
             stage = Stage.CLEANUP
         stage = Stage.GRADING
         evaluations.sort(key=lambda item: item.uid)

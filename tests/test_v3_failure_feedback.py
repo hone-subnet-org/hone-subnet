@@ -266,6 +266,7 @@ def test_full_round_sends_only_legacy_feedback_after_successful_cleanup(
         False,
         False,
         fault,
+        1,
     )
     if fault is not None:
         assert sent == []
@@ -314,6 +315,7 @@ def test_round_directory_cleanup_failure_prevents_feedback_and_score_updates(
             False,
             False,
             None,
+            1,
         )
     outcome = captured["result"]
     assert outcome.status == "abandoned"

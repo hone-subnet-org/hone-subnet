@@ -73,6 +73,9 @@ class Settings(BaseSettings):
     # needs one in-flight request per serving miner or slow solvers serialize
     # into deadline-length waves.
     validator_dispatch_concurrency: int = Field(default=256, ge=1, le=1024)
+    # Miners graded at the same time. Each one may hold a sandbox container at
+    # the full memory limit plus a copy of the task workspace on disk.
+    validator_grading_concurrency: int = Field(default=2, ge=1, le=16)
     # Requests waiting for one of these short-lived send-start slots remain
     # unsigned. The slot is released after the request body reaches the HTTP
     # transport, so miner solve time does not serialize the fan-out.
@@ -147,6 +150,7 @@ _SAFE_EFFECTIVE_SETTINGS = {
     "miner_max_response_bytes": "MINER_MAX_RESPONSE_BYTES",
     "problem_server_request_timeout_s": "PROBLEM_SERVER_REQUEST_TIMEOUT_S",
     "validator_dispatch_concurrency": "VALIDATOR_DISPATCH_CONCURRENCY",
+    "validator_grading_concurrency": "VALIDATOR_GRADING_CONCURRENCY",
     "validator_send_concurrency": "VALIDATOR_SEND_CONCURRENCY",
     "validator_verify_concurrency": "VALIDATOR_VERIFY_CONCURRENCY",
 }

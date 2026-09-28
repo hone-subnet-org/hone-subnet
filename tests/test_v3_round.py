@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import json
 import os
 import stat
+import time
 
 import httpx
 import pytest
@@ -216,16 +218,18 @@ def policy(tmp_path):
     )
 
 
-@pytest.mark.parametrize("submission_download_fails,checker_times_out,round_fault", [
-    (False, False, None), (True, False, None), (False, True, None), (True, True, None),
-    *[(False, False, fault) for fault in (
+@pytest.mark.parametrize("submission_download_fails,checker_times_out,round_fault,grading_concurrency", [
+    (False, False, None, 1), (False, False, None, 2), (False, False, None, 3),
+    (True, False, None, 1), (False, True, None, 1), (True, True, None, 1),
+    *[(False, False, fault, 1) for fault in (
         "cleanup", "quorum", "commit", "reveal", "expired", "verifier_download",
         "manifest", "workspace_download", "workspace_extract", "materialize",
         "format", "grant", "grade_infrastructure", "grade_exception", "temporary_directory",
     )],
+    (False, False, "grade_exception", 3),
 ])
 def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
-    tmp_path, monkeypatch, submission_download_fails, checker_times_out, round_fault
+    tmp_path, monkeypatch, submission_download_fails, checker_times_out, round_fault, grading_concurrency
 ):
     workspace_tar = make_tar([("repo", "dir", b"", 0o755), ("repo/a.txt", "file", b"a", 0o644)])
     workspace_blob = compress(workspace_tar)
@@ -333,7 +337,22 @@ def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
             return streamed(contents[int(path.rsplit("-", 1)[1])])
         return httpx.Response(404)
 
+    import threading
+
+    in_flight, peak, gate = [0], [0], threading.Lock()
+
     def fake_grade(workspace, patch, *args, **kwargs):
+        with gate:
+            in_flight[0] += 1
+            peak[0] = max(peak[0], in_flight[0])
+        try:
+            time.sleep(0.1)  # long enough for concurrent gradings to overlap
+            return fake_grade_outcome(workspace, patch, *args, **kwargs)
+        finally:
+            with gate:
+                in_flight[0] -= 1
+
+    def fake_grade_outcome(workspace, patch, *args, **kwargs):
         if patch == b"pass":
             return EvaluationResult("passed", "", (), None)
         if patch == b"fail":
@@ -403,12 +422,14 @@ def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
                 client,
                 http,
                 [Solver(uid, f"hk-{uid}", contents[uid]) for uid in contents],
-                policy(tmp_path),
+                dataclasses.replace(policy(tmp_path), grading_concurrency=grading_concurrency),
                 cache_dir=tmp_path / "cache",
                 work_dir=tmp_path / "work",
             )
 
     result = asyncio.run(go())
+    if not (round_fault or submission_download_fails or checker_times_out):
+        assert peak[0] == min(grading_concurrency, 3)  # three graded miners, bounded by the pool
     if round_fault:
         expected = {
             "cleanup": (RoundReason.CLEANUP_FAILED, Stage.CLEANUP),
@@ -443,10 +464,14 @@ def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
         if round_fault == "grade_exception":
             assert "miner-2" in cleaned_workspaces
             assert result.reason == "validator failed during grading (RuntimeError)"
-        if round_fault in {"cleanup", "grade_infrastructure", "grade_exception"}:
+        if round_fault in {"cleanup", "grade_infrastructure", "grade_exception"} and grading_concurrency == 1:
             by_uid = {record["uid"]: record for record in records[1:]}
             assert by_uid[1]["status"] == "passed"
-            assert by_uid[3]["status"] == "not_evaluated"
+            if round_fault == "grade_exception":
+                assert by_uid[2]["status"] == "not_evaluated"  # grading itself blew up
+            else:
+                assert by_uid[2]["status"] != "not_evaluated"  # its own result is still recorded
+            assert by_uid[3]["status"] == "not_evaluated"  # nothing starts after the round is dead
             assert by_uid[3]["checks_skipped"] == 1
         return
     if submission_download_fails:

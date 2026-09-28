@@ -28,7 +28,10 @@ clock. If wallet arguments are omitted, set only `WALLET_NAME` and
 
 Dispatch, grading, scoring, cadence, resource limits, sandbox image, and owner
 burn are fixed in release policy. Operators do not configure them in `.env`.
-The owner burn share is 0%.
+The owner burn share is 0%. The one sizing choice is how many miners are graded
+at the same time, `VALIDATOR_GRADING_CONCURRENCY`, default 2. Each concurrent
+grading may use a full sandbox memory limit and a copy of the task workspace on
+disk, so raise it only on a machine with the memory and disk to match.
 
 The validator stores its scoring window in `data/validator_scores.json`.
 Preserve that file across restarts.
