@@ -42,7 +42,7 @@ class ValidatorPolicy:
     rust_tmpfs_bytes: int = 256 * 1024 * 1024
     problem_response_read_bytes: int = 2 * 1024 * 1024
     v3_artifact_origins: tuple[str, ...] = (
-        "https://rlvr-agentic-v3-private-pilot-artifactbucket-upncfmevdb38.s3.us-east-1.amazonaws.com:443",
+        "https://hone-artifacts-o23247xbwz.s3.us-east-1.amazonaws.com:443",
     )
     v3_execution_profile_id: str = "repo-polyglot-v1"
     v3_image: str = (
