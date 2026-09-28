@@ -197,3 +197,45 @@ async def test_round_callback_logs_and_bounds_a_lease_pause(tmp_path, monkeypatc
     await decentralized._run_decentralized_validator_async(settings)
     assert len(deferrals) == 1 and deferrals[0] - before <= MAX_LEASE_DEFERRAL_S + 5
     assert "no lease: service paused (next attempt in 900s)" in capsys.readouterr().out
+
+
+async def test_round_callback_says_so_when_no_miner_is_eligible(tmp_path, monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    from rlvr.config import Settings
+    from rlvr.neurons import decentralized
+
+    settings = Settings(_env_file=None, problem_server_url="https://problems.invalid",
+                        validator_score_state_file=str(tmp_path / "scores.json"))
+    leased = []
+
+    class Validator:
+        def __init__(self, *_args, **_kwargs):
+            self.wallet = SimpleNamespace(hotkey=SimpleNamespace(ss58_address="validator"))
+            self.subtensor = object()
+            # the only serving miner holds a validator permit
+            self.metagraph = SimpleNamespace(hotkeys=["owner", "hk-1"], validator_permit=[False, True], sync=lambda **_: None)
+
+        def setup_bittensor(self):
+            pass
+
+        def set_round_callback(self, callback):
+            self.callback = callback
+
+        def set_weight_setter(self, _setter):
+            pass
+
+        async def run(self):
+            await self.callback(self)
+
+    async def evaluate(*_a, **_k):
+        leased.append(True)
+
+    monkeypatch.setattr(decentralized, "ValidatorNeuron", Validator)
+    monkeypatch.setattr(decentralized, "_apply_weights_rate_limit", lambda *_: None)
+    monkeypatch.setattr(decentralized, "v3_round_policy", lambda *_a, **_k: object())
+    monkeypatch.setattr(decentralized, "_solver_clients", lambda *_a, **_k: [SimpleNamespace(uid=1, hotkey="hk-1")])
+    monkeypatch.setattr(decentralized, "evaluate_round", evaluate)
+    await decentralized._run_decentralized_validator_async(settings)
+    assert leased == []
+    assert "no lease: no eligible miners to offer (serving=1" in capsys.readouterr().out

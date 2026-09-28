@@ -519,6 +519,10 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
             offered = next_offer(offer_state["order"], eligible)
             offer_state["order"] = offered  # reused until a round completes
             if not offered:
+                print(
+                    "[validator] no lease: no eligible miners to offer "
+                    f"(serving={len(live_solvers)}, eligible after excluding the owner and permit holders=0)"
+                )
                 return {}
             offered_set = set(offered)
             solvers = [s for s in live_solvers if (s.uid, s.hotkey) in offered_set]
