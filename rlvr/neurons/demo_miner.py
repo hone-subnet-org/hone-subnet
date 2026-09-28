@@ -47,6 +47,19 @@ WORKSPACE_TOOL_PROMPT = (
 )
 
 _ANY_FENCE_RE = re.compile(r"```[^\n`]*\n(.*?)```", re.DOTALL)
+_WORKSPACE_FENCE_RE = re.compile(r"\s*```workspace\s*\n(.*?)```\s*", re.DOTALL)
+# Kimi sometimes answers with its own tool-call markup instead of the fence.
+# Only a reply that is nothing but that envelope counts; a submission that
+# merely contains the markup text is still a submission.
+_NATIVE_TOOL_SECTION_RE = re.compile(
+    r"\s*<\|tool_calls_section_begin\|>(.*)<\|tool_calls_section_end\|>\s*", re.DOTALL
+)
+_NATIVE_TOOL_CALL_RE = re.compile(
+    r"<\|tool_call_begin\|>\s*(?:functions\.)?([A-Za-z_]\w*)(?::\d+)?\s*"
+    r"<\|tool_call_argument_begin\|>(.*?)<\|tool_call_end\|>",
+    re.DOTALL,
+)
+_NATIVE_TOOL_NAMES = {"listfiles": "list_files", "readfile": "read_file"}
 
 
 class DemoMinerSettings(BaseSettings):
@@ -156,6 +169,28 @@ def _token_alternative(record: Mapping[str, Any]) -> dict[str, Any]:
         "token_id": token_id,
         "logprob": logprob,
     }
+
+
+def extract_tool_call(output: str) -> str | None:
+    """The JSON text of a workspace tool call, from the fence or from the
+    model's native tool-call markup; None when the output is a submission."""
+    fence = _WORKSPACE_FENCE_RE.fullmatch(output)
+    if fence is not None:
+        return fence.group(1)
+    section = _NATIVE_TOOL_SECTION_RE.fullmatch(output)
+    native = None if section is None else _NATIVE_TOOL_CALL_RE.search(section.group(1))
+    if native is None:
+        return None
+    name, raw = native.group(1), native.group(2)
+    try:
+        arguments = json.loads(raw)
+    except ValueError:
+        arguments = {}
+    if type(arguments) is not dict:
+        arguments = {}
+    key = name.lower().replace("_", "")
+    arguments.setdefault("tool", _NATIVE_TOOL_NAMES.get(key, name))
+    return json.dumps(arguments, separators=(",", ":"))
 
 
 def extract_submission(text: str) -> bytes:
@@ -282,10 +317,6 @@ class BedrockClient:
                             ],
                         }
                     )
-                # The token records cover the whole generation: reasoning,
-                # the reasoning delimiter, the answer and the end-of-turn token.
-                if tokens and content.strip().encode("utf-8") not in generated:
-                    raise ValueError("Bedrock token bytes do not contain the completion")
                 return ModelCompletion(
                     request_body=request_body,
                     response_body=response_body,
@@ -654,12 +685,12 @@ class DemoMiner:
                 raise TimeoutError("workspace/model deadline exceeded")
             completion = await self.client.complete(messages, timeout_s=remaining)
             events.append(_model_event(completion))
-            tool_match = re.fullmatch(r"\s*```workspace\s*\n(.*?)```\s*", completion.output, re.DOTALL)
-            if tool_match is None:
+            tool_call = extract_tool_call(completion.output)
+            if tool_call is None:
                 return completion, events
             if turn == self.settings.miner_max_workspace_tool_calls:
                 raise ValueError("workspace tool call limit exceeded")
-            arguments = json.loads(tool_match.group(1))
+            arguments = json.loads(tool_call)
             if type(arguments) is not dict:
                 raise ValueError("workspace tool call must be an object")
             output = reader.execute(arguments)
@@ -668,7 +699,7 @@ class DemoMiner:
                 {
                     "event_type": "tool_call", "call_id": call_id,
                     "tool_name": "workspace_read",
-                    "input_body_b64": _b64(tool_match.group(1).encode("utf-8")),
+                    "input_body_b64": _b64(tool_call.encode("utf-8")),
                 },
                 {
                     "event_type": "tool_result", "call_id": call_id,

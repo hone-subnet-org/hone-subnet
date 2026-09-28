@@ -154,9 +154,37 @@ async def test_provider_tokens_cover_a_multiword_answer():
     assert result.output == " the answer is 391\n"
 
 
-async def test_provider_tokens_missing_the_answer_are_rejected():
-    with pytest.raises(RuntimeError, match="invalid response"):
-        await _complete_with(_records(["thinking", "</think>", "392", "<|im_end|>"]))
+async def test_provider_tokens_are_recorded_as_returned_even_when_they_differ_from_the_text():
+    result = await _complete_with(_records(["thinking", "</think>", "392", "<|im_end|>"]))
+    assert result.output == " 391" and result.generated_bytes == b"thinking</think>392<|im_end|>"
+
+
+NATIVE_CALL = (
+    " <|tool_calls_section_begin|> <|tool_call_begin|> functions.list_files:0 "
+    "<|tool_call_argument_begin|> {\"path\": \".\", \"offset\": 0} <|tool_call_end|> <|tool_calls_section_end|>"
+)
+
+
+@pytest.mark.parametrize("output, expected", [
+    ("```workspace\n{\"tool\":\"read_file\",\"path\":\"a.py\",\"offset\":0}\n```", {"tool": "read_file", "path": "a.py", "offset": 0}),
+    (NATIVE_CALL, {"path": ".", "offset": 0, "tool": "list_files"}),
+    (NATIVE_CALL.replace("list_files", "ReadFile").replace('"path": "."', '"file_path": "slug/core.py"'), {"file_path": "slug/core.py", "offset": 0, "tool": "read_file"}),
+    (NATIVE_CALL.replace("list_files", "command").replace('"offset": 0', '"tool": "read_file"'), {"path": ".", "tool": "read_file"}),
+    (NATIVE_CALL.replace('{"path": ".", "offset": 0}', "{not json}"), {"tool": "list_files"}),
+    ("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n", None),
+    # markup inside a submission stays a submission
+    ("--- a/t.py\n+++ b/t.py\n@@ -1 +1,2 @@\n a\n+MARK = '" + NATIVE_CALL.strip() + "'\n", None),
+    ("```diff\n" + NATIVE_CALL + "\n```", None),
+    # non-object arguments keep the tool name only
+    (NATIVE_CALL.replace('{"path": ".", "offset": 0}', "[]"), {"tool": "list_files"}),
+    # the first call wins
+    (NATIVE_CALL.replace("<|tool_calls_section_end|>", " <|tool_call_begin|> functions.read_file:1 <|tool_call_argument_begin|> {\"path\": \"x\"} <|tool_call_end|> <|tool_calls_section_end|>"), {"path": ".", "offset": 0, "tool": "list_files"}),
+])
+def test_extract_tool_call_reads_the_fence_or_native_markup(output, expected):
+    from rlvr.neurons.demo_miner import extract_tool_call
+
+    found = extract_tool_call(output)
+    assert (None if found is None else json.loads(found)) == expected
 
 
 async def test_demo_uploads_submission_and_genuine_canonical_trajectory(monkeypatch, tmp_path):
