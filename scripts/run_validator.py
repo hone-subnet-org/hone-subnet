@@ -1,9 +1,9 @@
 #!/usr/bin/env python
-"""Live V1 validator entrypoint.
+"""Live V3 validator entrypoint.
 
 Obtain a public problem from the private source, query miners, commit their
-signed responses, reveal hidden tests, run the sandbox locally, compute local
-scores, and set the validator's own weights.
+    signed responses, retrieve the verifier, grade isolated miner artifacts,
+    compute local scores, and set the validator's own weights.
 
 Prerequisites (see scripts/register_testnet.sh):
   - a funded coldkey+hotkey, registered on your subnet's NETUID
@@ -24,7 +24,7 @@ from rlvr.config import (
 def main() -> None:
     settings = get_settings()
     if not settings.problem_server_url:
-        raise SystemExit("set PROBLEM_SERVER_URL for the V1 problem source")
+        raise SystemExit("set PROBLEM_SERVER_URL for the V3 problem source")
 
     ignored = ignored_release_policy_keys()
     if ignored:
@@ -33,6 +33,11 @@ def main() -> None:
             + ", ".join(ignored)
         )
     print(f"[validator] release policy {release_policy_summary()}")
+    if settings.problem_server_url_migrated_from:
+        print(
+            f"[validator] NOTE: PROBLEM_SERVER_URL={settings.problem_server_url_migrated_from} is the "
+            "previous release's server; using the current default instead. Remove it from .env."
+        )
     nondefault = nondefault_settings_summary(settings)
     if nondefault:
         print(f"[validator] non-default machine settings {nondefault}")

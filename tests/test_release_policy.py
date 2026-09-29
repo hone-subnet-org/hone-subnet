@@ -12,7 +12,6 @@ from rlvr.config import (
     nondefault_settings_summary,
     release_policy_summary,
 )
-from rlvr.neurons.decentralized import _dispatch_subset_size
 from rlvr.neurons.validator import ValidatorNeuron
 from rlvr.policy import RELEASE_POLICY, RELEASE_POLICY_ENV_KEYS
 
@@ -24,20 +23,6 @@ def test_policy_is_frozen():
 
 def test_policy_keys_are_not_settings_fields():
     assert RELEASE_POLICY_ENV_KEYS.isdisjoint(Settings.model_fields)
-
-
-def test_legacy_environment_cannot_restore_full_pool(monkeypatch):
-    monkeypatch.setenv("DISPATCH_SUBSET_K", "0")
-    monkeypatch.setenv("DISPATCH_SUBSET_FRACTION", "1")
-
-    Settings(_env_file=None)
-    sample = _dispatch_subset_size(
-        246,
-        required=0,
-        fraction=RELEASE_POLICY.dispatch_fraction,
-    )
-
-    assert sample == 123
 
 
 def test_legacy_env_file_keys_are_reported_without_values(tmp_path, monkeypatch):
@@ -60,7 +45,8 @@ def test_startup_summary_is_stable_and_nonsecret():
 
     assert f"version={RELEASE_POLICY.version}" in summary
     assert f"hash={RELEASE_POLICY.fingerprint}" in summary
-    assert "dispatch_fraction=0.5" in summary
+    assert "protocol=3" in summary
+    assert f"execution_profile={RELEASE_POLICY.v3_execution_profile_id}" in summary
     assert "score_samples=200" in summary
     assert summary.endswith("owner_burn=0")
 
@@ -129,20 +115,3 @@ def test_rust_executor_draws_from_release_policy(monkeypatch):
     assert executor.image == RELEASE_POLICY.rust_image
     assert executor.compile_timeout_s == RELEASE_POLICY.rust_compile_timeout_s
     assert executor.artifact_max_bytes == RELEASE_POLICY.rust_artifact_max_bytes
-
-def test_rust_verify_concurrency_is_bounded_by_host_memory(monkeypatch):
-    from rlvr.neurons import decentralized as dec
-
-    gib = 1024**3
-    settings = Settings(_env_file=None, validator_verify_concurrency=16)
-
-    monkeypatch.setattr(dec, "_host_memory_bytes", lambda: 16 * gib, raising=False)
-    slots = dec._rust_verify_concurrency(settings)
-    assert 1 <= slots <= 16
-    assert slots * 2 * gib <= 14 * gib
-
-    monkeypatch.setattr(dec, "_host_memory_bytes", lambda: 4 * gib, raising=False)
-    assert dec._rust_verify_concurrency(settings) == 1
-
-    monkeypatch.setattr(dec, "_host_memory_bytes", lambda: 64 * gib, raising=False)
-    assert dec._rust_verify_concurrency(settings) == 16

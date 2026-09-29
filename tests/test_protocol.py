@@ -270,6 +270,8 @@ def test_settings_fail_closed_to_docker_and_validate_difficulty_band():
     assert settings.executor == "docker"
     assert settings.docker_memory == "256m"
     assert settings.validator_dispatch_concurrency == 256
+    assert settings.solve_deadline_s == 3600.0  # the lease expiry, not this default, bounds a task
+    assert settings.problem_server_url == "https://d344p1xue0u9qs.cloudfront.net"  # production V3 server
     assert settings.validator_send_concurrency == 32
     assert settings.validator_verify_concurrency == 16
     assert settings.problem_server_request_timeout_s == 60
@@ -468,3 +470,14 @@ def test_nonce_cache_fails_closed_at_capacity_without_evicting_fresh_entries():
     # Once the signature/replay window has elapsed, stale entries are pruned
     # and new traffic is admitted again.
     assert cache.check_and_add("three", now_ms=10_000)
+
+
+def test_previous_release_server_url_migrates_to_the_current_default():
+    from rlvr.config import LEGACY_PROBLEM_SERVER_URLS
+
+    legacy = next(iter(LEGACY_PROBLEM_SERVER_URLS))
+    settings = Settings(_env_file=None, problem_server_url=legacy + "/")
+    assert settings.problem_server_url == "https://d344p1xue0u9qs.cloudfront.net"
+    assert settings.problem_server_url_migrated_from == legacy + "/"
+    plain = Settings(_env_file=None, problem_server_url="https://private.example")
+    assert plain.problem_server_url == "https://private.example" and not plain.problem_server_url_migrated_from

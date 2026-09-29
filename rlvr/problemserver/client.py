@@ -40,14 +40,14 @@ def require_secure_problem_url(url: str, allow_insecure_http: bool = False) -> N
 
 # Remote-supplied diagnostic text reaches operator log lines verbatim, so its
 # length is bounded here. Note that Retry-After is deliberately NOT bounded:
-# see _parse_retry_after.
+# see parse_retry_after.
 _MAX_DETAIL_CHARS = 200
 _RETRY_AFTER_CUSHION_S = 1.0
 
 # Transient conditions worth another attempt: the server could not complete the
 # request, but nothing about the request itself was refused. 5xx joins these by
-# range. One source of truth, because _post_result retries exactly this set and
-# _status_category must label exactly the same set as UNAVAILABLE.
+# range. One source of truth, because post_result retries exactly this set and
+# status_category must label exactly the same set as UNAVAILABLE.
 _RETRYABLE_STATUSES = frozenset({408, 425})
 
 
@@ -84,7 +84,7 @@ _CATEGORY_REASONS = {
 }
 
 
-def _bounded_detail(text: str) -> str:
+def bounded_detail(text: str) -> str:
     """Collapse remote text into one bounded, printable log line."""
     collapsed = " ".join(text.split())
     printable = "".join(ch for ch in collapsed if ch.isprintable())
@@ -93,7 +93,7 @@ def _bounded_detail(text: str) -> str:
     return printable
 
 
-def _response_detail(response: httpx.Response) -> str:
+def response_detail(response: httpx.Response) -> str:
     """Best-effort server explanation, tolerant of non-JSON and malformed bodies."""
     body = response.content.decode("utf-8", "replace").strip()
     if body.startswith("{"):
@@ -105,8 +105,8 @@ def _response_detail(response: httpx.Response) -> str:
             for key in ("detail", "error", "message"):
                 value = payload.get(key)
                 if isinstance(value, str) and value.strip():
-                    return _bounded_detail(value)
-    return _bounded_detail(body)
+                    return bounded_detail(value)
+    return bounded_detail(body)
 
 
 # RFC 9110 delta-seconds is 1*DIGIT, where DIGIT is ASCII 0-9 and nothing else.
@@ -116,7 +116,7 @@ def _response_detail(response: httpx.Response) -> str:
 _DELTA_SECONDS = re.compile(r"[0-9]+")
 
 
-def _parse_retry_after(response: httpx.Response) -> Optional[int]:
+def parse_retry_after(response: httpx.Response) -> Optional[int]:
     """Parse Retry-After fail-closed: whole non-negative seconds or nothing.
 
     The HTTP-date form and every malformed value stay ``None`` so a caller can
@@ -145,14 +145,14 @@ def next_lease_not_before(
     return current + retry_after_s + _RETRY_AFTER_CUSHION_S
 
 
-def _status_category(status: int) -> LeaseCategory:
+def status_category(status: int) -> LeaseCategory:
     if status == 204:
         return LeaseCategory.EMPTY
     if status == 429:
         return LeaseCategory.PACED
     if status in (401, 403):
         return LeaseCategory.DENIED
-    # Reached only after _post_result has retried this status to exhaustion:
+    # Reached only after post_result has retried this status to exhaustion:
     # the server kept answering, and kept failing.
     if status >= 500 or status in _RETRYABLE_STATUSES:
         return LeaseCategory.UNAVAILABLE
@@ -207,7 +207,7 @@ class LeaseOutcome:
 
 
 @dataclass(frozen=True)
-class _PostOutcome:
+class PostOutcome:
     """One bounded POST result, including an exhausted retryable response."""
 
     response: Optional[httpx.Response] = None
@@ -253,8 +253,8 @@ class ProblemServerClient:
                 raise RuntimeError("problem-server response exceeds byte limit")
         return bytes(body)
 
-    async def _post(self, path: str, body: bytes) -> Optional[httpx.Response]:
-        outcome = await self._post_result(path, body)
+    async def post(self, path: str, body: bytes) -> Optional[httpx.Response]:
+        outcome = await self.post_result(path, body)
         # Preserve the pre-existing contract for commit/reveal/feedback: an
         # exhausted retryable HTTP response remains a failed POST there. Lease
         # consumes the richer result so it can expose the final wire status.
@@ -262,9 +262,9 @@ class ProblemServerClient:
             return None
         return outcome.response
 
-    async def _post_result(
+    async def post_result(
         self, path: str, body: bytes
-    ) -> _PostOutcome:
+    ) -> PostOutcome:
         """POST with retries while retaining the final bounded HTTP response.
 
         A retryable response and a transport exception are deliberately
@@ -312,8 +312,8 @@ class ProblemServerClient:
                             request=request,
                         )
                         last_response = response
-                        last_protocol_error = _bounded_detail(str(error))
-                        parsed_retry_after = _parse_retry_after(response)
+                        last_protocol_error = bounded_detail(str(error))
+                        parsed_retry_after = parse_retry_after(response)
                         if parsed_retry_after is not None:
                             last_retry_after_s = parsed_retry_after
                             last_retry_after_attempt = attempt
@@ -326,7 +326,7 @@ class ProblemServerClient:
                                 min(0.25 * (2 ** (attempt - 1)), 2.0)
                             )
                             continue
-                        return _PostOutcome(
+                        return PostOutcome(
                             response=response,
                             protocol_error=last_protocol_error,
                             retry_after_s=last_retry_after_s,
@@ -355,7 +355,7 @@ class ProblemServerClient:
                     request=request,
                 )
                 last_response = response
-                parsed_retry_after = _parse_retry_after(response)
+                parsed_retry_after = parse_retry_after(response)
                 if parsed_retry_after is not None:
                     last_retry_after_s = parsed_retry_after
                     last_retry_after_attempt = attempt
@@ -366,7 +366,7 @@ class ProblemServerClient:
                             f"[validator] WARN: problem server {path} failed: "
                             f"HTTP {status_code}"
                         )
-                        return _PostOutcome(
+                        return PostOutcome(
                             response=response,
                             retry_after_s=last_retry_after_s,
                             retry_after_from_prior_response=(
@@ -377,11 +377,11 @@ class ProblemServerClient:
                         )
                     await asyncio.sleep(min(0.25 * (2 ** (attempt - 1)), 2.0))
                     continue
-                return _PostOutcome(response=response)
+                return PostOutcome(response=response)
             except Exception as e:  # noqa: BLE001 - retry transient network faults
                 if attempt == self._retries:
                     print(f"[validator] WARN: problem server {path} failed: {e}")
-                    return _PostOutcome(
+                    return PostOutcome(
                         response=last_response,
                         transport_error=str(e).strip() or type(e).__name__,
                         protocol_error=last_protocol_error,
@@ -392,16 +392,16 @@ class ProblemServerClient:
                         retry_exhausted=True,
                     )
                 await asyncio.sleep(min(0.25 * (2 ** (attempt - 1)), 2.0))
-        return _PostOutcome(transport_error="retries exhausted")
+        return PostOutcome(transport_error="retries exhausted")
 
     async def lease(self) -> LeaseOutcome:
         """Attempt one lease and report the outcome, never a bare ``None``."""
         # Stable body across HTTP retries makes generation idempotent.
         body = ChallengeLeaseRequest(request_id=uuid4().hex).model_dump_json().encode()
-        post = await self._post_result("/v1/challenges/lease", body)
+        post = await self.post_result("/v1/challenges/lease", body)
         response = post.response
         if response is None:
-            transport_error = _bounded_detail(post.transport_error)
+            transport_error = bounded_detail(post.transport_error)
             return LeaseOutcome(
                 category=LeaseCategory.TRANSPORT,
                 detail=transport_error,
@@ -414,25 +414,25 @@ class ProblemServerClient:
         retry_after_s = (
             post.retry_after_s
             if post.retry_after_s is not None
-            else _parse_retry_after(response)
+            else parse_retry_after(response)
         )
         if post.transport_error:
             return LeaseOutcome(
                 category=LeaseCategory.TRANSPORT,
                 status=status,
-                detail=post.protocol_error or _response_detail(response),
+                detail=post.protocol_error or response_detail(response),
                 retry_after_s=retry_after_s,
                 retry_after_from_prior_response=(
                     post.retry_after_from_prior_response
                 ),
-                transport_error=_bounded_detail(post.transport_error),
+                transport_error=bounded_detail(post.transport_error),
                 detail_is_server=not bool(post.protocol_error),
             )
         if post.protocol_error:
             category = (
                 LeaseCategory.MALFORMED
                 if status == 200
-                else _status_category(status)
+                else status_category(status)
             )
             return LeaseOutcome(
                 category=category,
@@ -446,9 +446,9 @@ class ProblemServerClient:
             )
         if status != 200:
             return LeaseOutcome(
-                category=_status_category(status),
+                category=status_category(status),
                 status=status,
-                detail=_response_detail(response),
+                detail=response_detail(response),
                 retry_after_s=retry_after_s,
                 retry_after_from_prior_response=(
                     post.retry_after_from_prior_response
@@ -460,7 +460,7 @@ class ProblemServerClient:
             return LeaseOutcome(
                 category=LeaseCategory.MALFORMED,
                 status=status,
-                detail=_bounded_detail(str(e)),
+                detail=bounded_detail(str(e)),
                 retry_after_s=retry_after_s,
                 detail_is_server=False,
             )
@@ -478,7 +478,7 @@ class ProblemServerClient:
         body = ChallengeCommitRequest(
             challenge_id=challenge_id, submissions=submissions
         ).model_dump_json().encode()
-        response = await self._post("/v1/challenges/commit", body)
+        response = await self.post("/v1/challenges/commit", body)
         if response is None:
             return None
         try:
@@ -493,7 +493,7 @@ class ProblemServerClient:
         body = ChallengeRevealRequest(
             challenge_id=challenge_id, commit_token=commit_token
         ).model_dump_json().encode()
-        response = await self._post("/v1/challenges/reveal", body)
+        response = await self.post("/v1/challenges/reveal", body)
         if response is None or response.status_code != 200:
             return None
         try:
@@ -505,7 +505,7 @@ class ProblemServerClient:
 
     async def feedback(self, feedback: ChallengeFeedback) -> bool:
         body = feedback.model_dump_json().encode()
-        response = await self._post("/v1/challenges/feedback", body)
+        response = await self.post("/v1/challenges/feedback", body)
         if response is None or response.status_code != 200:
             return False
         try:

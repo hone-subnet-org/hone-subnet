@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "task_type": "repository_patch_v1",
+  "task_kind": "bug_fix",
+  "instruction": "We've had reports that EventArchive sometimes gives incorrect results. Could you take a look and get this behaving as documented?",
+  "primary_language": "cpp",
+  "workspace_sha256": "bdb4aafce310bd6fc521bd1c8ac79bb7c7a3911956708916916e4b9b05734f52",
+  "verifier_sha256": "597b92f6e5236442ddf3f6e76792643cfa81a4295b972c07cadb543b1ae94acd",
+  "execution_profile_id": "repo-polyglot-v1",
+  "working_directory": ".",
+  "patch_format": "unified_diff_v1",
+  "verifier_policy": "command-gold-digest-v1",
+  "authoring_version": "bulk-author-v2"
+}

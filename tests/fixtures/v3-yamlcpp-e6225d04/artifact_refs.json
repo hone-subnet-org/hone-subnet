@@ -1,0 +1,16 @@
+{
+  "workspace": {
+    "artifact_role": "workspace",
+    "sha256": "bdb4aafce310bd6fc521bd1c8ac79bb7c7a3911956708916916e4b9b05734f52",
+    "compressed_size_bytes": 894444,
+    "expanded_size_bytes": 7311360,
+    "artifact_format": "tar_zst_v1"
+  },
+  "verifier": {
+    "artifact_role": "verifier",
+    "sha256": "597b92f6e5236442ddf3f6e76792643cfa81a4295b972c07cadb543b1ae94acd",
+    "compressed_size_bytes": 6498,
+    "expanded_size_bytes": 61440,
+    "artifact_format": "tar_zst_v1"
+  }
+}

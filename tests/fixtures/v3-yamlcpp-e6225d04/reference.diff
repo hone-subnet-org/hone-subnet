@@ -1,0 +1,22 @@
+--- a/src/eventarchive_query.cpp
++++ b/src/eventarchive_query.cpp
+@@ -350,7 +350,7 @@
+     }
+     if (records_[definition].kind != Kind::Scalar)
+       return false;  // null and collection keys are ignored
+-    return records_[definition].value == token.c_str();
++    return records_[definition].value == token;
+   }
+ 
+   /** The value record of `token` in a mapping, or a missing/ambiguous error. */
+--- a/src/eventarchive_store.cpp
++++ b/src/eventarchive_store.cpp
+@@ -121,7 +121,7 @@
+ 
+ std::string ParseString(const Node& node) {
+   Require(node.IsScalar());
+-  return node.Scalar().c_str();
++  return node.Scalar();
+ }
+ 
+ // The four checkpoint fields of a mapping, in a fixed order.

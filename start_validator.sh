@@ -41,7 +41,6 @@ set +a
 : "${NETUID:?set NETUID in .env}"
 : "${WALLET_NAME:?set WALLET_NAME in .env}"
 : "${WALLET_HOTKEY:?set WALLET_HOTKEY in .env}"
-: "${PROBLEM_SERVER_URL:?set PROBLEM_SERVER_URL in .env}"
 : "${SUBTENSOR_NETWORK:?set SUBTENSOR_NETWORK in .env}"
 
 if [[ "${WALLET_NAME}" == "YOUR_WALLET_NAME" ||
@@ -55,4 +54,4 @@ fi
 : "${LOGLEVEL:=info}"
 export LOGLEVEL
 echo "[start_validator] netuid=${NETUID} network=${SUBTENSOR_NETWORK} wallet=${WALLET_NAME}/${WALLET_HOTKEY}"
-exec python scripts/run_validator.py
+exec python -u scripts/run_validator.py

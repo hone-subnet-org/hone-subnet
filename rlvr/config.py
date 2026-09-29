@@ -26,7 +26,10 @@ class Settings(BaseSettings):
     # full response; HTTPX's own timeout is only a per-phase inactivity bound.
     # Too-short deadlines zero out honest miners on exactly the in-band-hard
     # problems the curriculum targets.
-    solve_deadline_s: float = Field(default=300.0, gt=0.0, le=3600.0)
+    # Upper bound on how long a validator waits for one miner. The validator
+    # waits the shorter of this and the lease expiry, so with the default the
+    # lease expiry set by the problem server is the per-task limit.
+    solve_deadline_s: float = Field(default=3600.0, gt=0.0, le=3600.0)
     # --- Difficulty classification ---
     band_low: float = Field(default=0.35, ge=0.0, le=1.0)
     band_high: float = Field(default=0.65, ge=0.0, le=1.0)
@@ -59,7 +62,10 @@ class Settings(BaseSettings):
     reward_partial_credit: bool = False
 
     # --- Private problem-source client ---
-    problem_server_url: str = ""
+    # The production V3 problem server. Override only for a private or test server.
+    problem_server_url: str = "https://d344p1xue0u9qs.cloudfront.net"
+    # Set by validation when a .env still names the previous release's server.
+    problem_server_url_migrated_from: str = ""
     # HTTPS authenticates problem-server responses; Epistula authenticates
     # validator requests. Plain HTTP is local-test only.
     problem_server_allow_insecure_http: bool = False
@@ -73,6 +79,9 @@ class Settings(BaseSettings):
     # needs one in-flight request per serving miner or slow solvers serialize
     # into deadline-length waves.
     validator_dispatch_concurrency: int = Field(default=256, ge=1, le=1024)
+    # Miners graded at the same time. Each one may hold a sandbox container at
+    # the full memory limit plus a copy of the task workspace on disk.
+    validator_grading_concurrency: int = Field(default=2, ge=1, le=16)
     # Requests waiting for one of these short-lived send-start slots remain
     # unsigned. The slot is released after the request body reaches the HTTP
     # transport, so miner solve time does not serialize the fan-out.
@@ -82,6 +91,13 @@ class Settings(BaseSettings):
     # full-pool dispatch cannot thrash the executor.
     validator_verify_concurrency: int = Field(default=16, ge=1, le=256)
     validator_score_state_file: str = "data/validator_scores.json"
+    validator_diagnostics_file: str | None = None
+    validator_failure_notices: bool = True
+    validator_failed_check_details: bool = True
+    # Trajectory spot checks: off until a service URL and its hotkey are set.
+    validator_trace_check_url: str = ""
+    validator_trace_check_hotkey: str = ""
+    validator_trace_check_rate: float = Field(default=0.01, ge=0.0, le=1.0)
 
     # --- Dataset export ---
     dataset_dir: str = "data/rollouts"
@@ -97,7 +113,18 @@ class Settings(BaseSettings):
     def validate_ranges(self) -> "Settings":
         if self.band_low > self.band_high:
             raise ValueError("BAND_LOW must be <= BAND_HIGH")
+        if self.problem_server_url.rstrip("/") in LEGACY_PROBLEM_SERVER_URLS:
+            # An existing .env from the previous release pins the old server,
+            # which does not speak this protocol. Use the current default.
+            self.problem_server_url_migrated_from = self.problem_server_url
+            self.problem_server_url = type(self).model_fields["problem_server_url"].default
         return self
+
+
+# Production servers of previous releases. A .env naming one of these is moved
+# to the current default rather than left leasing from a server that cannot
+# answer this protocol.
+LEGACY_PROBLEM_SERVER_URLS = frozenset({"https://dwvoiuahpq8jj.cloudfront.net"})
 
 
 def get_settings() -> Settings:
@@ -140,6 +167,7 @@ _SAFE_EFFECTIVE_SETTINGS = {
     "miner_max_response_bytes": "MINER_MAX_RESPONSE_BYTES",
     "problem_server_request_timeout_s": "PROBLEM_SERVER_REQUEST_TIMEOUT_S",
     "validator_dispatch_concurrency": "VALIDATOR_DISPATCH_CONCURRENCY",
+    "validator_grading_concurrency": "VALIDATOR_GRADING_CONCURRENCY",
     "validator_send_concurrency": "VALIDATOR_SEND_CONCURRENCY",
     "validator_verify_concurrency": "VALIDATOR_VERIFY_CONCURRENCY",
 }

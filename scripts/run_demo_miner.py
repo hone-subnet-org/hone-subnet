@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Run the GLM-5.2 demo miner."""
+"""Run the Bedrock-backed V3 demo miner."""
 
 from rlvr.neurons.demo_miner import run_demo_miner
 
