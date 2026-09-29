@@ -29,6 +29,8 @@ class RoundReason(str, Enum):
     UNSUPPORTED_VERIFIER_POLICY = "unsupported_verifier_policy"
     INSUFFICIENT_STORAGE = "insufficient_storage"
     SLOT_POOL_MISMATCH = "slot_pool_mismatch"
+    LEASE_QUORUM_MISMATCH = "lease_quorum_mismatch"
+    LEASE_TOO_SHORT = "lease_too_short"
     QUORUM_NOT_MET = "quorum_not_met"
     COMMIT_FAILED = "commit_failed"
     REVEAL_MISMATCH = "reveal_mismatch"

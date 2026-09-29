@@ -593,6 +593,8 @@ def run_round(tmp_path, client, round_policy, solvers=()):
         [(slots.submission.uid, slots.submission.hotkey) for slots in challenge.slot_pool]
         if challenge is not None else [(1, "hk-1")]
     )
+    if challenge is not None:  # the policy quorum matches the fixture lease, as on a real deployment
+        round_policy = dataclasses.replace(round_policy, commit_quorum=challenge.commit_min_signed_responses)
     return asyncio.run(evaluate_round(
         client, None, list(solvers), round_policy,
         cache_dir=tmp_path / "cache", work_dir=tmp_path / "work", candidates=offered,
@@ -618,7 +620,7 @@ def test_transport_lease_failure_is_unavailable_and_unrecorded(tmp_path):
     ("verifier_policy", RoundReason.UNSUPPORTED_VERIFIER_POLICY),
 ])
 def test_policy_mismatch_abandons_at_the_lease_stage_with_identity(tmp_path, field, code):
-    leased = V3LeaseOutcome(LeaseCategory.LEASED, challenge=LeaseResponse(**lease()))
+    leased = V3LeaseOutcome(LeaseCategory.LEASED, challenge=LeaseResponse(**lease(expires_at=2**53 - 1)))
     mismatched = dataclasses.replace(policy(tmp_path), **{field: "something-else"})
     result = run_round(tmp_path, LeaseOnlyClient(leased), mismatched)
     assert (result.status, result.reason_code) == ("abandoned", code)
@@ -639,7 +641,7 @@ def test_cleanup_stage_fault_maps_to_cleanup_failed_and_leaks_no_message(tmp_pat
         raise RuntimeError(secret)
 
     monkeypatch.setattr("rlvr.v3.round._remove_tree", broken)
-    leased = V3LeaseOutcome(LeaseCategory.LEASED, challenge=LeaseResponse(**lease()))
+    leased = V3LeaseOutcome(LeaseCategory.LEASED, challenge=LeaseResponse(**lease(expires_at=2**53 - 1)))
     result = run_round(tmp_path, LeaseOnlyClient(leased), policy(tmp_path))
     assert (result.status, result.reason_code, result.stage) == (
         "abandoned", RoundReason.CLEANUP_FAILED, Stage.CLEANUP)

@@ -24,6 +24,7 @@ from ..problemserver.client import (
 from ..scoring.eval_engine import EvalEngine
 from ..v3.client import V3ProblemServerClient
 from ..v3.diagnostics import EvaluationLog
+from ..v3.reasons import RoundReason
 from ..v3.release import round_policy as v3_round_policy
 from ..v3.round import apply_round_scores, evaluate_round
 from ..v3.selection import eligible_miners, next_offer
@@ -542,10 +543,13 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
                 work_dir=state_dir / "v3-rounds",
                 candidates=offered,
             )
-            if result.status == "completed":
-                # Only a completed round earns a fresh draw. An abandoned or
-                # rejected lease keeps the order, so nothing the server does
-                # to a lease can buy it a different one.
+            if result.status == "completed" or result.reason_code is RoundReason.QUORUM_NOT_MET:
+                # A completed round earns a fresh draw. So does a quorum
+                # failure: that is decided by the miners' own responses against
+                # a threshold fixed by release policy, not by the server, and
+                # keeping the order would retry the same silent prefix forever. Any other
+                # abandoned or rejected lease keeps the order, so nothing the
+                # server does to a lease can buy it a different one.
                 offer_state["order"] = None
             completed = int(result.status == "completed")
             if result.status == "completed":

@@ -129,12 +129,21 @@ def test_feedback_is_skipped_without_grants_and_failures_are_diagnostic():
 
 
 class Solver:
+    in_flight = 0
+    peak = 0  # how many solvers were being dispatched to at the same time
+
     def __init__(self, uid, hotkey, content):
         self.uid = uid
         self.hotkey = hotkey
         self.content = content
 
     async def solve_v3(self, task):
+        Solver.in_flight += 1
+        Solver.peak = max(Solver.peak, Solver.in_flight)
+        try:
+            await asyncio.sleep(0.05)  # long enough for concurrent dispatches to overlap
+        finally:
+            Solver.in_flight -= 1
         response = MinerTaskResponse(
             protocol_version=3,
             challenge_id=task.challenge_id,
@@ -225,7 +234,7 @@ def policy(tmp_path):
         "cleanup", "quorum", "commit", "reveal", "expired", "verifier_download",
         "manifest", "workspace_download", "workspace_extract", "materialize",
         "format", "grant", "grade_infrastructure", "grade_exception", "temporary_directory",
-        "pool_mismatch", "pool_skip", "pool_short",
+        "pool_mismatch", "pool_skip", "pool_short", "quorum_mismatch", "lease_short", "lease_short_at_dispatch",
     )],
     (False, False, "grade_exception", 3),
 ])
@@ -280,7 +289,11 @@ def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
         commit_min_signed_responses=4 if round_fault == "quorum" else 3,
         workspace=workspace_ref,
         verifier=verifier_ref,
-        expires_at=2**53 - 1,
+        expires_at=(
+            int(time.time()) + 60 if round_fault == "lease_short"
+            else int(time.time()) + 900 if round_fault == "lease_short_at_dispatch"
+            else 2**53 - 1
+        ),
     )
     leased = LeaseResponse(**lease_fields)
     feedback_requests = []
@@ -415,6 +428,17 @@ def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
             raise httpx.ConnectError("storage unavailable")
 
         monkeypatch.setattr("rlvr.v3.round.fetch_submission", fail_download)
+    if round_fault == "lease_short_at_dispatch":
+        # the workspace download "takes" 400 s: the first clock read is the lease check, later ones are after it
+        from types import SimpleNamespace
+
+        real_now, reads = time.time(), [0]
+
+        def slow_clock():
+            reads[0] += 1
+            return real_now + (0 if reads[0] == 1 else 400)
+
+        monkeypatch.setattr("rlvr.v3.round.time", SimpleNamespace(time=slow_clock, monotonic=time.monotonic))
     stale_cache = tmp_path / "cache" / ("f" * 64)
     stale_cache.mkdir(parents=True)
     (stale_cache / "old").write_bytes(b"old")
@@ -426,7 +450,12 @@ def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
                 client,
                 http,
                 [Solver(uid, f"hk-{uid}", contents[uid]) for uid in contents],
-                dataclasses.replace(policy(tmp_path), grading_concurrency=grading_concurrency),
+                dataclasses.replace(policy(tmp_path), grading_concurrency=grading_concurrency,
+                                    # one case dispatches with a fan-out of 1: the round must still contact every offered miner at once
+                                    dispatch_concurrency=1 if grading_concurrency == 3 else 4,
+                                    # the policy quorum matches the lease (3, or 4 in the "quorum" case)
+                                    # except in the "quorum_mismatch" case, where the lease says 3 and policy 2
+                                    commit_quorum={"quorum_mismatch": 2, "quorum": 4}.get(round_fault, 3)),
                 cache_dir=tmp_path / "cache",
                 work_dir=tmp_path / "work",
                 # uid 4 is offered but not serving. "pool_mismatch": uid 4 not offered at all.
@@ -439,7 +468,10 @@ def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
                 ),
             )
 
+    Solver.in_flight, Solver.peak = 0, 0
     result = asyncio.run(go())
+    if not (round_fault or submission_download_fails or checker_times_out):
+        assert Solver.peak == 3  # uids 1-3 serve and were dispatched to together, whatever the fan-out setting
     expected_offer = {"pool_mismatch": [1, 2, 3], "pool_skip": [9, 1, 2, 3, 4], "pool_short": [1, 2, 3, 4, 9]}.get(round_fault, [1, 2, 3, 4])
     assert [c["uid"] for c in lease_bodies[0]["candidates"]] == expected_offer
     if not (round_fault or submission_download_fails or checker_times_out):
@@ -450,6 +482,9 @@ def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
             "pool_mismatch": (RoundReason.SLOT_POOL_MISMATCH, Stage.LEASE),
             "pool_skip": (RoundReason.SLOT_POOL_MISMATCH, Stage.LEASE),
             "pool_short": (RoundReason.SLOT_POOL_MISMATCH, Stage.LEASE),  # 5 offered, policy says 32, only 4 issued
+            "quorum_mismatch": (RoundReason.LEASE_QUORUM_MISMATCH, Stage.LEASE),  # the lease says 3, policy says 2
+            "lease_short": (RoundReason.LEASE_TOO_SHORT, Stage.LEASE),  # 60 s left, policy wants 600
+            "lease_short_at_dispatch": (RoundReason.LEASE_TOO_SHORT, Stage.DISPATCH),  # 900 s at lease, 500 s by dispatch
             "quorum": (RoundReason.QUORUM_NOT_MET, Stage.DISPATCH),
             "commit": (RoundReason.COMMIT_FAILED, Stage.COMMIT),
             "reveal": (RoundReason.REVEAL_MISMATCH, Stage.COMMIT),

@@ -69,6 +69,9 @@ def test_prompt_and_submission_are_v3_shapes():
     assert extract_submission("```diff\n context line \n```") == b" context line \n"
     assert extract_submission("```diff\n+value\r\n```") == b"+value\r\n"
     assert extract_submission(" --- a/a\n+++ b/a\n") == b"--- a/a\n+++ b/a\n"  # provider-added leading space
+    # a raw diff that adds a fenced block keeps the fence as content
+    fenced = "--- a/README.md\n+++ b/README.md\n@@ -1 +1,4 @@\n x\n+```python\n+print('hi')\n+```\n"
+    assert extract_submission(fenced) == fenced.encode()
     assert extract_submission("  #!/bin/bash\necho hi\n") == b"#!/bin/bash\necho hi\n"
 
 

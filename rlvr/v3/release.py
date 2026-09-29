@@ -73,4 +73,6 @@ def round_policy(
         dispatch_concurrency=dispatch_concurrency,
         grading_concurrency=grading_concurrency,
         miners_per_task=policy.v3_miners_per_task,
+        commit_quorum=policy.v3_commit_quorum,
+        min_lease_s=policy.v3_min_lease_s,
     )

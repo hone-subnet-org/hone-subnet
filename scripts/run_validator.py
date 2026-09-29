@@ -33,6 +33,11 @@ def main() -> None:
             + ", ".join(ignored)
         )
     print(f"[validator] release policy {release_policy_summary()}")
+    if settings.problem_server_url_migrated_from:
+        print(
+            f"[validator] NOTE: PROBLEM_SERVER_URL={settings.problem_server_url_migrated_from} is the "
+            "previous release's server; using the current default instead. Remove it from .env."
+        )
     nondefault = nondefault_settings_summary(settings)
     if nondefault:
         print(f"[validator] non-default machine settings {nondefault}")

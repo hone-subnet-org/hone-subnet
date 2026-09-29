@@ -64,6 +64,12 @@ class ValidatorPolicy:
     # Miners each task is offered to. Fixed here, not per lease, so the problem
     # server cannot widen or narrow the pool around a particular miner.
     v3_miners_per_task: int = 32
+    # Signed responses a lease must gather before commit. Fixed here, like the
+    # pool size, so the problem server cannot vary it per lease.
+    v3_commit_quorum: int = 4
+    # The least time a lease may leave miners. A shorter lease is refused, so
+    # the server cannot starve miners into a quorum failure and a fresh draw.
+    v3_min_lease_s: int = 600
 
     def __post_init__(self) -> None:
         if not 0.0 < self.dispatch_fraction <= 1.0:
@@ -111,6 +117,8 @@ class ValidatorPolicy:
             self.v3_patch_bytes,
             self.v3_script_bytes,
             self.v3_miners_per_task,
+            self.v3_commit_quorum,
+            self.v3_min_lease_s,
             self.v3_problem_response_read_bytes,
         ):
             if type(value) is not int or value <= 0:

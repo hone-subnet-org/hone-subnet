@@ -185,3 +185,77 @@ async def test_v3_live_transport_has_a_total_response_deadline(monkeypatch):
     assert time.monotonic() - started < 1
     assert parsed is None
     assert "deadline" in committed.error
+
+
+async def test_v3_live_dispatch_fits_inside_the_lease_when_the_solve_limit_is_longer(monkeypatch):
+    from bittensor_wallet import Keypair
+
+    validator = Keypair.create_from_uri("//Alice")
+    miner = Keypair.create_from_uri("//Dave")
+    leased = lease()
+    task = MinerTaskRequest(
+        protocol_version=3,
+        challenge_id=leased["challenge_id"],
+        task_id=leased["task_id"],
+        identity=leased["identity"],
+        workspace=leased["workspace"],
+        workspace_url=leased["workspace_url"],
+        expires_at=int(time.time()) + 2,  # the lease, not the solve limit, is the binding bound
+        slots=slot_set(uid=7, hotkey=miner.ss58_address),
+    )
+
+    class SlowBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            while True:
+                await asyncio.sleep(0.1)
+                yield b"x"
+
+    async def handler(_request):
+        return httpx.Response(200, stream=SlowBody())
+
+    settings = get_settings().model_copy(update={"solve_deadline_s": 3600.0})
+    monkeypatch.setattr("rlvr.neurons.live._SOLVE_DEADLINE_GRACE_S", 0.2)
+    monkeypatch.setattr("rlvr.neurons.live._COMMIT_RESERVE_S", 0.5)
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = LiveSolverClient(uid=7, hotkey=miner.ss58_address, url="http://miner",
+                              wallet=WalletLike(validator), settings=settings, http=http)
+    started = time.monotonic()
+    try:
+        committed, parsed = await client.solve_v3(task)
+    finally:
+        await http.aclose()
+    assert parsed is None and "deadline" in committed.error
+    assert time.monotonic() - started < 2.0  # gave up before the lease expired, grace and reserve kept
+
+
+async def test_v3_live_does_not_dispatch_a_lease_too_short_for_the_exchange_and_commit(monkeypatch):
+    from bittensor_wallet import Keypair
+
+    validator = Keypair.create_from_uri("//Alice")
+    miner = Keypair.create_from_uri("//Dave")
+    leased = lease()
+    task = MinerTaskRequest(
+        protocol_version=3,
+        challenge_id=leased["challenge_id"],
+        task_id=leased["task_id"],
+        identity=leased["identity"],
+        workspace=leased["workspace"],
+        workspace_url=leased["workspace_url"],
+        expires_at=int(time.time()) + 20,  # less than the grace plus the commit reserve
+        slots=slot_set(uid=7, hotkey=miner.ss58_address),
+    )
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        return httpx.Response(200)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = LiveSolverClient(uid=7, hotkey=miner.ss58_address, url="http://miner",
+                              wallet=WalletLike(validator), settings=get_settings(), http=http)
+    try:
+        committed, parsed = await client.solve_v3(task)
+    finally:
+        await http.aclose()
+    assert parsed is None and "too short" in committed.error
+    assert requests == []  # the miner was never contacted

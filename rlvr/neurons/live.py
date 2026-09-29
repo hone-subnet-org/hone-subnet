@@ -24,6 +24,8 @@ from .validator import ValidatorNeuron
 
 _SEND_START_BUDGET_S = 6.0
 _SOLVE_DEADLINE_GRACE_S = 10.0
+# Time kept back from the lease for the commit that must follow every dispatch.
+_COMMIT_RESERVE_S = 30.0
 
 
 class _SendPermit:
@@ -169,10 +171,14 @@ class LiveSolverClient:
             return failed(f"dispatch signing failed: {error}")
         headers["Content-Type"] = "application/json"
         headers["Content-Length"] = str(len(body))
-        timeout_s = max(
-            0.001,
-            min(self._settings.solve_deadline_s, task.expires_at - time.time()),
-        )
+        # The exchange, its grace and the commit that follows must all fit
+        # inside the lease, or a silent miner pushes the commit past expiry.
+        # A lease too short for that is not dispatched at all.
+        lease_budget = task.expires_at - time.time() - _SOLVE_DEADLINE_GRACE_S - _COMMIT_RESERVE_S
+        if lease_budget <= 0:
+            permit.release()
+            return failed("lease too short to dispatch")
+        timeout_s = min(self._settings.solve_deadline_s, lease_budget)
         overall_deadline = time.monotonic() + timeout_s + _SOLVE_DEADLINE_GRACE_S
 
         async def exchange():

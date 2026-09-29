@@ -470,3 +470,14 @@ def test_nonce_cache_fails_closed_at_capacity_without_evicting_fresh_entries():
     # Once the signature/replay window has elapsed, stale entries are pruned
     # and new traffic is admitted again.
     assert cache.check_and_add("three", now_ms=10_000)
+
+
+def test_previous_release_server_url_migrates_to_the_current_default():
+    from rlvr.config import LEGACY_PROBLEM_SERVER_URLS
+
+    legacy = next(iter(LEGACY_PROBLEM_SERVER_URLS))
+    settings = Settings(_env_file=None, problem_server_url=legacy + "/")
+    assert settings.problem_server_url == "https://d344p1xue0u9qs.cloudfront.net"
+    assert settings.problem_server_url_migrated_from == legacy + "/"
+    plain = Settings(_env_file=None, problem_server_url="https://private.example")
+    assert plain.problem_server_url == "https://private.example" and not plain.problem_server_url_migrated_from

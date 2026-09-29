@@ -64,6 +64,8 @@ class Settings(BaseSettings):
     # --- Private problem-source client ---
     # The production V3 problem server. Override only for a private or test server.
     problem_server_url: str = "https://d344p1xue0u9qs.cloudfront.net"
+    # Set by validation when a .env still names the previous release's server.
+    problem_server_url_migrated_from: str = ""
     # HTTPS authenticates problem-server responses; Epistula authenticates
     # validator requests. Plain HTTP is local-test only.
     problem_server_allow_insecure_http: bool = False
@@ -111,7 +113,18 @@ class Settings(BaseSettings):
     def validate_ranges(self) -> "Settings":
         if self.band_low > self.band_high:
             raise ValueError("BAND_LOW must be <= BAND_HIGH")
+        if self.problem_server_url.rstrip("/") in LEGACY_PROBLEM_SERVER_URLS:
+            # An existing .env from the previous release pins the old server,
+            # which does not speak this protocol. Use the current default.
+            self.problem_server_url_migrated_from = self.problem_server_url
+            self.problem_server_url = type(self).model_fields["problem_server_url"].default
         return self
+
+
+# Production servers of previous releases. A .env naming one of these is moved
+# to the current default rather than left leasing from a server that cannot
+# answer this protocol.
+LEGACY_PROBLEM_SERVER_URLS = frozenset({"https://dwvoiuahpq8jj.cloudfront.net"})
 
 
 def get_settings() -> Settings:

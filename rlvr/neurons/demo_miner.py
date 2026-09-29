@@ -280,13 +280,15 @@ def _git_check(git: str, patch: bytes, workspace: Path, timeout: float) -> tuple
 
 
 def extract_submission(text: str) -> bytes:
-    match = _ANY_FENCE_RE.search(text)
-    payload = (match.group(1) if match else text).strip("\n")
-    # Some providers prefix the reply with a space; a diff or script never
-    # starts with one, while a context line inside a diff must keep its own.
-    stripped = payload.lstrip(" \t")
-    if stripped.startswith(("--- ", "diff ", "#!")):
-        payload = stripped
+    # A reply that starts as a diff or a script is taken whole: any fence in it
+    # is content the diff adds. (Some providers prefix a space; a diff or
+    # script never starts with one, while a context line keeps its own.)
+    bare = text.strip("\n").lstrip(" \t")
+    if bare.startswith(("--- ", "diff ", "#!")):
+        payload = bare
+    else:
+        match = _ANY_FENCE_RE.search(text)
+        payload = (match.group(1) if match else text).strip("\n")
     return ((payload + "\n") if payload else "").encode("utf-8")
 
 

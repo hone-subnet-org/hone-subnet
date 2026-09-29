@@ -82,7 +82,7 @@ async def test_round_callback_offers_a_filtered_random_subset_and_dispatches_onl
         _env_file=None, problem_server_url="https://problems.invalid",
         validator_score_state_file=str(tmp_path / "scores.json"),
     )
-    live = [SimpleNamespace(uid=uid, hotkey=f"hk-{uid}") for uid in range(4)]
+    live = [SimpleNamespace(uid=uid, hotkey=f"hk-{uid}") for uid in range(40)]
     seen = {}
 
     class Validator:
@@ -90,9 +90,9 @@ async def test_round_callback_offers_a_filtered_random_subset_and_dispatches_onl
             self.wallet = SimpleNamespace(hotkey=SimpleNamespace(ss58_address="validator"))
             self.subtensor = object()
             self.metagraph = SimpleNamespace(
-                hotkeys=[f"hk-{uid}" for uid in range(4)],
-                validator_permit=[False, False, True, False],  # uid 2 holds a permit ...
-                validator_trust=[0.0, 0.0, 0.5, 0.0],  # ... and validates
+                hotkeys=[f"hk-{uid}" for uid in range(40)],
+                validator_permit=[uid == 2 for uid in range(40)],  # uid 2 holds a permit ...
+                validator_trust=[0.5 if uid == 2 else 0.0 for uid in range(40)],  # ... and validates
                 sync=lambda **_: None,
             )
 
@@ -109,7 +109,7 @@ async def test_round_callback_offers_a_filtered_random_subset_and_dispatches_onl
             pass
 
         async def run(self):
-            for _ in range(4):
+            for _ in range(6):
                 await self.callback(self)
 
     offers = []
@@ -118,13 +118,16 @@ async def test_round_callback_offers_a_filtered_random_subset_and_dispatches_onl
         seen["solvers"] = [(s.uid, s.hotkey) for s in solvers]
         seen["candidates"] = list(candidates)
         offers.append(list(candidates))
-        # lease fails, lease rejected by the validator (carries a challenge id),
-        # round completes, then one more round
+        # 1 lease fails; 2 lease rejected by the validator (carries a challenge id);
+        # 3 round completes; 4 next order; 5 quorum failure; 6 fresh order again
         if len(offers) == 2:
             return RoundResult("abandoned", "bad pool", (), reason_code=RoundReason.SLOT_POOL_MISMATCH,
                                stage=Stage.LEASE, challenge_id="c", task_id="a" * 64)
         if len(offers) == 3:
             return RoundResult("completed", "", (), challenge_id="c", task_id="a" * 64)
+        if len(offers) == 5:
+            return RoundResult("abandoned", "quorum", (), reason_code=RoundReason.QUORUM_NOT_MET,
+                               stage=Stage.DISPATCH, challenge_id="c", task_id="a" * 64)
         return RoundResult("unavailable", "no task", (), retry_after_s=1)
 
     monkeypatch.setattr(decentralized, "ValidatorNeuron", Validator)
@@ -135,10 +138,13 @@ async def test_round_callback_offers_a_filtered_random_subset_and_dispatches_onl
 
     await decentralized._run_decentralized_validator_async(settings)
 
-    assert set(seen["candidates"]) == {(1, "hk-1"), (3, "hk-3")}  # not the owner, not the validator
+    expected = {(uid, f"hk-{uid}") for uid in range(1, 40) if uid != 2}  # not the owner, not the validator
+    assert set(seen["candidates"]) == expected
     assert set(seen["solvers"]) == set(seen["candidates"])  # dispatch goes only to the offered miners
     assert offers[0] == offers[1] == offers[2]  # kept through a failed lease and a rejected one
-    assert len(offers) == 4 and set(offers[3]) == set(offers[0])  # only a completed round earns a fresh draw
+    assert offers[3] != offers[2] and set(offers[3]) == expected  # a completed round earns a fresh draw
+    assert offers[4] == offers[3]  # an empty round keeps it
+    assert offers[5] != offers[4] and set(offers[5]) == expected  # a quorum failure earns a fresh draw too
 
 
 def test_next_offer_keeps_the_order_across_failed_leases():
@@ -251,3 +257,14 @@ async def test_round_callback_says_so_when_no_miner_is_eligible(tmp_path, monkey
     await decentralized._run_decentralized_validator_async(settings)
     assert leased == []
     assert "no lease: no eligible miners to offer (serving=1" in capsys.readouterr().out
+
+
+def test_release_policy_fixes_the_pool_size_and_the_quorum(monkeypatch):
+    from rlvr.policy import RELEASE_POLICY
+    from rlvr.v3.release import round_policy
+
+    monkeypatch.setattr("rlvr.v3.release.os.getuid", lambda: 1000)
+    monkeypatch.setattr("rlvr.v3.release.os.getgid", lambda: 1000)
+    monkeypatch.setattr("rlvr.v3.release.shutil.which", lambda _: "/usr/bin/docker")
+    released = round_policy(RELEASE_POLICY, dispatch_concurrency=4)
+    assert released.miners_per_task == 32 and released.commit_quorum == 4 and released.min_lease_s == 600

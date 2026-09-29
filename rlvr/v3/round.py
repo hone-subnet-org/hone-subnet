@@ -103,6 +103,13 @@ class RoundPolicy:
     dispatch_concurrency: int
     grading_concurrency: int = 1
     miners_per_task: int = 32
+    # Signed responses a lease must gather before commit. The lease carries
+    # the value too and must agree, so a quorum failure is a fact about the
+    # miners and never a knob the server could turn to force a reroll.
+    commit_quorum: int = 4
+    # The least time a lease may leave miners at dispatch. Shorter leases are
+    # refused without a fresh draw.
+    min_lease_s: int = 600
 
     def __post_init__(self) -> None:
         if type(self.dispatch_concurrency) is not int or self.dispatch_concurrency < 1:
@@ -111,6 +118,10 @@ class RoundPolicy:
             raise ValueError("grading concurrency must be positive")
         if type(self.miners_per_task) is not int or not 1 <= self.miners_per_task <= 1_024:
             raise ValueError("miners per task must be between 1 and 1024")
+        if type(self.commit_quorum) is not int or not 1 <= self.commit_quorum <= self.miners_per_task:
+            raise ValueError("commit quorum must be between 1 and miners per task")
+        if type(self.min_lease_s) is not int or self.min_lease_s < 1:
+            raise ValueError("minimum lease window must be positive")
 
 
 class _Abandon(Exception):
@@ -337,6 +348,10 @@ async def evaluate_round(
             # server added, skipped, substituted, widened or narrowed, any of
             # which would let it steer selection.
             return finish("abandoned", "lease pool is not the first miners the validator offered", RoundReason.SLOT_POOL_MISMATCH)
+        if lease.commit_min_signed_responses != policy.commit_quorum:
+            return finish("abandoned", "lease quorum differs from release policy", RoundReason.LEASE_QUORUM_MISMATCH)
+        if lease.expires_at - time.time() < policy.min_lease_s:
+            return finish("abandoned", "lease leaves miners less time than release policy requires", RoundReason.LEASE_TOO_SHORT)
         if lease.identity.execution_profile_id != policy.execution_profile_id:
             return finish("abandoned", "unsupported execution profile", RoundReason.UNSUPPORTED_PROFILE)
         if lease.identity.verifier_policy != policy.verifier_policy:
@@ -395,7 +410,9 @@ async def evaluate_round(
             )
 
             by_registration = {(solver.uid, solver.hotkey): solver for solver in solvers}
-            semaphore = asyncio.Semaphore(policy.dispatch_concurrency)
+            # Every offered miner is contacted at once: a miner that waited for
+            # a dispatch slot would get less than the released minimum window.
+            semaphore = asyncio.Semaphore(max(policy.dispatch_concurrency, len(lease.slot_pool)))
 
             async def dispatch(slots):
                 registration = (slots.submission.uid, slots.submission.hotkey)
@@ -434,6 +451,10 @@ async def evaluate_round(
                     )
 
             stage = Stage.DISPATCH
+            if lease.expires_at - time.time() < policy.min_lease_s:
+                # Checked again here: downloading and extracting the workspace
+                # took time, and miners must still get the released minimum.
+                return finish("abandoned", "lease leaves miners less time than release policy requires", RoundReason.LEASE_TOO_SHORT)
             dispatched = await asyncio.gather(
                 *(dispatch(slots) for slots in lease.slot_pool)
             )
@@ -557,8 +578,8 @@ async def evaluate_round(
                 run_prefix = f"v3-{challenge_tag}-{grant.uid}"
                 evaluation: MinerEvaluation | None = None
                 try:
-                    miner_workspace = materialize_workspace(
-                        cached, round_dir / f"miner-{grant.uid}"
+                    miner_workspace = await asyncio.to_thread(
+                        materialize_workspace, cached, round_dir / f"miner-{grant.uid}"
                     )
                 except Exception as error:  # noqa: BLE001 - workspace copies are infrastructure
                     raise _Abandon(
@@ -608,7 +629,7 @@ async def evaluate_round(
                     )
                 finally:
                     try:
-                        _remove_tree(miner_workspace)
+                        await asyncio.to_thread(_remove_tree, miner_workspace)
                     except Exception as error:  # noqa: BLE001 - a leftover workspace ends the round
                         raise _Abandon(
                             f"validator failed during cleanup ({type(error).__name__})",

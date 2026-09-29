@@ -11,6 +11,11 @@ Requirements:
 
 - Linux with Python 3.10–3.12
 - Docker with the daemon running
+- at least 25 GB free on the filesystem holding `data/`: grading refuses to
+  start a round with less than about 20 GB free, since each of the two
+  concurrent gradings may use a 10 GB workspace
+- at least 12 GB of RAM: each concurrent grading may use 4 GB, plus the
+  validator itself and Docker
 - a registered validator hotkey on Finney NETUID 5
 - a system clock synchronized with NTP
 

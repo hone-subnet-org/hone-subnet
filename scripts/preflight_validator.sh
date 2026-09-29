@@ -64,6 +64,15 @@ if [[ ! -v PROBLEM_SERVER_URL ]]; then
 elif [[ -z "${PROBLEM_SERVER_URL}" ]]; then
   echo "[preflight] ERROR: PROBLEM_SERVER_URL is set but empty; unset it for the default or set a server." >&2
   exit 1
+else
+  # A .env from the previous release names the old server; the validator
+  # itself moves to the current default, so the probe must too.
+  resolved="$("${python_bin}" -c 'import os; from rlvr.config import Settings; print(Settings(_env_file=None, problem_server_url=os.environ["PROBLEM_SERVER_URL"]).problem_server_url)')"
+  if [[ "${resolved}" != "${PROBLEM_SERVER_URL}" ]]; then
+    echo "[preflight] NOTE: PROBLEM_SERVER_URL names the previous release's server; using ${resolved}. Remove it from .env."
+    PROBLEM_SERVER_URL="${resolved}"
+    export PROBLEM_SERVER_URL
+  fi
 fi
 
 if [[ "${SUBTENSOR_NETWORK:-}" == "finney" && "${NETUID:-}" != "5" ]]; then
