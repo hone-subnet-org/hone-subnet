@@ -224,7 +224,10 @@ def apply_patch_in_container(
     if not patch:
         return PatchResult("applied", "")
 
-    with tempfile.TemporaryDirectory(prefix="hone-v3-patch-") as scratch_name:
+    # Beside the workspace, not in the system temp directory: the Docker
+    # daemon is a separate service and, under systemd PrivateTmp, cannot see
+    # this process's /tmp, so a bind mount from there fails.
+    with tempfile.TemporaryDirectory(prefix="hone-v3-patch-", dir=root.parent) as scratch_name:
         patch_path = Path(scratch_name) / "submission.diff"
         patch_path.write_bytes(patch)
         patch_path.chmod(0o444)

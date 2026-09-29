@@ -552,7 +552,8 @@ def evaluate_terminal(
         )
 
     try:
-        with tempfile.TemporaryDirectory(prefix="hone-v3-submission-") as temporary:
+        # Beside the workspace, not in the system temp directory: see patch.py.
+        with tempfile.TemporaryDirectory(prefix="hone-v3-submission-", dir=root.parent) as temporary:
             submission = Path(temporary)
             script_path = submission / "script.sh"
             script_path.write_bytes(script)
