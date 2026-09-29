@@ -57,6 +57,7 @@ miners' workspaces, the network, or the trusted result record. Infrastructure
 or protocol failures abandon the round without changing miner scores.
 
 The complete V3 contract is documented in [`docs/V3_TASKS.md`](docs/V3_TASKS.md).
+Miners can grade a patch against a real retired task with `scripts/try_task.py`; see [`docs/DEMO_MINER.md`](docs/DEMO_MINER.md).
 
 ## Demo miner
 

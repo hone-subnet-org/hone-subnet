@@ -17,6 +17,26 @@ Workspace preparation and all model turns share the solve deadline, reserving
 solve latency. The miner needs local disk space for the compressed archive, its
 expanded tar stream, and extracted files for each concurrent solve.
 
+
+## Try a real task locally
+
+`tests/fixtures/v3-yamlcpp-e6225d04` is a task the problem server issued once
+and retired: yaml-cpp with a private feature, two planted defects, six hidden
+checks and a reference fix. It lets you check your whole setup before mining:
+
+```
+python scripts/try_task.py extract /path/to/work      # workspace + instruction
+# produce a unified diff against that workspace with your own miner
+python scripts/try_task.py grade /path/to/fix.diff    # graded in the pinned sandbox
+```
+
+Grading needs Docker and the pinned sandbox image, pulled with
+`docker pull "$(python -c 'from rlvr.policy import RELEASE_POLICY; print(RELEASE_POLICY.v3_image)')"`.
+The output is the validator's verdict: status, reason code, every check's
+outcome, and for a failed check the same display a failure notice carries.
+`tests/fixtures/v3-yamlcpp-e6225d04/reference.diff` passes all six checks;
+applying only its first file fails at the fourth.
+
 ## Setup
 
 Requirements:
