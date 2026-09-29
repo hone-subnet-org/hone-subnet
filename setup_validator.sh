@@ -11,6 +11,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${REPO_ROOT}"
 
+"${REPO_ROOT}/scripts/require_service_user.sh" setup_validator
+
 wallet_name=""
 wallet_hotkey=""
 while (( $# )); do
@@ -80,7 +82,14 @@ echo "[setup_validator] installing the pinned validator dependencies"
 .venv/bin/python -m pip install -e '.[chain]'
 
 if [[ ! -f ".env" ]]; then
-  cp .env.example .env
+  cat > .env <<'ENV'
+# Only the wallet is required. Optional settings and their defaults are
+# listed in .env.example; add a line here to change one.
+NETUID=5
+SUBTENSOR_NETWORK=finney
+WALLET_NAME=YOUR_WALLET_NAME
+WALLET_HOTKEY=YOUR_WALLET_HOTKEY
+ENV
   chmod 0600 .env
   echo "[setup_validator] created .env"
 fi
