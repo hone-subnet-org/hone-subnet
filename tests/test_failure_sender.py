@@ -368,3 +368,30 @@ async def test_sender_to_demo_miner_with_real_signatures(monkeypatch):
     assert any("check_failed" in line for line in printed)
     assert printed[-1] == "[demo-miner] feedback:   " + DISPLAY
     assert all(PRIVATE not in line for line in printed)
+
+
+@pytest.mark.parametrize("refusal", [400, 413])
+async def test_a_miner_that_refuses_the_display_gets_the_reason_alone_once(refusal):
+    received = []
+
+    async def handler(request):
+        failure = json.loads(await request.aread())["failure"]
+        received.append(failure)
+        return httpx.Response(refusal if failure["failed_check"] is not None else 200)
+
+    assert await deliver(outcome(evaluation()), handler) == 1
+    assert [item["failed_check"] for item in received] == [DISPLAY, None]
+    assert received[1] == {"version": 1, "reason_code": "check_failed", "failed_check": None}
+
+
+@pytest.mark.parametrize("status,with_display", [(400, False), (413, False), (500, True), (404, True)])
+async def test_other_refusals_are_not_followed_up(status, with_display):
+    requests = []
+
+    async def handler(request):
+        requests.append(await request.aread())
+        return httpx.Response(status)
+
+    result = outcome(evaluation(display=DISPLAY if with_display else None))
+    assert await deliver(result, handler) == 0
+    assert len(requests) == 1

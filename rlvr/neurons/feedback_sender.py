@@ -70,6 +70,12 @@ def build_notice(
     return None
 
 
+def reason_only(notice: MinerFailureNotice) -> MinerFailureNotice:
+    return notice.model_copy(
+        update={"failure": FailureExplanation(version=1, reason_code=notice.failure.reason_code)}
+    )
+
+
 async def send_failure_notices(
     result,
     solvers: Sequence[LiveSolverClient],
@@ -127,26 +133,34 @@ async def send_failure_notices(
     limit = asyncio.Semaphore(NOTICE_CONCURRENCY)
     delivered = 0
 
+    async def post(client: LiveSolverClient, notice: MinerFailureNotice) -> int:
+        # Sign after the gate, so the signature is fresh when it goes out.
+        body = serialize_failure_notice(notice)
+        headers = sign_message(wallet, body, signed_for=client.hotkey)
+        headers["Content-Type"] = "application/json"
+        headers["Content-Length"] = str(len(body))
+        async with http.stream(
+            "POST",
+            f"{client.url}{NOTICE_PATH}",
+            content=body,
+            headers=headers,
+            timeout=NOTICE_TIMEOUT_S,
+            follow_redirects=False,
+        ) as response:
+            # The body is never read: the ack is an observation, not evidence.
+            return response.status_code
+
     async def deliver(client: LiveSolverClient, notice: MinerFailureNotice) -> None:
         nonlocal delivered
         permit = await client.gate.acquire()
         try:
-            # Sign after the gate, so the signature is fresh when it goes out.
-            body = serialize_failure_notice(notice)
-            headers = sign_message(wallet, body, signed_for=client.hotkey)
-            headers["Content-Type"] = "application/json"
-            headers["Content-Length"] = str(len(body))
-            async with http.stream(
-                "POST",
-                f"{client.url}{NOTICE_PATH}",
-                content=body,
-                headers=headers,
-                timeout=NOTICE_TIMEOUT_S,
-                follow_redirects=False,
-            ) as response:
-                # The body is never read: the ack is an observation, not evidence.
-                if response.status_code == 200:
-                    delivered += 1
+            status = await post(client, notice)
+            if status in (400, 413) and notice.failure.failed_check is not None:
+                # A miner on an older release refuses a display larger than its
+                # own cap. It still gets the reason, once.
+                status = await post(client, reason_only(notice))
+            if status == 200:
+                delivered += 1
         finally:
             permit.release()
 

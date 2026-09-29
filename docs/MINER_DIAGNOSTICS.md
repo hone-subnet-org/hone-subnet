@@ -155,7 +155,9 @@ the number of checks.
 
 Delivery is deliberately cheap and forgettable. One attempt per miner, no retries
 and no redirects, at most 8 in flight, 2 seconds for one exchange and 5 seconds for
-the whole batch, at most 1024 recipients. An old miner without the route, an
+the whole batch, at most 1024 recipients. The one exception: a miner that refuses
+a notice with a display as too large (400 or 413), as a miner on an older release
+does, is sent the reason alone, once. An old miner without the route, an
 offline miner, or a slow one simply gets nothing. Nothing here can change a grade, a
 score or a weight, and the round is already finished when it runs. A notice is sent
 only for a completed round, only to a registration the round actually assigned and
