@@ -4,7 +4,7 @@ Validators write one round outcome and one evaluation record for each assigned
 miner to `v3_evaluations.jsonl`, beside the configured score-state file. Each
 line is a JSON object. These records are local to the
 validator; they are never sent anywhere. Separately, and on by default, a
-validator sends each failed miner a short notice about its own failure, straight
+validator sends each graded miner a short notice about its own result, straight
 to that miner. See "Failure notices sent to miners" below.
 
 ```bash
@@ -131,9 +131,9 @@ problem server or to a miner.
 ## Failure notices sent to miners
 
 When a graded round finishes, the validator sends one small signed message to each
-miner whose submission failed or was rejected, straight to that miner's axon. There
-is no problem server involved and nothing is stored centrally. Two settings control
-it, both on by default:
+miner it graded, straight to that miner's axon: `passed`, or the reason the
+submission failed or was rejected. There is no problem server involved and nothing
+is stored centrally. Two settings control it, both on by default:
 
 - `VALIDATOR_FAILURE_NOTICES` sends the notices at all.
 - `VALIDATOR_FAILED_CHECK_DETAILS` adds the failing check's command and expected
@@ -146,9 +146,9 @@ holding `version`, `reason_code` and an optional `failed_check` display. For an
 inline check the display carries the check's script itself, so the miner sees the
 test it failed.
 
-The reason codes are the miner and submission codes tabled above. A round or
-infrastructure cause, or a missing code, is reported as the generic
-`evaluation_failed`. The `failed_check` display is only ever attached to
+The reason codes are the miner and submission codes tabled above, plus `passed`
+for a submission that passed every check. A round or infrastructure cause, or a
+missing code, is reported as the generic `evaluation_failed`. The `failed_check` display is only ever attached to
 `check_failed` at the check stage, and it is the same six-line text described
 below. It never contains the miner's own output, the check id, its position, or
 the number of checks.
@@ -176,6 +176,12 @@ The reference miner adds the route and prints what it receives, for example:
 [demo-miner] feedback:   Required exit code: 0
 [demo-miner] feedback:   Required stdout: "red-fox\n"
 [demo-miner] feedback:   Required stderr: not checked
+```
+
+A pass is the header alone:
+
+```
+[demo-miner] feedback: passed challenge chal-8f21 task 9c4f000000000000
 ```
 
 Nothing is written to disk. Operators who want history should capture the miner's

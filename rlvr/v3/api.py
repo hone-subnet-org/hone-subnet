@@ -299,8 +299,10 @@ class CommitRevealResponse(WireModel):
 
 
 class FailureExplanation(WireModel):
+    """How one graded submission did: `passed`, or the reason it did not."""
+
     version: exact_int_literal(1)
-    reason_code: MinerReason | Literal["evaluation_failed"]
+    reason_code: MinerReason | Literal["evaluation_failed", "passed"]
     failed_check: str | None = None
 
     @field_validator("failed_check")

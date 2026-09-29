@@ -52,7 +52,7 @@ def test_notice_round_trips_with_exact_self_describing_shape():
     }
 
 
-@pytest.mark.parametrize("reason", [*MinerReason, "evaluation_failed"])
+@pytest.mark.parametrize("reason", [*MinerReason, "evaluation_failed", "passed"])
 def test_notice_supports_reason_only(reason):
     original = notice(failure=FailureExplanation(version=1, reason_code=reason))
     assert MinerFailureNotice.model_validate_json(serialize_failure_notice(original)) == original
@@ -87,6 +87,7 @@ def test_notice_rejects_noncontract_data(changes):
     {"reason_code": "arbitrary private reason"},
     {"failed_check": "x" * FAILED_CHECK_MAX_BYTES},  # escaped, it exceeds the cap
     {"reason_code": MinerReason.TIMEOUT},
+    {"reason_code": "passed"},
 ])
 @pytest.mark.filterwarnings("ignore:Pydantic serializer warnings:UserWarning")
 def test_notice_serializer_revalidates_unchecked_nested_copies(changes):

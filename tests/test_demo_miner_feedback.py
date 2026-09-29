@@ -408,6 +408,14 @@ async def test_notice_receiver_requires_exact_served_task_and_registration(
     assert (await deliver_notice(miner))[0] == 200
 
 
+async def test_pass_notice_prints_the_reason_alone(receiver):
+    miner, output = receiver
+    body = notice_body(failure=FailureExplanation(version=1, reason_code="passed"))
+    remember_notice(miner, body)
+    assert await deliver_notice(miner, body) == (200, {"accepted": True})
+    assert output == [[PREFIX + "passed challenge challenge task " + "a" * 16]]
+
+
 async def test_fresh_duplicate_notice_is_acknowledged_but_printed_once(receiver):
     miner, output = receiver
     body = notice_body()
@@ -561,6 +569,7 @@ async def test_failure_route_honors_a_smaller_configured_body_limit(
                 "failed_check": "x" * FAILED_CHECK_MAX_BYTES,  # over the cap once escaped
             }
         },
+        {"failure": {"version": 1, "reason_code": "passed", "failed_check": "not allowed"}},
     ],
 )
 async def test_notice_rejects_invalid_wire_without_consuming_task_eligibility(

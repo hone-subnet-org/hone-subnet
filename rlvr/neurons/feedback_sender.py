@@ -1,6 +1,7 @@
-"""Tell each failed miner why it failed, straight after a graded round.
+"""Tell each graded miner how it did, straight after a graded round.
 
-Best effort by design: one signed request per failed miner, no retries, bounded
+A miner that passed hears `passed`; one that did not hears the reason. Best
+effort by design: one signed request per graded miner, no retries, bounded
 concurrency and a deadline for the whole batch. Nothing here can change a grade,
 a score or a weight, and every failure is swallowed.
 """
@@ -38,9 +39,12 @@ def build_notice(
 ) -> MinerFailureNotice | None:
     """Build one notice, or None when this outcome does not earn one."""
 
-    if evaluation_status not in ("failed", "rejected"):
+    if evaluation_status == "passed":
+        code = "passed"
+    elif evaluation_status in ("failed", "rejected"):
+        code = reason_code if type(reason_code) is MinerReason else "evaluation_failed"
+    else:
         return None
-    code = reason_code if type(reason_code) is MinerReason else "evaluation_failed"
     display = (
         failed_check
         if include_details
@@ -74,7 +78,7 @@ async def send_failure_notices(
     http: httpx.AsyncClient,
     include_details: bool,
 ) -> int:
-    """Send one notice per failed miner. Returns how many were accepted.
+    """Send one notice per graded miner. Returns how many were accepted.
 
     Only a completed round, only the miners it graded, and only to the exact
     registration that was dispatched.
@@ -113,10 +117,12 @@ async def send_failure_notices(
             continue
         seen.add(registration)
         jobs.append((client, notice))
-        if len(jobs) >= NOTICE_MAX_RECIPIENTS:
-            break
     if not jobs:
         return 0
+    # Failures first: when the batch runs out of room or time, it is passes that
+    # go unsent.
+    jobs.sort(key=lambda job: job[1].failure.reason_code == "passed")
+    del jobs[NOTICE_MAX_RECIPIENTS:]
 
     limit = asyncio.Semaphore(NOTICE_CONCURRENCY)
     delivered = 0
