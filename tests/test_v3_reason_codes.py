@@ -457,3 +457,30 @@ def test_missing_gold_reference_at_run_time_is_verifier_unavailable(tmp_path, ru
     )
     assert_classified(verdict, "abandoned", RoundReason.VERIFIER_UNAVAILABLE, Stage.CHECK)
     assert [check.outcome for check in verdict.checks] == ["skipped", "skipped"]
+
+
+# --------------------------------------------------------------------------- #
+# Container inputs must live where the Docker daemon can see them
+# --------------------------------------------------------------------------- #
+def test_container_inputs_live_beside_the_workspace_not_in_the_system_temp_dir(tmp_path, runner, monkeypatch):
+    """The daemon is a separate service; under systemd PrivateTmp it cannot see
+    this process's /tmp, so a bind mount from there fails and the round is
+    abandoned. Both the terminal script and the repository patch are therefore
+    written beside the miner's workspace, which the daemon already mounts."""
+    import tempfile
+
+    # Whatever the default temp location is, it must stay unused: point it at
+    # a directory that has to remain empty.
+    forbidden = tmp_path / "forbidden-system-tmp"
+    forbidden.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(forbidden))
+    # terminal: the script the container runs
+    eval_term(tmp_path, runner, None, script=b"true\n")
+    script_request = next(r for r in runner.requests if r.name.endswith("-script"))
+    script_host = next(m.host for m in script_request.mounts if m.container == "/submission")
+    assert script_host.parent == tmp_path  # beside "env", the workspace
+    # repository: the patch the container applies
+    _, fake = container_apply(tmp_path, monkeypatch, result(exit_code=0), result(exit_code=0))
+    patch_host = next(m.host for m in fake.requests[0].mounts if m.container == "/submission.diff")
+    assert patch_host.parent.parent == tmp_path  # beside "ws", the workspace
+    assert list(forbidden.iterdir()) == []  # nothing went to the default temp location
