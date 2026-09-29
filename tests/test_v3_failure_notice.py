@@ -11,6 +11,7 @@ from rlvr.v3.api import (
     MinerFailureNotice,
     serialize_failure_notice,
 )
+from rlvr.v3.feedback import FAILED_CHECK_MAX_BYTES
 from rlvr.v3.reasons import MinerReason
 
 
@@ -84,7 +85,7 @@ def test_notice_rejects_noncontract_data(changes):
 @pytest.mark.parametrize("changes", [
     {"version": True},
     {"reason_code": "arbitrary private reason"},
-    {"failed_check": "x" * 2047},
+    {"failed_check": "x" * FAILED_CHECK_MAX_BYTES},  # escaped, it exceeds the cap
     {"reason_code": MinerReason.TIMEOUT},
 ])
 @pytest.mark.filterwarnings("ignore:Pydantic serializer warnings:UserWarning")
@@ -114,5 +115,5 @@ def test_maximum_escaped_identifiers_and_display_fit_request_limit():
         ),
     )
     body = serialize_failure_notice(original)
-    assert len(body) < FAILURE_NOTICE_MAX_BYTES == 8192
+    assert len(body) < FAILURE_NOTICE_MAX_BYTES == 320 * 1024
     assert MinerFailureNotice.model_validate_json(body) == original

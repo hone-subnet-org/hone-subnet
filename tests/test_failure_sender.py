@@ -13,6 +13,7 @@ from rlvr.config import Settings
 from rlvr.neurons import feedback_sender as sender
 from rlvr.neurons.live import LiveSolverClient, SendGate
 from rlvr.v3.api import MinerFailureNotice
+from rlvr.v3.feedback import FAILED_CHECK_MAX_BYTES
 from rlvr.v3.grading import EvaluationResult
 from rlvr.v3.reasons import MinerReason, RoundReason, Stage
 from rlvr.v3.round import MinerEvaluation, RoundResult, compute_round_payments
@@ -110,7 +111,7 @@ async def test_only_assigned_exact_registrations_receive_one_notice():
     ("failed", None, Stage.CHECK, DISPLAY, True, "evaluation_failed"),
     ("failed", PRIVATE, Stage.CHECK, DISPLAY, True, "evaluation_failed"),
     ("failed", RoundReason.VALIDATOR_ERROR, Stage.CHECK, DISPLAY, True, "evaluation_failed"),
-    ("failed", MinerReason.CHECK_FAILED, Stage.CHECK, "x" * 2047, True, "check_failed"),
+    ("failed", MinerReason.CHECK_FAILED, Stage.CHECK, "x" * FAILED_CHECK_MAX_BYTES, True, "check_failed"),  # over the cap once escaped
     ("failed", MinerReason.CHECK_FAILED, Stage.CHECK, {"actual": PRIVATE}, True, "check_failed"),
 ])
 async def test_reason_only_fallback(status, code, stage, display, details, reason):

@@ -13,8 +13,6 @@ from rlvr import protocol
 from rlvr.neurons import demo_miner
 from rlvr.neurons.demo_miner import (
     FEEDBACK_PRINT_HEADER_CHARS,
-    FEEDBACK_PRINT_MAX_CHARS,
-    FEEDBACK_PRINT_MAX_LINES,
     SERVED_TASK_LIMIT,
     SERVED_TASK_TTL_S,
     DemoMiner,
@@ -31,7 +29,7 @@ from rlvr.v3.api import (
     MinerTaskResponse,
     serialize_failure_notice,
 )
-from rlvr.v3.feedback import FAILED_CHECK_MAX_BYTES
+from rlvr.v3.feedback import FAILED_CHECK_MAX_BYTES, escaped_bytes
 from rlvr.v3.reasons import MinerReason
 
 IDENTITY = ("validator", "challenge", "task", 7, "miner")
@@ -216,29 +214,29 @@ def test_largest_legal_ascii_failed_check_keeps_the_entire_expected_value():
     assert lines[-2] == DISPLAY_PREFIX + f'Required stdout: "{expected}"'
 
 
-def test_display_line_limit_includes_header_and_preserves_empty_lines():
-    display = "\n".join(["check"] * (FEEDBACK_PRINT_MAX_LINES - 2) + [""])
+def test_display_of_many_empty_lines_at_the_cap_prints_every_line():
+    # Each newline costs two escaped bytes, so this display sits exactly at the cap.
+    newlines = (FAILED_CHECK_MAX_BYTES - 2) // 2
+    display = "\n" * newlines
+    assert escaped_bytes(display) == FAILED_CHECK_MAX_BYTES
     lines = feedback_lines("check_failed", display)
-    assert len(lines) == FEEDBACK_PRINT_MAX_LINES
-    assert lines[-1] == DISPLAY_PREFIX
-    omitted = feedback_lines("check_failed", display + "\none more")
-    assert omitted == [
+    assert lines == [PREFIX + "check_failed"] + [DISPLAY_PREFIX] * (newlines + 1)
+    assert feedback_lines("check_failed", display + "\n") == [
         PREFIX + "check_failed",
-        DISPLAY_PREFIX + "display omitted: larger than this miner prints",
+        DISPLAY_PREFIX + "display omitted: larger than a validator may send",
     ]
 
 
 @pytest.mark.parametrize("value", ["x", "\x1b", "\U0001f600"])
-def test_display_character_limit_uses_escaped_length_and_never_slices_a_test(value):
-    escaped_size = len(printable(value))
-    fitting = value * (FEEDBACK_PRINT_MAX_CHARS // escaped_size)
+def test_display_limit_is_the_validator_bound_and_never_slices_a_test(value):
+    fitting = value * ((FAILED_CHECK_MAX_BYTES - 2) // (escaped_bytes(value) - 2))
     assert feedback_lines("check_failed", fitting) == [
         PREFIX + "check_failed",
         DISPLAY_PREFIX + printable(fitting),
     ]
     assert feedback_lines("check_failed", fitting + value) == [
         PREFIX + "check_failed",
-        DISPLAY_PREFIX + "display omitted: larger than this miner prints",
+        DISPLAY_PREFIX + "display omitted: larger than a validator may send",
     ]
 
 
@@ -468,7 +466,7 @@ async def test_terminal_output_errors_do_not_escape_notice_handling(monkeypatch,
 
 
 @pytest.mark.parametrize("chunked", [False, True])
-async def test_failure_route_rejects_body_over_8192_before_handler(
+async def test_failure_route_rejects_body_over_the_cap_before_handler(
     receiver, monkeypatch, chunked
 ):
     miner, output = receiver
@@ -495,7 +493,7 @@ async def test_failure_route_rejects_body_over_8192_before_handler(
     assert output == []
 
 
-async def test_failure_route_accepts_exact_8192_with_valid_signature(receiver):
+async def test_failure_route_accepts_a_body_at_the_cap_with_valid_signature(receiver):
     miner, output = receiver
     body = notice_body()
     remember_notice(miner, body)
@@ -560,7 +558,7 @@ async def test_failure_route_honors_a_smaller_configured_body_limit(
             "failure": {
                 "version": 1,
                 "reason_code": "check_failed",
-                "failed_check": "x" * 2048,
+                "failed_check": "x" * FAILED_CHECK_MAX_BYTES,  # over the cap once escaped
             }
         },
     ],

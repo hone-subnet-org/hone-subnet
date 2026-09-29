@@ -36,7 +36,7 @@ from .wire import (
 
 ProtocolVersion = exact_int_literal(3)
 VerifierPolicy = Literal["command-gold-digest-v1"]
-FAILURE_NOTICE_MAX_BYTES = 8 * 1024
+FAILURE_NOTICE_MAX_BYTES = 320 * 1024  # the display cap plus the envelope
 TRACE_CHECK_MAX_BYTES = 4 * 1024
 
 EPISTULA_HEADERS = (

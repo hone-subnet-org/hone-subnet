@@ -19,6 +19,7 @@ from rlvr.v3.api import (
 )
 from rlvr.v3.artifacts import ArtifactGrant
 from rlvr.v3.client import V3ProblemServerClient
+from rlvr.v3.feedback import FAILED_CHECK_MAX_BYTES
 from rlvr.v3.grading import EvaluationResult
 from rlvr.v3.reasons import MinerReason, RoundReason, Stage
 from rlvr.v3.release import round_policy
@@ -139,7 +140,7 @@ def test_failure_schema_rejects_noncontract_data(changes):
 @pytest.mark.parametrize("unit", ["x", "\n", "é", "😀"])
 def test_failed_check_cap_counts_json_escaping_and_quotes(unit):
     per_unit = len(json.dumps(unit, ensure_ascii=True).encode("ascii")) - 2
-    fitting = unit * (2046 // per_unit)
+    fitting = unit * ((FAILED_CHECK_MAX_BYTES - 2) // per_unit)
     FailureExplanation(
         version=1, reason_code=MinerReason.CHECK_FAILED, failed_check=fitting
     )
