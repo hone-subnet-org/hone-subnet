@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
 from rlvr.v3.api import (
     EPISTULA_HEADERS,
+    FEEDBACK_LATENCY_MAX_MS,
     ChallengeCommitRequest,
     ChallengeFeedbackRequest,
     ChallengeFeedbackResponse,
@@ -20,6 +23,7 @@ from rlvr.v3.api import (
 )
 from rlvr.v3.artifacts import ArtifactRef, MinerSlotSet, UploadSlot
 from rlvr.v3.identity import RepositoryTaskIdentity, compute_task_id
+from rlvr.v3.reasons import MinerReason
 
 HEX_A = "a" * 64
 HEX_B = "b" * 64
@@ -311,6 +315,14 @@ def test_feedback_is_strict_bounded_unique_and_serialized_once():
         verdicts=[verdict],
     )
     assert serialize_feedback_request(request) == request.model_dump_json().encode()
+    assert json.loads(serialize_feedback_request(request))["verdicts"][0] == {
+        "uid": 7,
+        "hotkey": "hk-7",
+        "passed": False,
+        "grading_duration_ms": 123,
+        "response_latency_ms": None,
+        "reason_code": None,
+    }
     with pytest.raises(ValidationError):
         FeedbackVerdict(uid=7, hotkey="hk-7", passed=1, grading_duration_ms=0)
     with pytest.raises(ValidationError):
@@ -335,3 +347,29 @@ def test_incoming_v3_models_require_explicit_protocol_version():
         payload.pop("protocol_version")
         with pytest.raises(ValidationError):
             model(**payload)
+
+
+def test_feedback_verdict_carries_latency_and_a_reason_only_for_a_miss():
+    failed = FeedbackVerdict(
+        uid=7,
+        hotkey="hk-7",
+        passed=False,
+        grading_duration_ms=1,
+        response_latency_ms=FEEDBACK_LATENCY_MAX_MS,
+        reason_code=MinerReason.CHECK_FAILED,
+    )
+    assert json.loads(failed.model_dump_json())["reason_code"] == "check_failed"
+    passed = FeedbackVerdict(
+        uid=7, hotkey="hk-7", passed=True, grading_duration_ms=1, response_latency_ms=0
+    )
+    assert passed.reason_code is None
+    for bad in (
+        {"passed": True, "reason_code": MinerReason.CHECK_FAILED},
+        {"passed": False, "response_latency_ms": FEEDBACK_LATENCY_MAX_MS + 1},
+        {"passed": False, "response_latency_ms": -1},
+        {"passed": False, "response_latency_ms": 1.5},
+        {"passed": False, "reason_code": "invented"},
+        {"passed": False, "reason_code": "validator_error"},
+    ):
+        with pytest.raises(ValidationError):
+            FeedbackVerdict(uid=7, hotkey="hk-7", grading_duration_ms=1, **bad)

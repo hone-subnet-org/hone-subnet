@@ -357,11 +357,24 @@ class TraceCheckRequest(WireModel):
         return self
 
 
+FEEDBACK_LATENCY_MAX_MS = 3_600_000
+
+
 class FeedbackVerdict(WireModel):
     uid: UID
     hotkey: BoundedIdentifier
     passed: StrictBool
     grading_duration_ms: Annotated[int, Field(ge=0, le=SAFE_INTEGER_MAX)]
+    # Dispatch to signed response, as the validator measured it; None when unknown.
+    response_latency_ms: Annotated[int, Field(ge=0, le=FEEDBACK_LATENCY_MAX_MS)] | None = None
+    # Why a submission did not pass; the server refuses a reason on a pass.
+    reason_code: MinerReason | None = None
+
+    @model_validator(mode="after")
+    def reason_only_when_not_passed(self) -> FeedbackVerdict:
+        if self.passed and self.reason_code is not None:
+            raise ValueError("a passed verdict carries no reason code")
+        return self
 
 
 class ChallengeFeedbackRequest(WireModel):

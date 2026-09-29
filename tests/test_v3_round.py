@@ -14,6 +14,7 @@ import pytest
 from rlvr.scoring.eval_engine import EvalEngine
 from rlvr.v3.api import (
     EPISTULA_HEADERS,
+    FEEDBACK_LATENCY_MAX_MS,
     ChallengeFeedbackRequest,
     ChallengeFeedbackResponse,
     CommitRevealResponse,
@@ -558,6 +559,14 @@ def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
         type(item.grading_duration_ms) is int and item.grading_duration_ms >= 0
         for item in feedback_requests[0].verdicts
     )
+    assert {item.uid: item.response_latency_ms for item in feedback_requests[0].verdicts} == {
+        uid: by_uid[uid].latency_ms for uid in (1, 2, 3)
+    }
+    assert {item.uid: item.reason_code for item in feedback_requests[0].verdicts} == {
+        1: None,
+        2: by_uid[2].result.reason_code,
+        3: by_uid[3].result.reason_code,
+    }
     payments = compute_round_payments(
         result, speed_half_life_ms=180_000, speed_floor=0.95
     )
@@ -616,3 +625,60 @@ def test_scoring_ignores_stale_or_unknown_registrations():
     )
     assert engine.hotkeys[1] == "current-1"
     assert not engine.histories
+
+
+def test_feedback_verdicts_carry_latency_and_reason_from_the_evaluation():
+    class Client:
+        request = None
+
+        async def feedback(self, request):
+            self.request = request
+            return True
+
+    def grant(uid):
+        return ArtifactGrant(
+            uid=uid,
+            hotkey=f"hk-{uid}",
+            upload_id="upload",
+            sha256="b" * 64,
+            size_bytes=1,
+            format="unified_diff_v1",
+            read_url="https://uploads.invalid/read",
+        )
+
+    def evaluation(uid, latency, status, code):
+        return MinerEvaluation(
+            uid, f"hk-{uid}", latency, EvaluationResult(status, "" if status == "passed" else "why", (), None, code), 3
+        )
+
+    client = Client()
+    assert asyncio.run(
+        _send_diagnostic_feedback(
+            client,
+            "challenge",
+            "a" * 64,
+            [grant(uid) for uid in range(1, 8)],
+            [
+                evaluation(1, 1_234, "passed", None),
+                evaluation(2, 5, "failed", MinerReason.CHECK_FAILED),
+                evaluation(3, FEEDBACK_LATENCY_MAX_MS + 1, "rejected", MinerReason.PATCH_REJECTED),
+                evaluation(4, 0, "failed", RoundReason.VALIDATOR_ERROR),
+                evaluation(5, 1.5, "passed", MinerReason.CHECK_FAILED),  # a stray code on a pass
+                evaluation(6, -1, "failed", "check_failed"),  # a raw string is not a code
+                evaluation(7, True, "failed", None),
+            ],
+        )
+    )
+    verdicts = {
+        item.uid: (item.passed, item.response_latency_ms, item.reason_code)
+        for item in client.request.verdicts
+    }
+    assert verdicts == {
+        1: (True, 1_234, None),
+        2: (False, 5, MinerReason.CHECK_FAILED),
+        3: (False, None, MinerReason.PATCH_REJECTED),
+        4: (False, 0, None),
+        5: (True, None, None),
+        6: (False, None, None),
+        7: (False, None, None),
+    }
