@@ -80,8 +80,9 @@ class Settings(BaseSettings):
     # into deadline-length waves.
     validator_dispatch_concurrency: int = Field(default=256, ge=1, le=1024)
     # Miners graded at the same time. Each one may hold a sandbox container at
-    # the full memory limit plus a copy of the task workspace on disk.
-    validator_grading_concurrency: int = Field(default=2, ge=1, le=16)
+    # the full memory limit plus a copy of the task workspace on disk. Unset
+    # means sized from the host's CPUs, memory and free disk at startup.
+    validator_grading_concurrency: int | None = Field(default=None, ge=1, le=16)
     # Requests waiting for one of these short-lived send-start slots remain
     # unsigned. The slot is released after the request body reaches the HTTP
     # transport, so miner solve time does not serialize the fan-out.
