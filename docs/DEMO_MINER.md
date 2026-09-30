@@ -20,22 +20,35 @@ expanded tar stream, and extracted files for each concurrent solve.
 
 ## Try a real task locally
 
-`tests/fixtures/v3-yamlcpp-e6225d04` is a task the problem server issued once
-and retired: yaml-cpp with a private feature, two planted defects, six hidden
-checks and a reference fix. It lets you check your whole setup before mining:
+Two tasks the problem server issued once and retired live under
+`tests/fixtures/`, one of each kind. They let you check your whole setup
+before mining:
+
+- `v3-yamlcpp-e6225d04`, a repository task: yaml-cpp with a private feature,
+  two planted defects, six hidden checks and a reference fix. The answer is a
+  unified diff.
+- `v3-terminal-urlooker-651460ec`, a terminal task: a pinned Go checkout plus
+  incident material, six hidden checks and a reference script. The answer is
+  a bash script that runs in the workspace and leaves the required results.
 
 ```
 python scripts/try_task.py extract /path/to/work      # workspace + instruction
 # produce a unified diff against that workspace with your own miner
 python scripts/try_task.py grade /path/to/fix.diff    # graded in the pinned sandbox
+
+# the terminal task
+python scripts/try_task.py --fixture tests/fixtures/v3-terminal-urlooker-651460ec extract /path/to/work
+python scripts/try_task.py --fixture tests/fixtures/v3-terminal-urlooker-651460ec grade /path/to/solve.sh
 ```
 
 Grading needs Docker and the pinned sandbox image, pulled with
 `docker pull "$(python -c 'from rlvr.policy import RELEASE_POLICY; print(RELEASE_POLICY.v3_image)')"`.
 The output is the validator's verdict: status, reason code, every check's
 outcome, and for a failed check the same display a failure notice carries.
-`tests/fixtures/v3-yamlcpp-e6225d04/reference.diff` passes all six checks;
-applying only its first file fails at the fourth.
+`v3-yamlcpp-e6225d04/reference.diff` passes all six checks; applying only its
+first file fails at the fourth. `v3-terminal-urlooker-651460ec/reference.sh`
+passes all six; an empty script fails at the first, and the reference script
+followed by a change to the recovery inputs fails at the sixth.
 
 ## Setup
 
