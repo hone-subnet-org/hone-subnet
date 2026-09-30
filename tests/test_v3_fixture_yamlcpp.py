@@ -179,7 +179,7 @@ def test_try_task_extracts_the_workspace_and_prints_the_instruction(tmp_path, ca
     assert not (tmp_path / "missing").exists()
 
 
-def test_try_task_rejects_an_oversized_patch_without_reading_it(tmp_path, capsys):
+def test_try_task_rejects_an_oversized_patch_after_reading_at_most_the_limit(tmp_path, capsys):
     import importlib.util
 
     spec = importlib.util.spec_from_file_location("try_task", Path(__file__).parent.parent / "scripts" / "try_task.py")
@@ -188,7 +188,7 @@ def test_try_task_rejects_an_oversized_patch_without_reading_it(tmp_path, capsys
     limit = RELEASE_POLICY.v3_patch_bytes
     big = tmp_path / "big.diff"
     with big.open("wb") as handle:
-        handle.truncate(limit * 8)  # sparse: 8x the limit on disk, nothing to read
+        handle.truncate(limit * 8)  # sparse: 8x the limit on disk
     assert module.main(["grade", str(big)]) == 1
     assert "exceeds" in capsys.readouterr().out
 
