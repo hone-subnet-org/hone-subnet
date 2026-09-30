@@ -1,6 +1,7 @@
-"""Tell each failed miner why it failed, straight after a graded round.
+"""Tell each graded miner how it did, straight after a graded round.
 
-Best effort by design: one signed request per failed miner, no retries, bounded
+A miner that passed hears `passed`; one that did not hears the reason. Best
+effort by design: one signed request per graded miner, no retries, bounded
 concurrency and a deadline for the whole batch. Nothing here can change a grade,
 a score or a weight, and every failure is swallowed.
 """
@@ -38,9 +39,12 @@ def build_notice(
 ) -> MinerFailureNotice | None:
     """Build one notice, or None when this outcome does not earn one."""
 
-    if evaluation_status not in ("failed", "rejected"):
+    if evaluation_status == "passed":
+        code = "passed"
+    elif evaluation_status in ("failed", "rejected"):
+        code = reason_code if type(reason_code) is MinerReason else "evaluation_failed"
+    else:
         return None
-    code = reason_code if type(reason_code) is MinerReason else "evaluation_failed"
     display = (
         failed_check
         if include_details
@@ -66,6 +70,12 @@ def build_notice(
     return None
 
 
+def reason_only(notice: MinerFailureNotice) -> MinerFailureNotice:
+    return notice.model_copy(
+        update={"failure": FailureExplanation(version=1, reason_code=notice.failure.reason_code)}
+    )
+
+
 async def send_failure_notices(
     result,
     solvers: Sequence[LiveSolverClient],
@@ -74,7 +84,7 @@ async def send_failure_notices(
     http: httpx.AsyncClient,
     include_details: bool,
 ) -> int:
-    """Send one notice per failed miner. Returns how many were accepted.
+    """Send one notice per graded miner. Returns how many were accepted.
 
     Only a completed round, only the miners it graded, and only to the exact
     registration that was dispatched.
@@ -113,34 +123,44 @@ async def send_failure_notices(
             continue
         seen.add(registration)
         jobs.append((client, notice))
-        if len(jobs) >= NOTICE_MAX_RECIPIENTS:
-            break
     if not jobs:
         return 0
+    # Failures first: when the batch runs out of room or time, it is passes that
+    # go unsent.
+    jobs.sort(key=lambda job: job[1].failure.reason_code == "passed")
+    del jobs[NOTICE_MAX_RECIPIENTS:]
 
     limit = asyncio.Semaphore(NOTICE_CONCURRENCY)
     delivered = 0
+
+    async def post(client: LiveSolverClient, notice: MinerFailureNotice) -> int:
+        # Sign after the gate, so the signature is fresh when it goes out.
+        body = serialize_failure_notice(notice)
+        headers = sign_message(wallet, body, signed_for=client.hotkey)
+        headers["Content-Type"] = "application/json"
+        headers["Content-Length"] = str(len(body))
+        async with http.stream(
+            "POST",
+            f"{client.url}{NOTICE_PATH}",
+            content=body,
+            headers=headers,
+            timeout=NOTICE_TIMEOUT_S,
+            follow_redirects=False,
+        ) as response:
+            # The body is never read: the ack is an observation, not evidence.
+            return response.status_code
 
     async def deliver(client: LiveSolverClient, notice: MinerFailureNotice) -> None:
         nonlocal delivered
         permit = await client.gate.acquire()
         try:
-            # Sign after the gate, so the signature is fresh when it goes out.
-            body = serialize_failure_notice(notice)
-            headers = sign_message(wallet, body, signed_for=client.hotkey)
-            headers["Content-Type"] = "application/json"
-            headers["Content-Length"] = str(len(body))
-            async with http.stream(
-                "POST",
-                f"{client.url}{NOTICE_PATH}",
-                content=body,
-                headers=headers,
-                timeout=NOTICE_TIMEOUT_S,
-                follow_redirects=False,
-            ) as response:
-                # The body is never read: the ack is an observation, not evidence.
-                if response.status_code == 200:
-                    delivered += 1
+            status = await post(client, notice)
+            if status in (400, 413) and notice.failure.failed_check is not None:
+                # A miner on an older release refuses a display larger than its
+                # own cap. It still gets the reason, once.
+                status = await post(client, reason_only(notice))
+            if status == 200:
+                delivered += 1
         finally:
             permit.release()
 

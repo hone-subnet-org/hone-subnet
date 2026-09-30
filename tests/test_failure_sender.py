@@ -13,6 +13,7 @@ from rlvr.config import Settings
 from rlvr.neurons import feedback_sender as sender
 from rlvr.neurons.live import LiveSolverClient, SendGate
 from rlvr.v3.api import MinerFailureNotice
+from rlvr.v3.feedback import FAILED_CHECK_MAX_BYTES
 from rlvr.v3.grading import EvaluationResult
 from rlvr.v3.reasons import MinerReason, RoundReason, Stage
 from rlvr.v3.round import MinerEvaluation, RoundResult, compute_round_payments
@@ -60,21 +61,24 @@ async def deliver(result, handler, *, include_details=True, registrations=None):
 async def test_signed_direct_notice_preserves_details_without_private_output_or_score_changes():
     result = outcome(evaluation(), evaluation(8, status="passed", display=None))
     before = repr(result)
-    received = []
+    received = {}
 
     async def handler(request):
         body = await request.aread()
         assert request.url.path == "/v3/failure"
-        assert request.url.host == "miner-7"
-        assert protocol.verify_signature(request.headers, body, expected_signed_for="miner-7")
+        notice = MinerFailureNotice.model_validate_json(body)
+        assert request.url.host == f"miner-{notice.uid}"
+        assert protocol.verify_signature(request.headers, body, expected_signed_for=notice.hotkey)
         assert request.headers["Epistula-Signed-By"] == "validator"
         assert PRIVATE.encode() not in body
-        received.append(MinerFailureNotice.model_validate_json(body))
+        received[notice.uid] = notice.failure
         return httpx.Response(200, json={"accepted": True})
 
     await deliver(result, handler)
-    assert len(received) == 1
-    assert received[0].failure.failed_check == DISPLAY
+    assert received[7].reason_code == MinerReason.CHECK_FAILED
+    assert received[7].failed_check == DISPLAY
+    assert received[8].reason_code == "passed"
+    assert received[8].failed_check is None
     assert repr(result) == before
     assert compute_round_payments(result, speed_half_life_ms=180_000, speed_floor=0.95) == {7: 0, 8: 1}
 
@@ -110,7 +114,7 @@ async def test_only_assigned_exact_registrations_receive_one_notice():
     ("failed", None, Stage.CHECK, DISPLAY, True, "evaluation_failed"),
     ("failed", PRIVATE, Stage.CHECK, DISPLAY, True, "evaluation_failed"),
     ("failed", RoundReason.VALIDATOR_ERROR, Stage.CHECK, DISPLAY, True, "evaluation_failed"),
-    ("failed", MinerReason.CHECK_FAILED, Stage.CHECK, "x" * 2047, True, "check_failed"),
+    ("failed", MinerReason.CHECK_FAILED, Stage.CHECK, "x" * FAILED_CHECK_MAX_BYTES, True, "check_failed"),  # over the cap once escaped
     ("failed", MinerReason.CHECK_FAILED, Stage.CHECK, {"actual": PRIVATE}, True, "check_failed"),
 ])
 async def test_reason_only_fallback(status, code, stage, display, details, reason):
@@ -123,6 +127,32 @@ async def test_reason_only_fallback(status, code, stage, display, details, reaso
     await deliver(outcome(evaluation(status=status, code=code, stage=stage, display=display)),
                   handler, include_details=details)
     assert received == [{"version": 1, "reason_code": reason, "failed_check": None}]
+
+
+@pytest.mark.parametrize("code", [None, MinerReason.CHECK_FAILED])
+async def test_pass_earns_a_notice_with_no_display_whatever_the_evaluation_carries(code):
+    received = []
+
+    async def handler(request):
+        received.append(json.loads(await request.aread())["failure"])
+        return httpx.Response(200)
+
+    await deliver(outcome(evaluation(status="passed", code=code, display=DISPLAY)), handler)
+    assert received == [{"version": 1, "reason_code": "passed", "failed_check": None}]
+
+
+async def test_failures_are_sent_before_passes_and_survive_the_recipient_cap(monkeypatch):
+    monkeypatch.setattr(sender, "NOTICE_MAX_RECIPIENTS", 10)
+    result = outcome(*[evaluation(uid, status="passed", display=None) for uid in range(1, 20)],
+                     evaluation(20))
+    order = []
+
+    async def handler(request):
+        order.append(json.loads(await request.aread())["failure"]["reason_code"])
+        return httpx.Response(200)
+
+    await deliver(result, handler)
+    assert order == ["check_failed"] + ["passed"] * 9
 
 
 @pytest.mark.parametrize("failure", ["connect", "sign", "404", "redirect"])
@@ -338,3 +368,30 @@ async def test_sender_to_demo_miner_with_real_signatures(monkeypatch):
     assert any("check_failed" in line for line in printed)
     assert printed[-1] == "[demo-miner] feedback:   " + DISPLAY
     assert all(PRIVATE not in line for line in printed)
+
+
+@pytest.mark.parametrize("refusal", [400, 413])
+async def test_a_miner_that_refuses_the_display_gets_the_reason_alone_once(refusal):
+    received = []
+
+    async def handler(request):
+        failure = json.loads(await request.aread())["failure"]
+        received.append(failure)
+        return httpx.Response(refusal if failure["failed_check"] is not None else 200)
+
+    assert await deliver(outcome(evaluation()), handler) == 1
+    assert [item["failed_check"] for item in received] == [DISPLAY, None]
+    assert received[1] == {"version": 1, "reason_code": "check_failed", "failed_check": None}
+
+
+@pytest.mark.parametrize("status,with_display", [(400, False), (413, False), (500, True), (404, True)])
+async def test_other_refusals_are_not_followed_up(status, with_display):
+    requests = []
+
+    async def handler(request):
+        requests.append(await request.aread())
+        return httpx.Response(status)
+
+    result = outcome(evaluation(display=DISPLAY if with_display else None))
+    assert await deliver(result, handler) == 0
+    assert len(requests) == 1

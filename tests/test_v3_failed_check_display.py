@@ -87,7 +87,6 @@ def test_exact_supported_command_forms(python, script):
     "argv",
     [
         ("/usr/bin/python3",),  # no script
-        ("/usr/bin/python3", "-c", "print('private')"),  # inline code
         ("/usr/bin/python3", "-I", "main.py"),  # any interpreter flag
         ("/usr/bin/python3", "main.py", "secret"),  # script arguments
         ("/usr/bin/python3", "-hidden.py"),  # script token that is an option
@@ -169,7 +168,15 @@ def test_complete_bytes_survive_unicode_and_control_escaping():
 
 
 @pytest.mark.parametrize("field", ["stdin", "expected_stdout", "expected_stderr"])
-@pytest.mark.parametrize("value", [b"\xff", b"x" * 10000, b"\x00" * 600])
+@pytest.mark.parametrize(
+    "value",
+    [
+        b"\xff",
+        b"x" * (feedback.FAILED_CHECK_MAX_BYTES + 1),
+        b"\x00" * (feedback.FAILED_CHECK_MAX_BYTES // 6 + 1),  # escapes six-fold
+    ],
+    ids=["not-utf8", "over-the-cap", "over-the-cap-once-escaped"],
+)
 def test_binary_or_oversized_definition_is_omitted_whole(field, value):
     args = display_inputs(stdin=b"seed", stderr=b"")
     if field == "stdin":
@@ -182,7 +189,7 @@ def test_binary_or_oversized_definition_is_omitted_whole(field, value):
 def test_exact_escaped_size_boundary_never_returns_a_truncated_display():
     args = display_inputs()
     longest = None
-    for size in range(1700, 2050):
+    for size in range(feedback.FAILED_CHECK_MAX_BYTES - 350, feedback.FAILED_CHECK_MAX_BYTES + 2):
         args["expected_stdout"] = b"x" * size
         shown = feedback.render_failed_check(**args)
         if shown is None:
@@ -278,7 +285,9 @@ def test_noncomparison_paths_do_not_build_display_or_change_execution(
 
 
 @pytest.mark.parametrize(
-    "broken", [RuntimeError("display bug"), None, 5, {}, "", "x" * 10000]
+    "broken",
+    [RuntimeError("display bug"), None, 5, {}, "", "x" * (feedback.FAILED_CHECK_MAX_BYTES + 1)],
+    ids=["raises", "none", "int", "dict", "empty", "over-the-cap"],
 )
 def test_display_failures_never_change_grading_fields(
     tmp_path, runner, monkeypatch, broken
@@ -322,7 +331,7 @@ def test_evaluation_rejects_display_on_other_outcomes_and_oversized_text():
                 stage,
                 failed_check="check",
             )
-    for text in ["", 1, "x" * 10000]:
+    for text in ["", 1, "x" * (feedback.FAILED_CHECK_MAX_BYTES + 1)]:
         with pytest.raises(ValueError):
             EvaluationResult(
                 "failed",
@@ -336,8 +345,10 @@ def test_evaluation_rejects_display_on_other_outcomes_and_oversized_text():
 
 
 def test_complete_size_includes_command_and_working_directory():
-    assert render(argv=("/usr/bin/python3", "a" * 2000 + ".py")) is None
-    assert render(cwd="/work/" + "a" * 2000) is None
+    almost = b"x" * (feedback.FAILED_CHECK_MAX_BYTES - 1000)
+    assert render(stdin=almost) is not None
+    assert render(stdin=almost, argv=("/usr/bin/python3", "a" * 1000 + ".py")) is None
+    assert render(stdin=almost, cwd="/work/" + "a" * 1000) is None
 
 
 def test_terminal_invocation_uses_the_existing_single_script_replay(tmp_path, runner):
@@ -410,3 +421,15 @@ def test_rendered_grading_failure_reaches_wire_without_candidate_output(
     assert len(runner.requests) == 1
     assert b"CAPTURED_STDOUT" not in encoded and b"CAPTURED_STDERR" not in encoded
     assert verdict.reason.encode() not in encoded
+
+
+def test_inline_check_shows_the_script_itself():
+    python = "/usr/bin/python3"
+    code = "import sys\nprint(sys.stdin.read().strip().upper())\n"
+    shown = render(argv=(python, "-c", code), cwd="/work")
+    assert shown is not None
+    first = json.loads(shown.splitlines()[0].split(": ", 1)[1])
+    assert first == [python, "-c", feedback.INLINE_SCRIPT_PLACEHOLDER]  # the argv line stays short
+    assert shown.endswith("Inline script:\n" + code)  # the test, verbatim
+    big = "x = 1\n" * (65536 // 6)  # a script at the manifest's per-argument cap still renders
+    assert render(argv=(python, "-c", big), cwd="/work") is not None

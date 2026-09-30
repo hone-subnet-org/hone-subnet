@@ -8,7 +8,10 @@ import posixpath
 from .manifest import InvocationCheck
 from .supervisor import ContainerRequest
 
-FAILED_CHECK_MAX_BYTES = 2_048
+# Large enough for an inline check script (at most 64 KiB in a manifest) once
+# JSON-escaped, plus the expected streams.
+FAILED_CHECK_MAX_BYTES = 256 * 1024
+INLINE_SCRIPT_PLACEHOLDER = "<inline script below>"
 
 _WORK = "/work"
 _INTERPRETERS = ("/usr/bin/python3", "/usr/local/bin/python3")
@@ -84,9 +87,17 @@ def render_failed_check(
         return None
     if request.trusted is not False or request.argv != check.argv:
         return None
-    if len(check.argv) != 2 or check.argv[0] not in _INTERPRETERS:
+    if not _eligible_cwd(request.cwd):
         return None
-    if not _eligible_cwd(request.cwd) or not _eligible_script(check.argv[1], request.cwd):
+    if not check.argv or check.argv[0] not in _INTERPRETERS:
+        return None
+    inline_script: str | None = None
+    if len(check.argv) == 3 and check.argv[1] == "-c":
+        # The test is the script itself: show it.
+        inline_script = check.argv[2]
+        if type(inline_script) is not str or not inline_script:
+            return None
+    elif len(check.argv) != 2 or not _eligible_script(check.argv[1], request.cwd):
         return None
     if type(expected_stdout) is not bytes or type(check.expect.exit_code) is not int:
         return None
@@ -109,16 +120,18 @@ def render_failed_check(
     except UnicodeDecodeError:
         return None
 
-    display = "\n".join(
-        (
-            "Command (argv): "
-            + json.dumps(list(check.argv), ensure_ascii=True, separators=(",", ":")),
-            f"Working directory: {_quote(request.cwd)}",
-            f"Stdin: {_quote(stdin_text)}",
-            f"Required exit code: {check.expect.exit_code}",
-            f"Required stdout: {_quote(stdout_text)}",
-            "Required stderr: "
-            + ("not checked" if stderr_text is None else _quote(stderr_text)),
-        )
-    )
+    shown_argv = list(check.argv)
+    if inline_script is not None:
+        shown_argv[2] = INLINE_SCRIPT_PLACEHOLDER
+    lines = [
+        "Command (argv): " + json.dumps(shown_argv, ensure_ascii=True, separators=(",", ":")),
+        f"Working directory: {_quote(request.cwd)}",
+        f"Stdin: {_quote(stdin_text)}",
+        f"Required exit code: {check.expect.exit_code}",
+        f"Required stdout: {_quote(stdout_text)}",
+        "Required stderr: " + ("not checked" if stderr_text is None else _quote(stderr_text)),
+    ]
+    if inline_script is not None:
+        lines += ["Inline script:", inline_script]
+    display = "\n".join(lines)
     return display if escaped_bytes(display) <= FAILED_CHECK_MAX_BYTES else None

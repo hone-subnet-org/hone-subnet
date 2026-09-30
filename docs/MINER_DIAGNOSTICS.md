@@ -4,7 +4,7 @@ Validators write one round outcome and one evaluation record for each assigned
 miner to `v3_evaluations.jsonl`, beside the configured score-state file. Each
 line is a JSON object. These records are local to the
 validator; they are never sent anywhere. Separately, and on by default, a
-validator sends each failed miner a short notice about its own failure, straight
+validator sends each graded miner a short notice about its own result, straight
 to that miner. See "Failure notices sent to miners" below.
 
 ```bash
@@ -131,9 +131,9 @@ problem server or to a miner.
 ## Failure notices sent to miners
 
 When a graded round finishes, the validator sends one small signed message to each
-miner whose submission failed or was rejected, straight to that miner's axon. There
-is no problem server involved and nothing is stored centrally. Two settings control
-it, both on by default:
+miner it graded, straight to that miner's axon: `passed`, or the reason the
+submission failed or was rejected. There is no problem server involved and nothing
+is stored centrally. Two settings control it, both on by default:
 
 - `VALIDATOR_FAILURE_NOTICES` sends the notices at all.
 - `VALIDATOR_FAILED_CHECK_DETAILS` adds the failing check's command and expected
@@ -142,18 +142,22 @@ it, both on by default:
 A notice is `POST {miner axon}/v3/failure`, signed the same way a task is, and
 carries the protocol version, the fixed message type `failure_notice_v1`, the
 challenge and task ids, the recipient's own uid and hotkey, and a `failure` object
-holding `version`, `reason_code` and an optional `failed_check` display.
+holding `version`, `reason_code` and an optional `failed_check` display. For an
+inline check the display carries the check's script itself, so the miner sees the
+test it failed.
 
-The reason codes are the miner and submission codes tabled above. A round or
-infrastructure cause, or a missing code, is reported as the generic
-`evaluation_failed`. The `failed_check` display is only ever attached to
+The reason codes are the miner and submission codes tabled above, plus `passed`
+for a submission that passed every check. A round or infrastructure cause, or a
+missing code, is reported as the generic `evaluation_failed`. The `failed_check` display is only ever attached to
 `check_failed` at the check stage, and it is the same six-line text described
-below. It never contains the miner's own output, the check id, its position, the
-number of checks, or any verifier code.
+below. It never contains the miner's own output, the check id, its position, or
+the number of checks.
 
 Delivery is deliberately cheap and forgettable. One attempt per miner, no retries
 and no redirects, at most 8 in flight, 2 seconds for one exchange and 5 seconds for
-the whole batch, at most 1024 recipients. An old miner without the route, an
+the whole batch, at most 1024 recipients. The one exception: a miner that refuses
+a notice with a display as too large (400 or 413), as a miner on an older release
+does, is sent the reason alone, once. An old miner without the route, an
 offline miner, or a slow one simply gets nothing. Nothing here can change a grade, a
 score or a weight, and the round is already finished when it runs. A notice is sent
 only for a completed round, only to a registration the round actually assigned and
@@ -174,6 +178,12 @@ The reference miner adds the route and prints what it receives, for example:
 [demo-miner] feedback:   Required exit code: 0
 [demo-miner] feedback:   Required stdout: "red-fox\n"
 [demo-miner] feedback:   Required stderr: not checked
+```
+
+A pass is the header alone:
+
+```
+[demo-miner] feedback: passed challenge chal-8f21 task 9c4f000000000000
 ```
 
 Nothing is written to disk. Operators who want history should capture the miner's
@@ -205,14 +215,17 @@ The display describes the FIRST check that failed, in the order the manifest
 already runs them. It is not the shortest or a minimized case, and finding it
 costs no extra grading runs. Later checks never ran and are never named.
 
-Only a narrow shape is rendered at all:
+Two shapes of invocation check are rendered:
 
-- an invocation check whose command is exactly an allowlisted Python executable,
-  `/usr/bin/python3` or `/usr/local/bin/python3`, followed by one `.py` script
-  path that resolves inside `/work`;
-- no interpreter flags, no script arguments, no shell, no inline code;
-- the stdin and expected streams must decode as UTF-8, and the whole display must
-  fit 2048 bytes measured as an escaped JSON string.
+- an allowlisted Python executable, `/usr/bin/python3` or
+  `/usr/local/bin/python3`, followed by one `.py` script path that resolves inside
+  `/work`; the script is part of the miner's own workspace;
+- the same executable followed by `-c` and an inline script: the display then ends
+  with `Inline script:` and the script verbatim, which is the test itself.
+
+In both, no other interpreter flags, arguments or shell; the stdin and expected
+streams must decode as UTF-8; and the whole display must fit 256 KiB measured as
+an escaped JSON string.
 
 Anything else gets the reason code and no display: inspection checks that run the
 verifier's own checker, suites, other interpreters, compiled languages, build
@@ -220,7 +233,7 @@ steps, and any check whose data is too large or not UTF-8. Compiler and build
 output are never forwarded, and an existing setup or execution failure is never
 relabelled as a compilation failure.
 
-A notice is at most 8192 bytes on the wire, and a miner should refuse anything
+A notice is at most 320 KiB on the wire, and a miner should refuse anything
 larger.
 
 The display states what the check required. It is not a reproduction recipe:

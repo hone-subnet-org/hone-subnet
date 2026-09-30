@@ -42,6 +42,7 @@ SHELL_SCRIPTS = [
     REPO_ROOT / "start_demo_miner.sh",
     SCRIPTS / "preflight_validator.sh",
     SCRIPTS / "register_testnet.sh",
+    SCRIPTS / "require_service_user.sh",
 ]
 
 
@@ -273,3 +274,77 @@ def test_rust_sandbox_image_provides_the_full_supervisor_stdlib():
     assert "tempfile" in text, (
         "build must import-check the supervisor's stdlib surface"
     )
+
+
+def fake_id(tmp_path, uid, gid):
+    """A PATH shim for `id`, so the root check can be tested by any user."""
+    shim = tmp_path / "id"
+    shim.write_text(
+        "#!/bin/sh\n"
+        f'case "$1" in -u) echo {uid} ;; -g) echo {gid} ;; *) exit 1 ;; esac\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "HOME": "/root",
+        "RLVR_SERVICE_USER": "svc",
+    }
+    probe = subprocess.run(["id", "-u"], env=env, capture_output=True, text=True, check=False)
+    if probe.stdout.strip() != str(uid):
+        pytest.skip("the temporary directory cannot host an executable shim")
+    return env
+
+
+def run_service_user_check(env):
+    return subprocess.run(
+        ["bash", str(SCRIPTS / "require_service_user.sh"), "test"],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize("uid,gid", [(0, 0), (0, 1000), (1000, 0)])
+def test_service_user_check_refuses_root_and_prints_the_way_out(tmp_path, uid, gid):
+    result = run_service_user_check(fake_id(tmp_path, uid, gid))
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "[test] ERROR: the validator must not run as root" in result.stderr
+    assert result.stderr.index("First stop and remove") < result.stderr.index("adduser")
+    assert f"cp -a {REPO_ROOT}/. /home/svc/hone-subnet/" in result.stderr
+    assert "cp -a /root/.bittensor/wallets/. /home/svc/.bittensor/wallets/" in result.stderr
+    assert "usermod -aG docker svc" in result.stderr
+    assert "rm -rf /home/svc/hone-subnet/.venv" in result.stderr
+
+
+def test_service_user_check_is_silent_for_an_ordinary_user(tmp_path):
+    result = run_service_user_check(fake_id(tmp_path, 1000, 1000))
+    assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
+
+
+@pytest.mark.parametrize("script", ["setup_validator.sh", "scripts/preflight_validator.sh"])
+def test_setup_and_preflight_check_the_service_user_before_doing_anything(script):
+    text = (REPO_ROOT / script).read_text(encoding="utf-8")
+    check = text.index('"${REPO_ROOT}/scripts/require_service_user.sh"')
+    # Nothing that reads arguments, touches the venv, .env or Docker runs first.
+    markers = ("while (( $# ))", "docker", ".venv/bin", "source .env", "cat > .env")
+    first_action = min(text.index(marker) for marker in markers if marker in text)
+    assert check < first_action
+
+
+def test_setup_writes_a_minimal_env_with_only_what_start_needs():
+    text = (REPO_ROOT / "setup_validator.sh").read_text(encoding="utf-8")
+    block = text[text.index("cat > .env <<'ENV'") : text.index("\nENV\n")]
+    settings = [line for line in block.splitlines()[1:] if line and not line.startswith("#")]
+    assert settings == [
+        "NETUID=5",
+        "SUBTENSOR_NETWORK=finney",
+        "WALLET_NAME=YOUR_WALLET_NAME",
+        "WALLET_HOTKEY=YOUR_WALLET_HOTKEY",
+    ]
+    assert "cp .env.example .env" not in text

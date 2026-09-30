@@ -11,6 +11,8 @@ Requirements:
 
 - Linux with Python 3.10–3.12
 - Docker with the daemon running
+- an ordinary user in the `docker` group to run everything as: the validator
+  refuses to run as root, since it runs miner code in containers
 - at least 25 GB free on the filesystem holding `data/`: grading refuses to
   start a round with less than about 20 GB free, since each of the two
   concurrent gradings may use a 10 GB workspace
@@ -26,10 +28,11 @@ From the repository root:
 ./start_validator.sh
 ```
 
-Setup creates `.venv` and `.env`, installs dependencies, pulls and checks the
-release-pinned V3 sandbox image, and verifies the problem service and local
-clock. If wallet arguments are omitted, set only `WALLET_NAME` and
-`WALLET_HOTKEY` in `.env`.
+Setup creates `.venv` and a four-line `.env`, installs dependencies, pulls and
+checks the release-pinned V3 sandbox image, and verifies the problem service
+and local clock. If wallet arguments are omitted, set `WALLET_NAME` and
+`WALLET_HOTKEY` in `.env`. Nothing else is required; `.env.example` lists the
+optional settings.
 
 Dispatch, grading, scoring, cadence, resource limits, sandbox image, and owner
 burn are fixed in release policy. Operators do not configure them in `.env`.

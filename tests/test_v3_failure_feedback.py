@@ -19,6 +19,7 @@ from rlvr.v3.api import (
 )
 from rlvr.v3.artifacts import ArtifactGrant
 from rlvr.v3.client import V3ProblemServerClient
+from rlvr.v3.feedback import FAILED_CHECK_MAX_BYTES
 from rlvr.v3.grading import EvaluationResult
 from rlvr.v3.reasons import MinerReason, RoundReason, Stage
 from rlvr.v3.release import round_policy
@@ -98,18 +99,26 @@ def send(client, evaluations, *, grants=None, **kwargs):
     )
 
 
-def test_server_feedback_keeps_legacy_bytes_in_all_serialization_paths():
+def test_server_feedback_wire_shape_in_all_serialization_paths():
     item = verdict()
-    expected = {"uid": 7, "hotkey": "hk-7", "passed": False, "grading_duration_ms": 23}
+    expected = {
+        "uid": 7,
+        "hotkey": "hk-7",
+        "passed": False,
+        "grading_duration_ms": 23,
+        "response_latency_ms": None,
+        "reason_code": None,
+    }
     assert item.model_dump() == expected
     assert json.loads(item.model_dump_json()) == expected
-    old_wire = (
+    wire = (
         '{"protocol_version":3,"challenge_id":"chal-1","task_id":"'
         + "a" * 64
-        + '","verdicts":[{"uid":7,"hotkey":"hk-7","passed":false,"grading_duration_ms":23}]}'
+        + '","verdicts":[{"uid":7,"hotkey":"hk-7","passed":false,"grading_duration_ms":23,'
+        '"response_latency_ms":null,"reason_code":null}]}'
     ).encode()
-    assert request(item).model_dump_json().encode() == old_wire
-    assert serialize_feedback_request(request(item)) == old_wire
+    assert request(item).model_dump_json().encode() == wire
+    assert serialize_feedback_request(request(item)) == wire
 
 
 @pytest.mark.parametrize(
@@ -139,7 +148,7 @@ def test_failure_schema_rejects_noncontract_data(changes):
 @pytest.mark.parametrize("unit", ["x", "\n", "é", "😀"])
 def test_failed_check_cap_counts_json_escaping_and_quotes(unit):
     per_unit = len(json.dumps(unit, ensure_ascii=True).encode("ascii")) - 2
-    fitting = unit * (2046 // per_unit)
+    fitting = unit * ((FAILED_CHECK_MAX_BYTES - 2) // per_unit)
     FailureExplanation(
         version=1, reason_code=MinerReason.CHECK_FAILED, failed_check=fitting
     )
@@ -149,10 +158,13 @@ def test_failed_check_cap_counts_json_escaping_and_quotes(unit):
         )
 
 
-def test_server_feedback_keeps_legacy_payload_despite_available_display():
+def test_server_feedback_carries_reason_and_latency_but_never_the_display():
     client = RecordingClient()
     assert send(client, [evaluation()])
-    assert client.bodies == [serialize_feedback_request(request(verdict()))]
+    expected = verdict(response_latency_ms=1, reason_code=MinerReason.CHECK_FAILED)
+    assert client.bodies == [serialize_feedback_request(request(expected))]
+    assert DISPLAY.encode() not in client.bodies[0]
+    assert PRIVATE.encode() not in client.bodies[0]
 
 
 def test_server_feedback_binds_exact_registration_and_preserves_grant_order():

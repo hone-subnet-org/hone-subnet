@@ -16,6 +16,7 @@ from typing import Literal, Protocol
 import httpx
 
 from .api import (
+    FEEDBACK_LATENCY_MAX_MS,
     ChallengeCommitRequest,
     ChallengeFeedbackRequest,
     FeedbackVerdict,
@@ -197,6 +198,24 @@ def _grant_matches_signed_response(
     )
 
 
+def _verdict(grant: ArtifactGrant, evaluation: MinerEvaluation) -> FeedbackVerdict:
+    passed = evaluation.result.status == "passed"
+    reason = evaluation.result.reason_code
+    latency = evaluation.latency_ms
+    # Anything the server would refuse is sent as null, so one odd value can
+    # never sink the whole call.
+    if type(latency) is not int or not 0 <= latency <= FEEDBACK_LATENCY_MAX_MS:
+        latency = None
+    return FeedbackVerdict(
+        uid=grant.uid,
+        hotkey=grant.hotkey,
+        passed=passed,
+        grading_duration_ms=evaluation.grading_duration_ms,
+        response_latency_ms=latency,
+        reason_code=reason if not passed and isinstance(reason, MinerReason) else None,
+    )
+
+
 async def _send_diagnostic_feedback(
     client: V3ProblemServerClient,
     challenge_id: str,
@@ -212,17 +231,7 @@ async def _send_diagnostic_feedback(
             protocol_version=3,
             challenge_id=challenge_id,
             task_id=task_id,
-            verdicts=[
-                FeedbackVerdict(
-                    uid=grant.uid,
-                    hotkey=grant.hotkey,
-                    passed=(by_registration[(grant.uid, grant.hotkey)].result.status == "passed"),
-                    grading_duration_ms=by_registration[
-                        (grant.uid, grant.hotkey)
-                    ].grading_duration_ms,
-                )
-                for grant in grants
-            ],
+            verdicts=[_verdict(grant, by_registration[(grant.uid, grant.hotkey)]) for grant in grants],
         )
         return await client.feedback(request)
     except Exception:  # noqa: BLE001 - feedback is diagnostic only

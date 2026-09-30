@@ -36,7 +36,7 @@ from .wire import (
 
 ProtocolVersion = exact_int_literal(3)
 VerifierPolicy = Literal["command-gold-digest-v1"]
-FAILURE_NOTICE_MAX_BYTES = 8 * 1024
+FAILURE_NOTICE_MAX_BYTES = 320 * 1024  # the display cap plus the envelope
 TRACE_CHECK_MAX_BYTES = 4 * 1024
 
 EPISTULA_HEADERS = (
@@ -299,8 +299,10 @@ class CommitRevealResponse(WireModel):
 
 
 class FailureExplanation(WireModel):
+    """How one graded submission did: `passed`, or the reason it did not."""
+
     version: exact_int_literal(1)
-    reason_code: MinerReason | Literal["evaluation_failed"]
+    reason_code: MinerReason | Literal["evaluation_failed", "passed"]
     failed_check: str | None = None
 
     @field_validator("failed_check")
@@ -355,11 +357,24 @@ class TraceCheckRequest(WireModel):
         return self
 
 
+FEEDBACK_LATENCY_MAX_MS = 3_600_000
+
+
 class FeedbackVerdict(WireModel):
     uid: UID
     hotkey: BoundedIdentifier
     passed: StrictBool
     grading_duration_ms: Annotated[int, Field(ge=0, le=SAFE_INTEGER_MAX)]
+    # Dispatch to signed response, as the validator measured it; None when unknown.
+    response_latency_ms: Annotated[int, Field(ge=0, le=FEEDBACK_LATENCY_MAX_MS)] | None = None
+    # Why a submission did not pass; the server refuses a reason on a pass.
+    reason_code: MinerReason | None = None
+
+    @model_validator(mode="after")
+    def reason_only_when_not_passed(self) -> FeedbackVerdict:
+        if self.passed and self.reason_code is not None:
+            raise ValueError("a passed verdict carries no reason code")
+        return self
 
 
 class ChallengeFeedbackRequest(WireModel):

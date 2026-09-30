@@ -7,6 +7,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
+"${REPO_ROOT}/scripts/require_service_user.sh" preflight
+
 pull_image=false
 while (( $# )); do
   case "$1" in

@@ -29,6 +29,7 @@ from ..v3.api import (
     MinerTaskResponse,
 )
 from ..v3.canonical import canonical_json_bytes
+from ..v3.feedback import is_bounded_display
 from ..v3.miner import upload_miner_result
 from ..v3.miner_workspace import WorkspaceReader, open_miner_workspace
 from ..v3.patch import PatchLimits, static_rejection
@@ -479,9 +480,7 @@ class BedrockClient:
 SERVED_TASK_LIMIT = 256
 SERVED_TASK_TTL_S = 7_200.0
 NOTICE_PRINT_SLOTS = 4
-FEEDBACK_PRINT_MAX_LINES = 24
 FEEDBACK_PRINT_HEADER_CHARS = 120
-FEEDBACK_PRINT_MAX_CHARS = 2_048
 
 
 class ServedTasks:
@@ -589,24 +588,20 @@ def feedback_lines(header: str, display: str | None) -> list[str]:
     """Build every line printed for one notice, header included.
 
     The header is escaped and cut, since it is only identifiers. The display is
-    escaped but NEVER cut: a shortened expected answer would be a different test, so
-    a display that does not fit is omitted with a reason instead. At most
-    FEEDBACK_PRINT_MAX_LINES lines are returned in total.
+    escaped but NEVER cut: a shortened expected answer would be a different test.
+    Any display a validator may send is printed whole; a larger one is omitted
+    with a reason instead.
     """
 
     prefix = "[demo-miner] feedback: "
     lines = [prefix + printable(header)[:FEEDBACK_PRINT_HEADER_CHARS]]
     if not display:
         return lines
+    if not is_bounded_display(display):
+        return lines + [prefix + "  display omitted: larger than a validator may send"]
     # Split on LF only. str.splitlines() would also split on CR, VT, FF, NEL and
     # U+2028, silently swallowing those bytes before printable could escape them.
-    escaped = [printable(line) for line in display.split("\n")]
-    if (
-        len(escaped) > FEEDBACK_PRINT_MAX_LINES - 1
-        or sum(len(line) for line in escaped) > FEEDBACK_PRINT_MAX_CHARS
-    ):
-        return lines + [prefix + "  display omitted: larger than this miner prints"]
-    return lines + [prefix + "  " + line for line in escaped]
+    return lines + [prefix + "  " + printable(line) for line in display.split("\n")]
 
 
 class DemoMiner:
