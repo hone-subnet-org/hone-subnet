@@ -154,7 +154,7 @@ below. It never contains the miner's own output, the check id, its position, or
 the number of checks.
 
 Delivery is deliberately cheap and forgettable. One attempt per miner, no retries
-and no redirects, at most 8 in flight, 2 seconds for one exchange and 5 seconds for
+and no redirects, at most 8 in flight, 2 seconds for one exchange and 15 seconds for
 the whole batch, at most 1024 recipients. The one exception: a miner that refuses
 a notice with a display as too large (400 or 413), as a miner on an older release
 does, is sent the reason alone, once. An old miner without the route, an
@@ -163,7 +163,7 @@ score or a weight, and the round is already finished when it runs. A notice is s
 only for a completed round, only to a registration the round actually assigned and
 graded, and only when the score file was written successfully: an operator who
 disables score persistence receives no notices either. The cost is bounded but not
-zero, so a round can take up to five seconds longer when many miners are
+zero, so a round can take up to fifteen seconds longer when many miners are
 unreachable.
 
 ### What a miner does with one

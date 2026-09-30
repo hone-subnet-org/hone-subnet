@@ -267,4 +267,4 @@ def test_release_policy_fixes_the_pool_size_and_the_quorum(monkeypatch):
     monkeypatch.setattr("rlvr.v3.release.os.getgid", lambda: 1000)
     monkeypatch.setattr("rlvr.v3.release.shutil.which", lambda _: "/usr/bin/docker")
     released = round_policy(RELEASE_POLICY, dispatch_concurrency=4)
-    assert released.miners_per_task == 32 and released.commit_quorum == 4 and released.min_lease_s == 600
+    assert released.miners_per_task == 128 and released.commit_quorum == 4 and released.min_lease_s == 600
