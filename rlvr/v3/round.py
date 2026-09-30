@@ -366,8 +366,10 @@ async def evaluate_round(
         if lease.identity.verifier_policy != policy.verifier_policy:
             return finish("abandoned", "unsupported verifier policy", RoundReason.UNSUPPORTED_VERIFIER_POLICY)
         stage = Stage.WORKSPACE_MATERIALIZATION
-        cache = Path(cache_dir)
-        root = Path(work_dir)
+        # Absolute, whatever the caller passed: the sandbox only mounts absolute
+        # paths, and before Python 3.12 tempfile keeps a relative dir relative.
+        cache = Path(cache_dir).absolute()
+        root = Path(work_dir).absolute()
         cache.mkdir(mode=0o700, parents=True, exist_ok=True)
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         stage = Stage.CLEANUP

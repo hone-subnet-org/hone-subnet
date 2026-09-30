@@ -487,7 +487,7 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
         dispatch_concurrency=settings.validator_dispatch_concurrency,
         grading_concurrency=settings.validator_grading_concurrency,
     )
-    state_dir = Path(settings.validator_score_state_file).parent
+    state_dir = Path(settings.validator_score_state_file).absolute().parent
     diagnostics = EvaluationLog(
         str(state_dir / "v3_evaluations.jsonl")
         if settings.validator_diagnostics_file is None

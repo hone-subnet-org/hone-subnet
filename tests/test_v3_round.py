@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import time
+from pathlib import Path
 
 import httpx
 import pytest
@@ -682,3 +683,43 @@ def test_feedback_verdicts_carry_latency_and_reason_from_the_evaluation():
         6: (False, None, None),
         7: (False, None, None),
     }
+
+
+def test_round_directories_are_absolute_even_from_a_relative_work_dir(tmp_path, monkeypatch):
+    """Before Python 3.12, tempfile keeps a relative dir relative, and the sandbox
+    refuses to mount a relative path. The round makes its directories absolute first."""
+    import tempfile
+
+    monkeypatch.chdir(tmp_path)
+    leased = LeaseResponse(**lease(expires_at=2**53 - 1))
+    seen = {}
+    real = tempfile.TemporaryDirectory
+
+    def recording(*args, **kwargs):
+        if kwargs.get("prefix") != "hone-v3-round-":
+            return real(*args, **kwargs)
+        seen["dir"] = Path(kwargs["dir"])
+        raise RuntimeError("stop after the directories are set up")
+
+    monkeypatch.setattr("rlvr.v3.round.tempfile.TemporaryDirectory", recording)
+
+    async def handler(request):
+        if request.url.path == "/v3/challenges/lease":
+            return httpx.Response(200, content=leased.model_dump_json())
+        return httpx.Response(404)
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            client = V3ProblemServerClient("https://problems.invalid", "validator", http, retries=1)
+            return await evaluate_round(
+                client, http, [],
+                dataclasses.replace(policy(tmp_path), commit_quorum=leased.commit_min_signed_responses),
+                cache_dir="rel-cache", work_dir="rel-work",
+                candidates=[(slot.submission.uid, slot.submission.hotkey) for slot in leased.slot_pool],
+            )
+
+    result = asyncio.run(go())
+    assert result.status == "abandoned", result.reason
+    assert seen, (result.reason, result.reason_code, result.stage)
+    assert seen["dir"].is_absolute() and seen["dir"] == tmp_path / "rel-work"
+    assert (tmp_path / "rel-cache").is_dir() and (tmp_path / "rel-work").is_dir()
