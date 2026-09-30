@@ -126,10 +126,10 @@ class RoundPolicy:
 
 
 class _Abandon(Exception):
-    """One miner's grading hit a validator-side fault that ends the round.
+    """One grading hit a validator-side fault that ends the round.
 
-    Carries that miner's evaluation when grading had already produced one,
-    so diagnostics still record it.
+    Carries the evaluations that grading had already produced, so diagnostics
+    still record them.
     """
 
     def __init__(
@@ -137,13 +137,13 @@ class _Abandon(Exception):
         reason: str,
         code: RoundReason,
         stage: Stage,
-        evaluation: MinerEvaluation | None = None,
+        evaluations: Sequence[MinerEvaluation] = (),
     ) -> None:
         super().__init__(reason)
         self.reason = reason
         self.code = code
         self.stage = stage
-        self.evaluation = evaluation
+        self.evaluations = tuple(evaluations)
 
 
 @dataclass(frozen=True)
@@ -312,7 +312,7 @@ async def evaluate_round(
             "unavailable", "no eligible miners to offer", (),
             reason_code=RoundReason.LEASE_UNAVAILABLE, stage=Stage.LEASE,
         )
-    outcome = await client.lease(offered)
+    outcome = await client.lease(offered, miners_per_task=policy.miners_per_task)
     lease = outcome.challenge
     if lease is None:
         reason = outcome.detail or outcome.category.value
@@ -558,18 +558,36 @@ async def evaluate_round(
             grading_slots = asyncio.Semaphore(policy.grading_concurrency)
             round_dead = asyncio.Event()  # set on the first fault; no new grading starts after it
 
-            async def grade(index: int, grant: ArtifactGrant) -> MinerEvaluation | None:
+            # Byte-identical submissions are graded once. Every miner that sent
+            # the same bytes gets the same verdict, with its own latency and
+            # trajectory. This saves grading time and storage; it changes no score.
+            groups: dict[str, list[ArtifactGrant]] = {}
+            for grant in revealed.submission_grants:
+                groups.setdefault(grant.sha256, []).append(grant)
+
+            def verdicts(grants: list[ArtifactGrant], result: EvaluationResult, grading_duration_ms: int) -> list[MinerEvaluation]:
+                return [
+                    MinerEvaluation(
+                        grant.uid, grant.hotkey,
+                        submissions_by_registration[(grant.uid, grant.hotkey)].latency_ms,
+                        result, grading_duration_ms,
+                        trajectory=signed_responses[(grant.uid, grant.hotkey)].trajectory,
+                    )
+                    for grant in grants
+                ]
+
+            async def grade(index: int, grants: list[ArtifactGrant]) -> list[MinerEvaluation] | None:
                 async with grading_slots:
                     if round_dead.is_set():
                         return None
                     try:
-                        return await grade_one(index, grant)
+                        return await grade_once(index, grants)
                     except BaseException:
                         round_dead.set()
                         raise
 
-            async def grade_one(index: int, grant: ArtifactGrant) -> MinerEvaluation:
-                registration = (grant.uid, grant.hotkey)
+            async def grade_once(index: int, grants: list[ArtifactGrant]) -> list[MinerEvaluation]:
+                grant = grants[0]
                 try:
                     submission_path = await fetch_submission(
                         http,
@@ -587,7 +605,7 @@ async def evaluate_round(
                     raise _Abandon("insufficient grading storage", RoundReason.INSUFFICIENT_STORAGE, Stage.WORKSPACE_MATERIALIZATION)
                 grading_started = time.monotonic()
                 run_prefix = f"v3-{challenge_tag}-{grant.uid}"
-                evaluation: MinerEvaluation | None = None
+                graded: list[MinerEvaluation] = []
                 try:
                     miner_workspace = await asyncio.to_thread(
                         materialize_workspace, cached, round_dir / f"miner-{grant.uid}"
@@ -632,31 +650,26 @@ async def evaluate_round(
                         2**53 - 1,
                         int((time.monotonic() - grading_started) * 1000),
                     )
-                    evaluation = MinerEvaluation(
-                        grant.uid, grant.hotkey,
-                        submissions_by_registration[registration].latency_ms,
-                        result, grading_duration_ms,
-                        trajectory=signed_responses[registration].trajectory,
-                    )
+                    graded = verdicts(grants, result, grading_duration_ms)
                 finally:
                     try:
                         await asyncio.to_thread(_remove_tree, miner_workspace)
                     except Exception as error:  # noqa: BLE001 - a leftover workspace ends the round
                         raise _Abandon(
                             f"validator failed during cleanup ({type(error).__name__})",
-                            RoundReason.CLEANUP_FAILED, Stage.CLEANUP, evaluation,
+                            RoundReason.CLEANUP_FAILED, Stage.CLEANUP, graded,
                         ) from None
                 if result.status == "abandoned":
                     raise _Abandon(
                         result.reason,
                         result.reason_code if isinstance(result.reason_code, RoundReason) else RoundReason.VALIDATOR_ERROR,
-                        result.stage, evaluation,
+                        result.stage, graded,
                     )
-                return evaluation
+                return graded
 
             stage = Stage.GRADING
             outcomes = await asyncio.gather(
-                *(grade(index, grant) for index, grant in enumerate(revealed.submission_grants)),
+                *(grade(index, grants) for index, grants in enumerate(groups.values())),
                 return_exceptions=True,
             )
             # Every grading task has finished and cleaned up. Graded miners are
@@ -664,12 +677,11 @@ async def evaluate_round(
             # the first grading fault in grant order decides. Grant format and
             # signature mismatches were checked for every grant before any
             # grading started, so they take precedence over grading faults.
-            evaluations.extend(
-                outcome.evaluation if isinstance(outcome, _Abandon) else outcome
-                for outcome in outcomes
-                if isinstance(outcome, MinerEvaluation)
-                or (isinstance(outcome, _Abandon) and outcome.evaluation is not None)
-            )
+            for outcome in outcomes:
+                if isinstance(outcome, list):
+                    evaluations.extend(outcome)
+                elif isinstance(outcome, _Abandon):
+                    evaluations.extend(outcome.evaluations)
             for outcome in outcomes:
                 if isinstance(outcome, _Abandon):
                     return finish("abandoned", outcome.reason, outcome.code, outcome.stage)

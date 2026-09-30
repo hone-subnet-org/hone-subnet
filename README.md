@@ -37,9 +37,14 @@ optional settings.
 Dispatch, grading, scoring, cadence, resource limits, sandbox image, and owner
 burn are fixed in release policy. Operators do not configure them in `.env`.
 The owner burn share is 0%. The one sizing choice is how many miners are graded
-at the same time, `VALIDATOR_GRADING_CONCURRENCY`, default 2. Each concurrent
-grading may use a full sandbox memory limit and a copy of the task workspace on
-disk, so raise it only on a machine with the memory and disk to match.
+at the same time, `VALIDATOR_GRADING_CONCURRENCY`. Unset, the validator sizes it
+from the host at startup: one per two CPUs, one per 4 GB of RAM after 4 GB for
+the system, one per 10 GB of free disk after 2 GB, at most 16, and prints the
+result. Each concurrent grading may use a full sandbox memory limit and a copy
+of the task workspace on disk, so set it higher only on a machine with the
+memory and disk to match. Byte-identical submissions in a round are graded
+once, so the number of distinct answers, not the number of miners, sets the
+grading time.
 
 The validator stores its scoring window in `data/validator_scores.json`.
 Preserve that file across restarts.

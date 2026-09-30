@@ -63,7 +63,7 @@ class ValidatorPolicy:
     v3_problem_response_read_bytes: int = 32 * 1024**2
     # Miners each task is offered to. Fixed here, not per lease, so the problem
     # server cannot widen or narrow the pool around a particular miner.
-    v3_miners_per_task: int = 32
+    v3_miners_per_task: int = 128
     # Signed responses a lease must gather before commit. Fixed here, like the
     # pool size, so the problem server cannot vary it per lease.
     v3_commit_quorum: int = 4

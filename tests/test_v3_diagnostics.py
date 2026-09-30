@@ -574,7 +574,7 @@ class LeaseOnlyClient:
     def __init__(self, outcome):
         self.outcome = outcome
 
-    async def lease(self, candidates):
+    async def lease(self, candidates, **_kwargs):
         self.candidates = list(candidates)
         return self.outcome
 

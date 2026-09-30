@@ -1,5 +1,6 @@
 """The validator, not the server, chooses which miners a task is offered to."""
 
+import json
 import random
 
 import pytest
@@ -267,4 +268,14 @@ def test_release_policy_fixes_the_pool_size_and_the_quorum(monkeypatch):
     monkeypatch.setattr("rlvr.v3.release.os.getgid", lambda: 1000)
     monkeypatch.setattr("rlvr.v3.release.shutil.which", lambda _: "/usr/bin/docker")
     released = round_policy(RELEASE_POLICY, dispatch_concurrency=4)
-    assert released.miners_per_task == 32 and released.commit_quorum == 4 and released.min_lease_s == 600
+    assert released.miners_per_task == 128 and released.commit_quorum == 4 and released.min_lease_s == 600
+
+
+def test_lease_request_names_the_pool_size_and_omits_it_when_unset():
+    named = LeaseRequest(request_id="r", candidates=[MinerCandidate(uid=5, hotkey="hk-5")], miners_per_task=128)
+    assert json.loads(named.model_dump_json(exclude_none=True))["miners_per_task"] == 128
+    unset = LeaseRequest(request_id="r", candidates=[MinerCandidate(uid=5, hotkey="hk-5")])
+    assert "miners_per_task" not in json.loads(unset.model_dump_json(exclude_none=True))
+    for bad in (0, 257, 1.5, "128"):
+        with pytest.raises(ValidationError):
+            LeaseRequest(request_id="r", candidates=[MinerCandidate(uid=5, hotkey="hk-5")], miners_per_task=bad)

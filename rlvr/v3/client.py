@@ -40,11 +40,14 @@ class V3ProblemServerClient:
     def __init__(self, *args, **kwargs):
         self._transport = ProblemServerClient(*args, **kwargs)
 
-    async def lease(self, candidates: Sequence[tuple[int, str]]) -> V3LeaseOutcome:
+    async def lease(
+        self, candidates: Sequence[tuple[int, str]], *, miners_per_task: int | None = None
+    ) -> V3LeaseOutcome:
         body = LeaseRequest(
             request_id=uuid4().hex,
             candidates=[MinerCandidate(uid=uid, hotkey=hotkey) for uid, hotkey in candidates],
-        ).model_dump_json().encode("utf-8")
+            miners_per_task=miners_per_task,
+        ).model_dump_json(exclude_none=True).encode("utf-8")
         post = await self._transport.post_result("/v3/challenges/lease", body)
         response = post.response
         if response is None:

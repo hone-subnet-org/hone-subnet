@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -25,6 +26,7 @@ from ..scoring.eval_engine import EvalEngine
 from ..v3.client import V3ProblemServerClient
 from ..v3.diagnostics import EvaluationLog
 from ..v3.reasons import RoundReason
+from ..v3.release import default_grading_concurrency
 from ..v3.release import round_policy as v3_round_policy
 from ..v3.round import apply_round_scores, evaluate_round
 from ..v3.selection import eligible_miners, next_offer
@@ -197,6 +199,27 @@ def _validator_http_limits(settings: Settings) -> httpx.Limits:
         max_connections=dispatch + 8,
         max_keepalive_connections=min(dispatch, 64),
     )
+
+
+def _grading_concurrency(settings: Settings, policy: ValidatorPolicy, state_dir: Path) -> int:
+    """The operator's setting, or a size that fits this host."""
+    if settings.validator_grading_concurrency is not None:
+        return settings.validator_grading_concurrency
+    cpus = os.cpu_count() or 1
+    memory_bytes = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    probe = state_dir  # the state directory may not exist yet: measure its filesystem
+    while not probe.exists():
+        probe = probe.parent
+    free_disk_bytes = shutil.disk_usage(probe).free
+    sized = default_grading_concurrency(
+        policy, cpus=cpus, memory_bytes=memory_bytes, free_disk_bytes=free_disk_bytes
+    )
+    print(
+        f"[validator] grading concurrency {sized} for this host "
+        f"(cpus={cpus} memory={memory_bytes / 1024**3:.0f}GiB free_disk={free_disk_bytes / 1000**3:.0f}GB); "
+        "set VALIDATOR_GRADING_CONCURRENCY to override"
+    )
+    return sized
 
 
 def _weight_observation_count(engine: EvalEngine) -> int:
@@ -482,12 +505,12 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
         decay=policy.decay_nonresponders,
     )
     _load_scores(engine, settings.validator_score_state_file)
+    state_dir = Path(settings.validator_score_state_file).absolute().parent
     grading_policy = v3_round_policy(
         policy,
         dispatch_concurrency=settings.validator_dispatch_concurrency,
-        grading_concurrency=settings.validator_grading_concurrency,
+        grading_concurrency=_grading_concurrency(settings, policy, state_dir),
     )
-    state_dir = Path(settings.validator_score_state_file).absolute().parent
     diagnostics = EvaluationLog(
         str(state_dir / "v3_evaluations.jsonl")
         if settings.validator_diagnostics_file is None
