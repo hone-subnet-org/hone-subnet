@@ -24,7 +24,8 @@ def test_the_documented_minimum_host_grades_two_at_once():
 
 
 def test_each_resource_bounds_it_and_nothing_goes_below_one():
-    assert sized(cpus=1, memory_gib=64, free_disk_gb=500) == 1  # CPUs
+    assert sized(cpus=16, memory_gib=256, free_disk_gb=500) == 8  # two CPUs per grading sandbox
+    assert sized(cpus=1, memory_gib=64, free_disk_gb=500) == 1  # never zero
     assert sized(cpus=16, memory_gib=16, free_disk_gb=500) == 3  # (16 - 4) / 4 memory
     assert sized(cpus=16, memory_gib=64, free_disk_gb=35) == 3  # (35 - 2) / 10.7 disk
     assert sized(cpus=2, memory_gib=2, free_disk_gb=1) == 1  # never zero, never negative

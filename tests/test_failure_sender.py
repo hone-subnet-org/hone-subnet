@@ -253,7 +253,7 @@ async def test_concurrent_requests_are_bounded():
         nonlocal active, maximum
         active += 1
         maximum = max(maximum, active)
-        if active == 8:
+        if active == sender.NOTICE_CONCURRENCY:
             full.set()
         try:
             await release.wait()
@@ -261,14 +261,14 @@ async def test_concurrent_requests_are_bounded():
         finally:
             active -= 1
 
-    task = asyncio.create_task(deliver(outcome(*(evaluation(uid) for uid in range(24))), handler))
+    task = asyncio.create_task(deliver(outcome(*(evaluation(uid) for uid in range(sender.NOTICE_CONCURRENCY + 8))), handler))
     try:
         await asyncio.wait_for(full.wait(), timeout=1)
-        assert maximum == 8
+        assert maximum == sender.NOTICE_CONCURRENCY
     finally:
         release.set()
         await task
-    assert maximum == 8 and active == 0
+    assert maximum == sender.NOTICE_CONCURRENCY and active == 0
 
 
 async def test_batch_caps_unique_recipient_count(monkeypatch):

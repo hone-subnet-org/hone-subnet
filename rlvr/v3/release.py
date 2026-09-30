@@ -20,13 +20,14 @@ HOST_DISK_RESERVE_BYTES = 2 * 1000**3  # the round's verifier and submissions; t
 def default_grading_concurrency(
     policy: ValidatorPolicy, *, cpus: int, memory_bytes: int, free_disk_bytes: int
 ) -> int:
-    """How many gradings this host can run at once: one per CPU, and one per
-    sandbox memory limit and per workspace of disk after a reserve for the
-    validator itself."""
+    """How many gradings this host can run at once: one per sandbox CPU
+    allowance, and one per sandbox memory limit and per workspace of disk
+    after a reserve for the validator itself."""
 
+    by_cpu = cpus // policy.v3_cpus
     by_memory = (memory_bytes - HOST_MEMORY_RESERVE_BYTES) // policy.v3_memory_bytes
     by_disk = (free_disk_bytes - HOST_DISK_RESERVE_BYTES) // policy.v3_workspace_bytes
-    return max(1, min(GRADING_CONCURRENCY_MAX, cpus, by_memory, by_disk))
+    return max(1, min(GRADING_CONCURRENCY_MAX, by_cpu, by_memory, by_disk))
 
 
 def round_policy(

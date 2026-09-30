@@ -154,7 +154,7 @@ below. It never contains the miner's own output, the check id, its position, or
 the number of checks.
 
 Delivery is deliberately cheap and forgettable. One attempt per miner, no retries
-and no redirects, at most 8 in flight, 2 seconds for one exchange and 15 seconds for
+and no redirects, at most 32 in flight, 2 seconds for one exchange and 15 seconds for
 the whole batch, at most 1024 recipients. The one exception: a miner that refuses
 a notice with a display as too large (400 or 413), as a miner on an older release
 does, is sent the reason alone, once. An old miner without the route, an

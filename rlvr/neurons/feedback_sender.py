@@ -19,7 +19,7 @@ from ..v3.reasons import MinerReason, Stage
 from .live import LiveSolverClient
 
 NOTICE_PATH = "/v3/failure"
-NOTICE_CONCURRENCY = 8
+NOTICE_CONCURRENCY = 32
 NOTICE_TIMEOUT_S = 2.0
 NOTICE_BATCH_DEADLINE_S = 15.0
 NOTICE_MAX_RECIPIENTS = 1_024

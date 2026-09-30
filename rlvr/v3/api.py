@@ -70,6 +70,10 @@ class LeaseRequest(WireModel):
 
     request_id: BoundedIdentifier
     candidates: Annotated[list[MinerCandidate], Field(min_length=1, max_length=CANDIDATE_LIMIT)]
+    # How many of the candidates, from the front, the server must issue slots
+    # for. Fixed by release policy; the validator checks the pool against it.
+    # Absent, a server assumes the previous release's 32.
+    miners_per_task: Annotated[int, Field(ge=1, le=CANDIDATE_LIMIT)] | None = None
 
     @model_validator(mode="after")
     def validate_candidates(self) -> LeaseRequest:

@@ -223,7 +223,13 @@ def test_task_wire_models_are_unchanged_since_the_previous_release(previous_rele
 
     old = previous_release({"op": "schemas", "models": TASK_WIRE_MODELS + ["MinerFailureNotice"]})
     for name in TASK_WIRE_MODELS:
-        assert getattr(api, name).model_json_schema() == old[name], name
+        new = getattr(api, name).model_json_schema()
+        if name == "LeaseRequest":
+            # The lease request grew one optional field, the pool size; a server
+            # that does not know it treats the request as the previous release's.
+            assert new["properties"].pop("miners_per_task")["default"] is None
+            assert "miners_per_task" not in new.get("required", [])
+        assert new == old[name], name
     # The notice is identical except that the reason code grew by exactly "passed".
     new = api.MinerFailureNotice.model_json_schema()
     old_notice = old["MinerFailureNotice"]

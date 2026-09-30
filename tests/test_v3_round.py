@@ -477,6 +477,7 @@ def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
         assert Solver.peak == 3  # uids 1-3 serve and were dispatched to together, whatever the fan-out setting
     expected_offer = {"pool_mismatch": [1, 2, 3], "pool_skip": [9, 1, 2, 3, 4], "pool_short": [1, 2, 3, 4, 9]}.get(round_fault, [1, 2, 3, 4])
     assert [c["uid"] for c in lease_bodies[0]["candidates"]] == expected_offer
+    assert lease_bodies[0]["miners_per_task"] == policy(tmp_path).miners_per_task  # the validator names its pool size
     if not (round_fault or submission_download_fails or checker_times_out):
         assert peak[0] == min(grading_concurrency, 3)  # three graded miners, bounded by the pool
     if round_fault:

@@ -312,7 +312,7 @@ async def evaluate_round(
             "unavailable", "no eligible miners to offer", (),
             reason_code=RoundReason.LEASE_UNAVAILABLE, stage=Stage.LEASE,
         )
-    outcome = await client.lease(offered)
+    outcome = await client.lease(offered, miners_per_task=policy.miners_per_task)
     lease = outcome.challenge
     if lease is None:
         reason = outcome.detail or outcome.category.value
