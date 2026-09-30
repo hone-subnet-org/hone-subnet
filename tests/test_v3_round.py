@@ -133,6 +133,7 @@ def test_feedback_is_skipped_without_grants_and_failures_are_diagnostic():
 class Solver:
     in_flight = 0
     peak = 0  # how many solvers were being dispatched to at the same time
+    latency_ms = 10
 
     def __init__(self, uid, hotkey, content):
         self.uid = uid
@@ -174,7 +175,7 @@ class Solver:
             response_body=body,
             response_headers={name: "value" for name in EPISTULA_HEADERS},
             error="",
-            latency_ms=10,
+            latency_ms=self.latency_ms,
         ), response
 
 
@@ -723,3 +724,139 @@ def test_round_directories_are_absolute_even_from_a_relative_work_dir(tmp_path, 
     assert seen, (result.reason, result.reason_code, result.stage)
     assert seen["dir"].is_absolute() and seen["dir"] == tmp_path / "rel-work"
     assert (tmp_path / "rel-cache").is_dir() and (tmp_path / "rel-work").is_dir()
+
+
+def test_identical_submissions_are_graded_once_and_every_sender_is_credited(tmp_path, monkeypatch):
+    workspace_tar = make_tar([("repo", "dir", b"", 0o755), ("repo/a.txt", "file", b"a", 0o644)])
+    workspace_blob = compress(workspace_tar)
+    manifest = {
+        "manifest_version": 1, "task_type": "repository_patch_v1", "setup": None,
+        "checks": [{
+            "check_id": "check", "kind": "inspection", "argv": ["/usr/bin/true"], "timeout_s": 1,
+            "max_stdout_bytes": 100, "max_stderr_bytes": 100,
+            "expect": {"exit_code": 0, "stdout": "gold/out", "stderr": None},
+        }],
+    }
+    verifier_tar = make_tar([
+        ("manifest.json", "file", json.dumps(manifest).encode(), 0o644),
+        ("checks", "dir", b"", 0o755), ("gold", "dir", b"", 0o755), ("gold/out", "file", b"", 0o644),
+    ])
+    verifier_blob = compress(verifier_tar)
+    contents = {1: b"pass", 2: b"pass", 3: b"fail", 4: b"pass"}  # 1, 2 and 4 sent the same bytes
+    workspace_ref = artifact_ref("workspace", workspace_tar, workspace_blob)
+    verifier_ref = artifact_ref("verifier", verifier_tar, verifier_blob)
+    task_identity = lease()["identity"].model_copy(
+        update={"workspace_sha256": workspace_ref.sha256, "verifier_sha256": verifier_ref.sha256}
+    )
+    task_id = compute_task_id(task_identity)
+    slots = []
+    for uid in contents:
+        current = slot_set(uid=uid, hotkey=f"hk-{uid}", prefix=f"u{uid}")
+        slots.append(current.model_validate({
+            "submission": current.submission.model_dump() | {"task_id": task_id},
+            "trajectory": current.trajectory.model_dump() | {"task_id": task_id},
+        }))
+    leased = LeaseResponse(**lease(
+        identity=task_identity, task_id=task_id, slot_pool=slots, commit_min_signed_responses=3,
+        workspace=workspace_ref, verifier=verifier_ref, expires_at=2**53 - 1,
+    ))
+    downloads, feedback_requests = [], []
+
+    async def handler(request):
+        path = request.url.path
+        if request.method == "POST" and path == "/v3/challenges/lease":
+            return httpx.Response(200, content=leased.model_dump_json())
+        if request.method == "POST" and path == "/v3/challenges/commit":
+            response = CommitRevealResponse(
+                protocol_version=3, challenge_id=leased.challenge_id, task_id=leased.task_id,
+                verifier=verifier_ref, verifier_policy="command-gold-digest-v1",
+                verifier_url="https://uploads.invalid/verifier", grading_expires_at=2**53 - 1,
+                submission_grants=[{
+                    "uid": uid, "hotkey": f"hk-{uid}", "upload_id": f"u{uid}-submission",
+                    "sha256": hashlib.sha256(contents[uid]).hexdigest(), "size_bytes": len(contents[uid]),
+                    "format": "unified_diff_v1", "read_url": f"https://uploads.invalid/submission-{uid}",
+                } for uid in contents],
+                artifact_failures=[],
+            )
+            return httpx.Response(200, content=response.model_dump_json())
+        if request.method == "POST" and path == "/v3/challenges/feedback":
+            feedback_requests.append(ChallengeFeedbackRequest.model_validate_json(await request.aread()))
+            return httpx.Response(200, content=ChallengeFeedbackResponse(
+                protocol_version=3, challenge_id=leased.challenge_id, task_id=leased.task_id,
+            ).model_dump_json())
+        if path == "/workspace":
+            return streamed(workspace_blob)
+        if path == "/verifier":
+            return streamed(verifier_blob)
+        if path.startswith("/submission-"):
+            downloads.append(path)
+            return streamed(contents[int(path.rsplit("-", 1)[1])])
+        return httpx.Response(404)
+
+    graded, copies = [], []
+
+    class TimedSolver(Solver):
+        def __init__(self, uid, hotkey, content):
+            super().__init__(uid, hotkey, content)
+            self.latency_ms = 100 * uid
+
+    def fake_grade(workspace, patch, *_args, **_kwargs):
+        graded.append(patch)
+        return EvaluationResult("passed" if patch == b"pass" else "failed", "" if patch == b"pass" else "no", (), None)
+
+    from rlvr.v3.workspace import materialize_workspace as real_materialize
+
+    def counting_materialize(cached, destination):
+        copies.append(destination.name)
+        return real_materialize(cached, destination)
+
+    monkeypatch.setattr("rlvr.v3.round.evaluate_repository", fake_grade)
+    monkeypatch.setattr("rlvr.v3.round.materialize_workspace", counting_materialize)
+
+    async def go(cleanup=None):
+        if cleanup is not None:
+            monkeypatch.setattr("rlvr.v3.round._remove_tree", cleanup)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            client = V3ProblemServerClient("https://problems.invalid", "validator", http, retries=1)
+            return await evaluate_round(
+                client, http, [TimedSolver(uid, f"hk-{uid}", contents[uid]) for uid in contents],
+                dataclasses.replace(policy(tmp_path), grading_concurrency=2, commit_quorum=3),
+                cache_dir=tmp_path / "cache", work_dir=tmp_path / "work",
+                candidates=[(uid, f"hk-{uid}") for uid in contents],
+            )
+
+    result = asyncio.run(go())
+    assert result.status == "completed", result.reason
+    # one download, one workspace copy and one grading per distinct submission
+    assert sorted(graded) == [b"fail", b"pass"]
+    assert sorted(downloads) == ["/submission-1", "/submission-3"]
+    assert sorted(copies) == ["miner-1", "miner-3"]
+    # every sender is evaluated exactly once, with the verdict for its bytes, its
+    # own latency and its own trajectory reference
+    assert sorted(item.uid for item in result.evaluations) == [1, 2, 3, 4]
+    by_uid = {item.uid: item for item in result.evaluations}
+    assert {uid: item.result.status for uid, item in by_uid.items()} == {1: "passed", 2: "passed", 3: "failed", 4: "passed"}
+    assert by_uid[1].result == by_uid[2].result == by_uid[4].result
+    assert by_uid[1].grading_duration_ms == by_uid[2].grading_duration_ms == by_uid[4].grading_duration_ms
+    assert {uid: by_uid[uid].latency_ms for uid in contents} == {1: 100, 2: 200, 3: 300, 4: 400}
+    assert all(by_uid[uid].trajectory is not None for uid in contents)
+    assert len({by_uid[uid].trajectory.upload_id for uid in contents}) == 4
+    # the server hears every miner once, and every copy is paid in full
+    assert sorted(item.uid for item in feedback_requests[0].verdicts) == [1, 2, 3, 4]
+    assert {item.uid: item.passed for item in feedback_requests[0].verdicts} == {1: True, 2: True, 3: False, 4: True}
+    assert {item.uid: item.response_latency_ms for item in feedback_requests[0].verdicts} == {1: 100, 2: 200, 3: 300, 4: 400}
+    payments = compute_round_payments(result, speed_half_life_ms=180_000, speed_floor=0.95)
+    assert payments[3] == 0.0 and payments[1] == 1.0 and 0.95 < payments[4] < payments[2] < 1.0  # slower copies pay the speed factor
+    assert len(list(round_records(result, "validator"))) == 1 + 4  # the round, then one record per miner
+
+    # a cleanup fault after grading a shared submission still records every sender
+    def broken_cleanup(path):
+        raise OSError("cleanup fixture failure")
+
+    graded.clear()
+    result = asyncio.run(go(cleanup=broken_cleanup))
+    assert result.status == "abandoned" and result.reason_code is RoundReason.CLEANUP_FAILED
+    assert sorted(item.uid for item in result.diagnostic_evaluations) == sorted(
+        uid for uid in contents if contents[uid] in graded
+    )
+    assert {1, 2, 4} <= set(item.uid for item in result.diagnostic_evaluations) or b"pass" not in graded
