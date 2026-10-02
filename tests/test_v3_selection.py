@@ -17,14 +17,14 @@ def test_owner_and_validating_uids_are_never_offered():
     permits[3] = permits[7] = True
     trust = [0.0] * 10
     trust[3] = 0.4  # uid 3 validates; uid 7 only holds a permit (a well-staked miner)
-    eligible = eligible_miners(SERVING, validator_permits=permits, validator_trust=trust)
+    eligible = eligible_miners(SERVING, validator_permits=permits, validator_trust=trust, owner_hotkey="hk-0")
     assert {uid for uid, _ in eligible} == {1, 2, 4, 5, 6, 7, 8, 9}
     # without a trust list the permit alone decides, conservatively
-    chosen = choose_candidates(SERVING, validator_permits=permits, rng=random.Random(1))
+    chosen = choose_candidates(SERVING, validator_permits=permits, rng=random.Random(1), owner_hotkey="hk-0")
     assert {uid for uid, _ in chosen} == {1, 2, 4, 5, 6, 8, 9}
     # a trust list too short to cover uid 7: its permit alone decides, so it is excluded;
     # uid 3 has a zero entry and stays eligible
-    short = eligible_miners(SERVING, validator_permits=permits, validator_trust=[0.0] * 5)
+    short = eligible_miners(SERVING, validator_permits=permits, validator_trust=[0.0] * 5, owner_hotkey="hk-0")
     assert {uid for uid, _ in short} == {1, 2, 3, 4, 5, 6, 8, 9}
 
 
@@ -33,13 +33,21 @@ def test_permits_may_arrive_as_an_array():
 
     permits = numpy.array([False, False, False, True, False, False, False, True, False, False])
     trust = numpy.array([0.0, 0.0, 0.0, 0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-    eligible = eligible_miners(SERVING, validator_permits=permits, validator_trust=trust)
+    eligible = eligible_miners(SERVING, validator_permits=permits, validator_trust=trust, owner_hotkey="hk-0")
     assert {uid for uid, _ in eligible} == {1, 2, 4, 5, 6, 7, 8, 9}
 
 
 def test_missing_permit_list_only_excludes_the_owner():
-    chosen = choose_candidates(SERVING, validator_permits=None, rng=random.Random(1))
+    chosen = choose_candidates(SERVING, validator_permits=None, rng=random.Random(1), owner_hotkey="hk-0")
     assert {uid for uid, _ in chosen} == set(range(1, 10))
+
+
+def test_uid_zero_is_an_ordinary_miner_and_the_owner_is_excluded_wherever_it_sits():
+    # the owner hotkey is at uid 5 here; uid 0 is just a miner
+    eligible = eligible_miners(SERVING, owner_hotkey="hk-5")
+    assert {uid for uid, _ in eligible} == {0, 1, 2, 3, 4, 6, 7, 8, 9}
+    # no owner known: nobody is excluded for being uid 0
+    assert {uid for uid, _ in eligible_miners(SERVING)} == set(range(10))
 
 
 def test_order_is_random_and_the_list_is_capped():
@@ -55,7 +63,7 @@ def test_default_source_of_randomness_is_not_the_module_random(monkeypatch):
     calls = []
     monkeypatch.setattr("random.shuffle", lambda *a, **k: calls.append("random"))
     chosen = choose_candidates(SERVING)
-    assert calls == [] and set(chosen) == set(SERVING[1:])
+    assert calls == [] and set(chosen) == set(SERVING)  # no owner named: uid 0 is a miner like any other
 
 
 def test_lease_request_names_its_candidates_and_bounds_them():
@@ -92,6 +100,7 @@ async def test_round_callback_offers_a_filtered_random_subset_and_dispatches_onl
             self.subtensor = object()
             self.metagraph = SimpleNamespace(
                 hotkeys=[f"hk-{uid}" for uid in range(40)],
+                owner_hotkey="hk-3",  # the owner sits at uid 3; uid 0 is an ordinary miner
                 validator_permit=[uid == 2 for uid in range(40)],  # uid 2 holds a permit ...
                 validator_trust=[0.5 if uid == 2 else 0.0 for uid in range(40)],  # ... and validates
                 sync=lambda **_: None,
@@ -139,7 +148,7 @@ async def test_round_callback_offers_a_filtered_random_subset_and_dispatches_onl
 
     await decentralized._run_decentralized_validator_async(settings)
 
-    expected = {(uid, f"hk-{uid}") for uid in range(1, 40) if uid != 2}  # not the owner, not the validator
+    expected = {(uid, f"hk-{uid}") for uid in range(40) if uid not in (2, 3)}  # not the validator, not the owner
     assert set(seen["candidates"]) == expected
     assert set(seen["solvers"]) == set(seen["candidates"])  # dispatch goes only to the offered miners
     assert offers[0] == offers[1] == offers[2]  # kept through a failed lease and a rejected one
@@ -163,7 +172,7 @@ def test_next_offer_keeps_the_order_across_failed_leases():
 def test_next_offer_without_a_previous_order_is_a_fresh_shuffle():
     eligible = [(uid, f"hk-{uid}") for uid in range(1, 50)]
     assert next_offer(None, eligible, rng=random.Random(1)) != next_offer(None, eligible, rng=random.Random(2))
-    assert eligible_miners([(0, "owner"), (1, "a")]) == [(1, "a")]
+    assert eligible_miners([(0, "owner"), (1, "a")], owner_hotkey="owner") == [(1, "a")]
 
 
 async def test_round_callback_logs_and_bounds_a_lease_pause(tmp_path, monkeypatch, capsys):
@@ -183,7 +192,7 @@ async def test_round_callback_logs_and_bounds_a_lease_pause(tmp_path, monkeypatc
         def __init__(self, *_args, **_kwargs):
             self.wallet = SimpleNamespace(hotkey=SimpleNamespace(ss58_address="validator"))
             self.subtensor = object()
-            self.metagraph = SimpleNamespace(hotkeys=["owner", "hk-1"], sync=lambda **_: None)
+            self.metagraph = SimpleNamespace(hotkeys=["owner", "hk-1"], owner_hotkey="owner", sync=lambda **_: None)
 
         def setup_bittensor(self):
             pass
@@ -232,7 +241,7 @@ async def test_round_callback_says_so_when_no_miner_is_eligible(tmp_path, monkey
             self.wallet = SimpleNamespace(hotkey=SimpleNamespace(ss58_address="validator"))
             self.subtensor = object()
             # the only serving miner holds a validator permit
-            self.metagraph = SimpleNamespace(hotkeys=["owner", "hk-1"], validator_permit=[False, True],
+            self.metagraph = SimpleNamespace(hotkeys=["owner", "hk-1"], owner_hotkey="owner", validator_permit=[False, True],
                                              validator_trust=[0.0, 0.2], sync=lambda **_: None)
 
         def setup_bittensor(self):

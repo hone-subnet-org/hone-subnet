@@ -3,9 +3,10 @@
 The validator, not the problem server, chooses. It offers the serving miners
 in a random order, and the server must issue slots for exactly the first N of
 them, N fixed by release policy. UIDs that are validating (a permit with
-non-zero validator trust) and the owner UID 0 are never offered. The order
-is kept until a round completes, so a
-rejected lease never earns the server a fresh draw.
+non-zero validator trust) and the subnet owner's hotkey, when the chain
+names one, are never offered.
+The order is kept until a round completes, so a rejected lease never earns
+the server a fresh draw.
 """
 
 from __future__ import annotations
@@ -21,8 +22,12 @@ def eligible_miners(
     *,
     validator_permits: Sequence[bool] | None = None,
     validator_trust: Sequence[float] | None = None,
+    owner_hotkey: str | None = None,
 ) -> list[tuple[int, str]]:
-    """Serving miners minus the owner and the UIDs that are validating.
+    """Serving miners minus the subnet owner and the UIDs that are validating.
+
+    The owner is the hotkey the chain names as the subnet owner, whatever UID
+    it holds; UID 0 is an ordinary miner.
 
     A UID is validating when it holds a validator permit and has non-zero
     validator trust, that is, it sets weights. A permit alone is not enough:
@@ -44,7 +49,11 @@ def eligible_miners(
             return True  # permit with unknown trust: treat as validating
         return trust[uid] > 0.0
 
-    return [(uid, hotkey) for uid, hotkey in serving if uid != 0 and not validating(uid)]
+    return [
+        (uid, hotkey)
+        for uid, hotkey in serving
+        if hotkey != owner_hotkey and not validating(uid)
+    ]
 
 
 def next_offer(
@@ -77,6 +86,8 @@ def choose_candidates(
     validator_permits: Sequence[bool] | None = None,
     limit: int = CANDIDATE_LIMIT,
     rng: secrets.SystemRandom | None = None,
+    owner_hotkey: str | None = None,
 ) -> list[tuple[int, str]]:
     """A fresh random offer from the serving set (no previous order)."""
-    return next_offer(None, eligible_miners(serving, validator_permits=validator_permits), limit=limit, rng=rng)
+    eligible = eligible_miners(serving, validator_permits=validator_permits, owner_hotkey=owner_hotkey)
+    return next_offer(None, eligible, limit=limit, rng=rng)

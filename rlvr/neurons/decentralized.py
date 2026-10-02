@@ -540,6 +540,7 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
                 [(solver.uid, solver.hotkey) for solver in live_solvers],
                 validator_permits=getattr(v.metagraph, "validator_permit", None),
                 validator_trust=getattr(v.metagraph, "validator_trust", None),
+                owner_hotkey=getattr(v.metagraph, "owner_hotkey", None),
             )
             offered = next_offer(offer_state["order"], eligible)
             offer_state["order"] = offered  # reused until a round completes
