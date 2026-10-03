@@ -23,6 +23,7 @@ from .api import (
     MinerSubmission,
     MinerTaskRequest,
     MinerTaskResponse,
+    RoundVerdict,
     derive_miner_request_id,
     validate_commit_reveal,
 )
@@ -32,6 +33,7 @@ from .client import V3ProblemServerClient
 from .download import download_artifact
 from .grading import EvaluationResult, evaluate_repository, evaluate_terminal
 from .identity import RepositoryTaskIdentity, TerminalScriptTaskIdentity
+from .ledger import RoundLedger
 from .manifest import load_manifest
 from .patch import PatchLimits
 from .reasons import MinerReason, RoundReason, Stage
@@ -216,6 +218,45 @@ def _verdict(grant: ArtifactGrant, evaluation: MinerEvaluation) -> FeedbackVerdi
     )
 
 
+def _round_verdict(uid: int, hotkey: str, evaluation: MinerEvaluation | None) -> RoundVerdict:
+    """One miner's line in the signed round. A graded answer, passed, failed
+    or rejected after download, keeps its measured latency. A miner with no
+    graded answer, silent or rejected at commit, is a miss with no latency."""
+    graded = evaluation is not None and evaluation.result.stage is not Stage.COMMIT
+    if not graded:
+        return RoundVerdict(uid=uid, hotkey=hotkey, passed=False, response_latency_ms=None)
+    latency = evaluation.latency_ms
+    if type(latency) is not int or not 0 <= latency <= FEEDBACK_LATENCY_MAX_MS:
+        latency = None
+    return RoundVerdict(
+        uid=uid, hotkey=hotkey, passed=evaluation.result.status == "passed", response_latency_ms=latency
+    )
+
+
+async def _report_signed_round(
+    client: V3ProblemServerClient,
+    ledger: RoundLedger,
+    challenge_id: str,
+    task_id: str,
+    pool: Sequence[tuple[int, str]],
+    evaluations: list[MinerEvaluation],
+    *,
+    expires_at: int,
+) -> bool:
+    """Number, sign and keep the round for the shared ledger, naming every
+    miner the lease was issued for, then send it without holding the round
+    up: the first attempt runs in the background and the resender takes over
+    if it fails. Returns whether the round was kept."""
+    try:
+        by_registration = {(item.uid, item.hotkey): item for item in evaluations}
+        verdicts = [_round_verdict(uid, hotkey, by_registration.get((uid, hotkey))) for uid, hotkey in dict.fromkeys(pool)]
+        kept = await asyncio.to_thread(ledger.prepare, challenge_id, task_id, verdicts, expires_at=expires_at)
+    except Exception:  # noqa: BLE001 - the ledger never ends a round
+        return False
+    ledger.send_in_background(client, kept)
+    return True
+
+
 async def _send_diagnostic_feedback(
     client: V3ProblemServerClient,
     challenge_id: str,
@@ -303,6 +344,7 @@ async def evaluate_round(
     cache_dir: str | Path,
     work_dir: str | Path,
     candidates: Sequence[tuple[int, str]],
+    ledger: RoundLedger | None = None,
 ) -> RoundResult:
     # The validator offers these miners, in its own random order. The server
     # must issue slots for exactly the first N of them, N being its setting.
@@ -690,6 +732,16 @@ async def evaluate_round(
             stage = Stage.CLEANUP
         stage = Stage.GRADING
         evaluations.sort(key=lambda item: item.uid)
+        # The signed round first: it is kept on disk the moment it is prepared,
+        # so a slow diagnostic call can never push it past its window.
+        if ledger is not None:
+            reported = await _report_signed_round(
+                client, ledger, lease.challenge_id, lease.task_id,
+                [(slots.submission.uid, slots.submission.hotkey) for slots in lease.slot_pool],
+                evaluations, expires_at=revealed.grading_expires_at,
+            )
+            if not reported:
+                print("[validator] WARN: signed round could not be kept for the ledger")
         feedback_accepted = await _send_diagnostic_feedback(
             client,
             lease.challenge_id,

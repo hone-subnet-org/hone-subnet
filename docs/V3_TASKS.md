@@ -20,7 +20,7 @@ Candidate containers have fixed CPU, memory, process, time, output, temporary-di
 Whole-round infrastructure or protocol failures do not update scores. Miner-specific upload, patch, build, test, timeout, or output failures affect only that miner.
 This includes timeout, memory, and output limits reached by a trusted inspection while processing a candidate's result. Missing trusted executables and container control failures remain infrastructure failures. This classification adds no container runs.
 
-After a completed round, the validator reports one verdict per submission grant: pass or fail, the grading duration, the miner's response latency (dispatch to signed response) and, for a failed verdict, the miner reason code. This feedback is diagnostic and does not affect scores or weights.
+After a completed round, the validator reports one verdict per submission grant: pass or fail, the grading duration, the miner's response latency (dispatch to signed response) and, for a failed verdict, the miner reason code. Separately, the validator posts the round for the shared ledger: numbered, signed by its hotkey over the challenge, task, sequence number and every miner the lease named with its verdict and latency, and kept on disk until the server has it, so other validators can pool it and a missing round shows as a gap. This feedback is diagnostic and does not affect scores or weights.
 Validators also retain bounded [local evaluation records](MINER_DIAGNOSTICS.md), including failure codes and abandoned-round outcomes. These records do not change the feedback wire contract.
 
 ## Rollout

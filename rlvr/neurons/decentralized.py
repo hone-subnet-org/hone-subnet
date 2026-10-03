@@ -25,6 +25,7 @@ from ..problemserver.client import (
 from ..scoring.eval_engine import EvalEngine
 from ..v3.client import V3ProblemServerClient
 from ..v3.diagnostics import EvaluationLog
+from ..v3.ledger import RETRY_MIN_S, RoundLedger, next_backoff, pass_interval
 from ..v3.reasons import RoundReason
 from ..v3.release import default_grading_concurrency
 from ..v3.release import round_policy as v3_round_policy
@@ -220,6 +221,20 @@ def _grading_concurrency(settings: Settings, policy: ValidatorPolicy, state_dir:
         "set VALIDATOR_GRADING_CONCURRENCY to override"
     )
     return sized
+
+
+async def _resend_feedback(ledger: RoundLedger, client: V3ProblemServerClient) -> None:
+    """Keep sending kept rounds until the server has them. Backs off while it
+    keeps refusing, polls slowly when idle, and never touches a round in progress."""
+    backoff = RETRY_MIN_S
+    still_pending = True  # a restart may find kept rounds: look soon
+    while True:
+        await asyncio.sleep(pass_interval(backoff, still_pending))
+        try:
+            still_pending = await ledger.retry_pending(client)
+        except Exception:  # noqa: BLE001 - the resender must outlive any one failure
+            still_pending = True
+        backoff = next_backoff(backoff, still_pending)
 
 
 def _weight_observation_count(engine: EvalEngine) -> int:
@@ -528,6 +543,11 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
         )
         dispatch_policy_logged = False
         send_gate = SendGate(settings.validator_send_concurrency)
+        ledger = (
+            RoundLedger(validator.wallet, state_dir / "feedback-outbox")
+            if validator.wallet is not None
+            else None
+        )
         offer_state: dict[str, list[tuple[int, str]] | None] = {"order": None}
 
         async def round_callback(v: ValidatorNeuron) -> dict[int, float]:
@@ -566,6 +586,7 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
                 cache_dir=state_dir / "v3-workspace-cache",
                 work_dir=state_dir / "v3-rounds",
                 candidates=offered,
+                ledger=ledger,
             )
             if result.status == "completed" or result.reason_code is RoundReason.QUORUM_NOT_MET:
                 # A completed round earns a fresh draw. So does a quorum
@@ -641,7 +662,15 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
 
         validator.set_round_callback(round_callback)
         validator.set_weight_setter(weight_setter)
-        await validator.run()
+        resender = asyncio.create_task(_resend_feedback(ledger, client)) if ledger is not None else None
+        try:
+            await validator.run()
+        finally:
+            if resender is not None:
+                resender.cancel()
+                await asyncio.gather(resender, return_exceptions=True)
+            if ledger is not None:
+                await ledger.close()  # before the HTTP client closes
 
 
 # The longest a server "retry later" reply may silence leasing. A server that

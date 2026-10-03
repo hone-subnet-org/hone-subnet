@@ -124,7 +124,7 @@ async def test_round_callback_offers_a_filtered_random_subset_and_dispatches_onl
 
     offers = []
 
-    async def evaluate(client, http, solvers, policy, *, cache_dir, work_dir, candidates):
+    async def evaluate(client, http, solvers, policy, *, cache_dir, work_dir, candidates, **_kwargs):
         seen["solvers"] = [(s.uid, s.hotkey) for s in solvers]
         seen["candidates"] = list(candidates)
         offers.append(list(candidates))

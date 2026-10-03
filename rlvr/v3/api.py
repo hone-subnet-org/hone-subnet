@@ -396,6 +396,47 @@ class ChallengeFeedbackRequest(WireModel):
         return self
 
 
+class RoundVerdict(WireModel):
+    """One miner's outcome in a signed round: exactly the signed fields."""
+
+    uid: UID
+    hotkey: BoundedIdentifier
+    passed: StrictBool
+    response_latency_ms: Annotated[int, Field(ge=0, le=FEEDBACK_LATENCY_MAX_MS)] | None = None
+
+
+class SignedRound(WireModel):
+    """A validator's whole round, numbered and signed, for the shared ledger.
+
+    Names every miner the lease was issued for. The signature is sr25519 by
+    the validator's hotkey over the message in rlvr/v3/verdicts.py.
+    """
+
+    protocol_version: ProtocolVersion
+    challenge_id: BoundedIdentifier
+    task_id: HexDigest
+    round_seq: Annotated[int, Field(ge=1, le=SAFE_INTEGER_MAX)]
+    verdicts: Annotated[list[RoundVerdict], Field(min_length=1, max_length=1_024)]
+    signature: Annotated[str, Field(pattern=r"^0x(?:[0-9a-f]{2}){1,256}$")]
+
+    @model_validator(mode="after")
+    def one_verdict_per_miner(self) -> SignedRound:
+        uids = [item.uid for item in self.verdicts]
+        hotkeys = [item.hotkey for item in self.verdicts]
+        if len(uids) != len(set(uids)) or len(hotkeys) != len(set(hotkeys)):
+            raise ValueError("a signed round names each miner once")
+        if uids != sorted(uids):
+            raise ValueError("a signed round lists miners by uid")
+        return self
+
+
+def serialize_signed_round(report: SignedRound) -> bytes:
+    if type(report) is not SignedRound:
+        raise TypeError("report must be a signed round")
+    validated = SignedRound.model_validate(report.model_dump(mode="python"))
+    return validated.model_dump_json().encode("utf-8")
+
+
 class ChallengeFeedbackResponse(WireModel):
     protocol_version: ProtocolVersion
     challenge_id: BoundedIdentifier

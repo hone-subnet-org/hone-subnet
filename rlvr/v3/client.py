@@ -104,6 +104,12 @@ class V3ProblemServerClient:
             print(f"[validator] WARN: invalid V3 commit response: {error}")
             return None
 
+    async def signed_round_status(self, body: bytes) -> int | None:
+        """POST one signed round exactly as given; the HTTP status, or None
+        when nothing answered. Kept rounds are resent byte for byte."""
+        response = await self._transport.post("/v3/challenges/round", bytes(body))
+        return None if response is None else response.status_code
+
     async def feedback(self, request: ChallengeFeedbackRequest) -> bool:
         body = serialize_feedback_request(request)
         response = await self._transport.post("/v3/challenges/feedback", body)
