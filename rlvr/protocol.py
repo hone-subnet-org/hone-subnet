@@ -237,6 +237,71 @@ def sign_message(
     }
 
 
+def _hmac_sign_bytes(signed_by: str, message: bytes) -> str:
+    digest = hmac.new(_hmac_key(signed_by), bytes(message), hashlib.sha256)
+    return "0x" + digest.hexdigest()
+
+
+def sign_detached(hotkey: Any, message: bytes) -> str:
+    """Sign ``message`` with the hotkey, the way request headers are signed.
+
+    Live path: sr25519 by the hotkey Keypair (a wallet is unwrapped to it).
+    Fallback path, only for an opaque signer id when no crypto stack is
+    present: the HMAC the request signer uses. Anything else raises, since a
+    signature nobody can verify must never be posted.
+    """
+    if not isinstance(message, (bytes, bytearray)):
+        raise TypeError("message must be bytes")
+    signed_by = _keypair_address(hotkey)
+    signer = hotkey
+    inner = getattr(signer, "hotkey", None)
+    if inner is not None and inner is not signer and hasattr(inner, "sign"):
+        signer = inner
+    if not isinstance(signer, str) and hasattr(signer, "sign"):
+        if not _HAVE_CRYPTO:
+            raise RuntimeError("a keypair signer needs the crypto stack")
+        signature = "0x" + signer.sign(bytes(message)).hex()  # pragma: no cover - live crypto
+        # A keypair of the wrong kind, or one that does not match the address,
+        # would produce a signature no reader accepts. Check before it leaves.
+        if not verify_detached(signed_by, message, signature):  # pragma: no cover - live crypto
+            raise RuntimeError("the hotkey's signature does not verify against its address")
+        return signature  # pragma: no cover - live crypto
+    if _HAVE_CRYPTO or _looks_like_ss58(signed_by):
+        raise RuntimeError("detached signing needs a keypair, not a bare address")
+    return _hmac_sign_bytes(signed_by, message)
+
+
+def verify_detached(signed_by: str, message: bytes, signature: str) -> bool:
+    """Verify a detached signature, failing closed exactly like request headers.
+
+    A real ss58 signer is only ever verified with real crypto; an opaque signer
+    only with the HMAC fallback, and only when no crypto stack is present.
+    """
+    if not isinstance(message, (bytes, bytearray)) or not isinstance(signature, str):
+        return False
+    if not isinstance(signed_by, str) or not signed_by or not signature.startswith("0x"):
+        return False
+    if _looks_like_ss58(signed_by):
+        if not _HAVE_CRYPTO:
+            return False
+        try:  # pragma: no cover - live crypto path
+            keypair = _Keypair(ss58_address=signed_by)  # type: ignore[call-arg,misc]
+            raw = bytes(message)
+            sig = bytes.fromhex(signature[2:])
+            if not keypair.verify(raw, sig):
+                return False
+            # Keypair.verify also accepts a signature made over
+            # "<Bytes>" + message + "</Bytes>" (the browser-wallet wrapping).
+            # Such a signature verifies against the wrapped bytes too; one over
+            # the exact message does not. Accept only the exact message.
+            return not keypair.verify(b"<Bytes>" + raw + b"</Bytes>", sig)
+        except Exception:  # noqa: BLE001 - fail closed
+            return False
+    if _HAVE_CRYPTO:
+        return False
+    return hmac.compare_digest(_hmac_sign_bytes(signed_by, message), signature)
+
+
 def verify_signature(
     headers: Mapping[str, str],
     body: bytes,

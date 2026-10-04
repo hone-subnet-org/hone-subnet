@@ -12,7 +12,9 @@ from pathlib import Path
 import httpx
 import pytest
 
+from rlvr import protocol
 from rlvr.scoring.eval_engine import EvalEngine
+from rlvr.v3 import pool as pool_module
 from rlvr.v3.api import (
     EPISTULA_HEADERS,
     FEEDBACK_LATENCY_MAX_MS,
@@ -20,8 +22,11 @@ from rlvr.v3.api import (
     ChallengeFeedbackResponse,
     CommitRevealResponse,
     LeaseResponse,
+    LedgerPage,
+    LedgerRound,
     MinerSubmission,
     MinerTaskResponse,
+    SignedRound,
     derive_miner_request_id,
 )
 from rlvr.v3.archive import ArchiveLimits
@@ -30,7 +35,9 @@ from rlvr.v3.client import V3ProblemServerClient
 from rlvr.v3.diagnostics import round_records
 from rlvr.v3.grading import EvaluationResult
 from rlvr.v3.identity import compute_task_id
+from rlvr.v3.ledger import RoundLedger
 from rlvr.v3.patch import PatchLimits
+from rlvr.v3.pool import LedgerPool
 from rlvr.v3.reasons import MinerReason, RoundReason, Stage
 from rlvr.v3.round import (
     MinerEvaluation,
@@ -46,6 +53,7 @@ from rlvr.v3.script import ScriptLimits
 from rlvr.v3.submission import SubmissionLimits
 from rlvr.v3.supervisor import SupervisorPolicy
 from rlvr.v3.tree import TreeLimits
+from rlvr.v3.verdicts import verify_round
 from tests.test_v3_api import lease, slot_set
 from tests.test_v3_archive import compress, make_tar
 
@@ -761,10 +769,15 @@ def test_identical_submissions_are_graded_once_and_every_sender_is_credited(tmp_
         identity=task_identity, task_id=task_id, slot_pool=slots, commit_min_signed_responses=3,
         workspace=workspace_ref, verifier=verifier_ref, expires_at=2**53 - 1,
     ))
-    downloads, feedback_requests = [], []
+    downloads, feedback_requests, signed_rounds = [], [], []
+    monkeypatch.setattr(protocol, "_HAVE_CRYPTO", False)  # an opaque test identity signs the ledger round
+    ledger = RoundLedger("validator", tmp_path / "outbox")
 
     async def handler(request):
         path = request.url.path
+        if request.method == "POST" and path == "/v3/challenges/round":
+            signed_rounds.append(SignedRound.model_validate_json(await request.aread()))
+            return httpx.Response(200, content=b"{}")
         if request.method == "POST" and path == "/v3/challenges/lease":
             return httpx.Response(200, content=leased.model_dump_json())
         if request.method == "POST" and path == "/v3/challenges/commit":
@@ -781,6 +794,8 @@ def test_identical_submissions_are_graded_once_and_every_sender_is_credited(tmp_
             )
             return httpx.Response(200, content=response.model_dump_json())
         if request.method == "POST" and path == "/v3/challenges/feedback":
+            # the signed round is kept (or already delivered) before feedback goes out
+            assert signed_rounds or ledger.pending()
             feedback_requests.append(ChallengeFeedbackRequest.model_validate_json(await request.aread()))
             return httpx.Response(200, content=ChallengeFeedbackResponse(
                 protocol_version=3, challenge_id=leased.challenge_id, task_id=leased.task_id,
@@ -819,12 +834,15 @@ def test_identical_submissions_are_graded_once_and_every_sender_is_credited(tmp_
             monkeypatch.setattr("rlvr.v3.round._remove_tree", cleanup)
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
             client = V3ProblemServerClient("https://problems.invalid", "validator", http, retries=1)
-            return await evaluate_round(
+            outcome = await evaluate_round(
                 client, http, [TimedSolver(uid, f"hk-{uid}", contents[uid]) for uid in contents],
                 dataclasses.replace(policy(tmp_path), grading_concurrency=2, commit_quorum=3),
                 cache_dir=tmp_path / "cache", work_dir=tmp_path / "work",
                 candidates=[(uid, f"hk-{uid}") for uid in contents],
+                ledger=ledger,
             )
+            await ledger.retry_pending(client)  # send what the round kept, as the worker would
+            return outcome
 
     result = asyncio.run(go())
     assert result.status == "completed", result.reason
@@ -849,6 +867,26 @@ def test_identical_submissions_are_graded_once_and_every_sender_is_credited(tmp_
     payments = compute_round_payments(result, speed_half_life_ms=180_000, speed_floor=0.95)
     assert payments[3] == 0.0 and payments[1] == 1.0 and 0.95 < payments[4] < payments[2] < 1.0  # slower copies pay the speed factor
     assert len(list(round_records(result, "validator"))) == 1 + 4  # the round, then one record per miner
+    # the signed round went to the ledger route: numbered 1, every pool miner once, by uid,
+    # the dedup copies each with their own latency, and it verifies by the validator's address
+    (signed,) = signed_rounds
+    assert signed.round_seq == 1 and signed.challenge_id == leased.challenge_id and signed.task_id == leased.task_id
+    assert [(v.uid, v.passed, v.response_latency_ms) for v in signed.verdicts] == [(1, True, 100), (2, True, 200), (3, False, 300), (4, True, 400)]
+    assert verify_round("validator", signed.signature, signed.challenge_id, signed.task_id, 1, signed.verdicts)
+    assert ledger.pending() == []  # delivered, so nothing is kept
+    # ...and another validator, reading the ledger, admits it and scores on it exactly as we paid
+    served = LedgerRound(
+        validator_hotkey="validator", challenge_id=signed.challenge_id, task_id=signed.task_id, round_seq=1,
+        verdicts=signed.verdicts, recorded_at="2026-10-05T12:00:00Z", signature=signed.signature,
+    )
+    other = LedgerPool(own_hotkey="other", cap_per_validator=50, window_s=4 * 86_400, speed_half_life_ms=180_000, speed_floor=0.95)
+    assert other.ingest(
+        LedgerPage(protocol_version=3, rounds=[served], next_cursor=None),
+        admitted=lambda hk: hk == "validator", hotkeys=["hk-0", *(f"hk-{uid}" for uid in contents)],
+        now=pool_module.parse_recorded_at("2026-10-05T12:00:00Z"),
+    ) == (1, 0)
+    pooled = other.scores(["hk-0", *(f"hk-{uid}" for uid in contents)], {}, min_samples=1, now=pool_module.parse_recorded_at("2026-10-05T12:00:00Z"))
+    assert pooled[1:] == pytest.approx([payments[uid] for uid in contents])  # the same payments this validator computed
 
     # a cleanup fault after grading a shared submission still records every sender
     def broken_cleanup(path):
@@ -857,6 +895,7 @@ def test_identical_submissions_are_graded_once_and_every_sender_is_credited(tmp_
     graded.clear()
     result = asyncio.run(go(cleanup=broken_cleanup))
     assert result.status == "abandoned" and result.reason_code is RoundReason.CLEANUP_FAILED
+    assert len(signed_rounds) == 1 and ledger.last_seq() == 1  # an abandoned round is never signed
     assert sorted(item.uid for item in result.diagnostic_evaluations) == sorted(
         uid for uid in contents if contents[uid] in graded
     )

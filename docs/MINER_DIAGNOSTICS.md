@@ -290,8 +290,10 @@ and 1, relative to the fastest positive response time among eligible passers.
 The current floor is 0.95 and the speed half-life is 180 seconds. Failed or
 rejected evaluations contribute zero. Abandoned rounds add no observations.
 
-The score window retains up to 200 recorded observations, with a startup
-denominator of at least four. This is not necessarily 200 wall-clock rounds:
+The local score window retains up to 200 recorded observations, with a startup
+denominator of at least four; the pooled window adds other validators' signed
+rounds from the shared ledger, at most 50 per validator per miner inside four
+days, each round counting equally. This is not necessarily 200 wall-clock rounds:
 serving miners not sampled for a task do not receive an observation, while
 previously observed nonserving miners receive zero on completed rounds when
 nonresponder decay is enabled. A hotkey change resets the old registration's
