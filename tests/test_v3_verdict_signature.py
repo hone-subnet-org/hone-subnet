@@ -14,14 +14,7 @@ from pydantic import ValidationError
 from rlvr import protocol
 from rlvr.v3.api import RoundVerdict, SignedRound, serialize_signed_round
 from rlvr.v3.grading import EvaluationResult
-from rlvr.v3.ledger import (
-    IDLE_S,
-    RETRY_MAX_S,
-    RETRY_MIN_S,
-    RoundLedger,
-    next_backoff,
-    pass_interval,
-)
+from rlvr.v3.ledger import RoundLedger
 from rlvr.v3.reasons import MinerReason, Stage
 from rlvr.v3.round import MinerEvaluation, _report_signed_round
 from rlvr.v3.verdicts import ROUND_DOMAIN, round_message, sign_round, verify_round
@@ -356,18 +349,32 @@ def test_numbering_and_removal_from_two_threads_never_repeat_or_lower_a_number(t
     assert ledger.prepare("chal-last", TASK, [verdict(2, True)], expires_at=10**10).seq == 61
 
 
-def test_backoff_doubles_to_a_cap_while_pending_and_resets_when_nothing_is_kept():
-    backoff = RETRY_MIN_S
-    seen = []
-    for _ in range(10):
-        backoff = next_backoff(backoff, True)
-        seen.append(backoff)
-    assert seen == [10, 20, 40, 80, 160, 320, 640, 900, 900, 900]
-    assert next_backoff(RETRY_MAX_S, False) == RETRY_MIN_S
-    # idle polling never feeds the backoff: after an idle stretch a fresh failure waits the minimum
-    assert pass_interval(RETRY_MIN_S, False) == IDLE_S
-    assert pass_interval(RETRY_MIN_S, True) == RETRY_MIN_S
-    assert pass_interval(RETRY_MAX_S, True) == RETRY_MAX_S
+def test_the_worker_sends_on_wake_and_keeps_trying_on_its_own(tmp_path, monkeypatch):
+    import rlvr.v3.ledger as ledger_module
+
+    monkeypatch.setattr(ledger_module, "RETRY_S", 0.05)
+
+    async def scenario():
+        ledger = RoundLedger("validator", tmp_path / "outbox")
+        server = Server(503, 200, 200)
+        worker = asyncio.create_task(ledger.run(server))
+        await asyncio.sleep(0.02)
+        assert server.bodies == []  # nothing kept: the worker waits
+        ledger.prepare("chal-1", TASK, [verdict(2, True)], expires_at=10**10)
+        ledger.notify()
+        deadline = time.monotonic() + 5
+        while ledger.pending() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert ledger.pending() == [] and len(server.bodies) == 2  # refused once, retried by itself, delivered
+        ledger.prepare("chal-2", TASK, [verdict(2, True)], expires_at=10**10)
+        ledger.notify()
+        while ledger.pending() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert ledger.pending() == [] and len(server.bodies) == 3
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
+    asyncio.run(scenario())
 
 
 def test_an_expired_round_is_dropped_at_the_moment_of_sending(tmp_path, capsys):
@@ -386,11 +393,10 @@ def evaluation(uid, status, *, latency=5, code=None, stage=Stage.CHECK):
     return MinerEvaluation(uid, f"hk-{uid}", latency, result, 3)
 
 
-async def report_and_wait(*args, **kwargs):
-    """Report a round, then let its background first send finish."""
-    kept = await _report_signed_round(*args, **kwargs)
-    pending = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
-    await asyncio.gather(*pending)
+async def report_and_wait(server, ledger, *args, **kwargs):
+    """Report a round, then send it the way the worker would."""
+    kept = await _report_signed_round(server, ledger, *args, **kwargs)
+    await ledger.retry_pending(server)
     return kept
 
 
@@ -429,28 +435,13 @@ def test_a_round_where_nobody_was_graded_is_still_reported(tmp_path):
     assert ledger.pending() == []
 
 
-def test_the_round_is_kept_before_the_first_send_and_the_send_does_not_hold_the_round(tmp_path):
-    class Slow(Server):
-        def __init__(self):
-            super().__init__(200)
-            self.started = asyncio.Event()
-            self.release = asyncio.Event()
-
-        async def signed_round_status(self, body):
-            self.started.set()
-            await self.release.wait()
-            return await super().signed_round_status(body)
-
+def test_the_round_is_kept_and_reported_before_anything_is_sent(tmp_path):
     async def scenario():
         ledger = RoundLedger("validator", tmp_path / "outbox")
-        server = Slow()
+        server = Server(200)
         kept = await _report_signed_round(server, ledger, "chal-1", TASK, [(1, "hk-1")], [evaluation(1, "passed")], expires_at=10**10)
-        assert kept is True and len(ledger.pending()) == 1  # returned while the send is still on its way
-        await server.started.wait()
-        assert await ledger.retry_pending(server) is True  # the resender leaves a round already in flight alone
-        assert len(server.bodies) == 0
-        server.release.set()
-        await asyncio.gather(*[task for task in asyncio.all_tasks() if task is not asyncio.current_task()])
+        assert kept is True and len(ledger.pending()) == 1 and server.bodies == []  # on disk, not yet on the wire
+        assert await ledger.retry_pending(server) is False
         assert len(server.bodies) == 1 and ledger.pending() == []
 
     asyncio.run(scenario())
@@ -539,7 +530,37 @@ def test_numbers_beyond_twelve_digits_are_still_recognised(tmp_path):
     assert ledger.last_seq() == 10**12
 
 
-def test_close_cancels_a_first_send_still_running_and_keeps_the_record(tmp_path):
+def test_a_new_round_is_sent_at_once_even_while_an_older_one_waits_for_its_retry(tmp_path, monkeypatch):
+    import rlvr.v3.ledger as ledger_module
+
+    monkeypatch.setattr(ledger_module, "RETRY_S", 3600)  # a retry wait that would outlive the test
+
+    class RefuseFirst(Server):
+        async def signed_round_status(self, body):
+            self.bodies.append(bytes(body))
+            return 503 if b"chal-1" in body else 200
+
+    async def scenario():
+        ledger = RoundLedger("validator", tmp_path / "outbox")
+        server = RefuseFirst()
+        ledger.prepare("chal-1", TASK, [verdict(2, True)], expires_at=10**10)
+        worker = asyncio.create_task(ledger.run(server))
+        deadline = time.monotonic() + 5
+        while len(server.bodies) < 1 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        ledger.prepare("chal-2", TASK, [verdict(2, True)], expires_at=10**10)
+        ledger.notify()  # the worker is in its retry wait: the wake must cut it short
+        while len(server.bodies) < 3 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert [b"chal-1" in body for body in server.bodies] == [True, True, False]  # both resent, the new one first time
+        assert [p.name for p in ledger.pending()] == ["round-000000000001.json"]
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_cancelling_the_worker_mid_send_keeps_the_record(tmp_path):
     class Stalled(Server):
         async def signed_round_status(self, body):
             self.bodies.append(bytes(body))
@@ -549,11 +570,15 @@ def test_close_cancels_a_first_send_still_running_and_keeps_the_record(tmp_path)
     async def scenario():
         ledger = RoundLedger("validator", tmp_path / "outbox")
         server = Stalled()
-        await _report_signed_round(server, ledger, "chal-1", TASK, [(1, "hk-1")], [evaluation(1, "passed")], expires_at=10**10)
-        await asyncio.sleep(0)  # let the first send start
-        assert len(ledger._sends) == 1 and len(server.bodies) == 1
-        await ledger.close()
-        assert ledger._sends == set() and len(ledger.pending()) == 1  # kept for next time
+        ledger.prepare("chal-1", TASK, [verdict(2, True)], expires_at=10**10)
+        worker = asyncio.create_task(ledger.run(server))
+        deadline = time.monotonic() + 5
+        while not server.bodies and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert len(server.bodies) == 1
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        assert worker.cancelled() and len(ledger.pending()) == 1  # kept for next time
 
     asyncio.run(scenario())
 

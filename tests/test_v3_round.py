@@ -14,6 +14,7 @@ import pytest
 
 from rlvr import protocol
 from rlvr.scoring.eval_engine import EvalEngine
+from rlvr.v3 import pool as pool_module
 from rlvr.v3.api import (
     EPISTULA_HEADERS,
     FEEDBACK_LATENCY_MAX_MS,
@@ -21,6 +22,8 @@ from rlvr.v3.api import (
     ChallengeFeedbackResponse,
     CommitRevealResponse,
     LeaseResponse,
+    LedgerPage,
+    LedgerRound,
     MinerSubmission,
     MinerTaskResponse,
     SignedRound,
@@ -34,6 +37,7 @@ from rlvr.v3.grading import EvaluationResult
 from rlvr.v3.identity import compute_task_id
 from rlvr.v3.ledger import RoundLedger
 from rlvr.v3.patch import PatchLimits
+from rlvr.v3.pool import LedgerPool
 from rlvr.v3.reasons import MinerReason, RoundReason, Stage
 from rlvr.v3.round import (
     MinerEvaluation,
@@ -837,7 +841,7 @@ def test_identical_submissions_are_graded_once_and_every_sender_is_credited(tmp_
                 candidates=[(uid, f"hk-{uid}") for uid in contents],
                 ledger=ledger,
             )
-            await asyncio.gather(*ledger._sends)  # let the background first send finish
+            await ledger.retry_pending(client)  # send what the round kept, as the worker would
             return outcome
 
     result = asyncio.run(go())
@@ -870,6 +874,19 @@ def test_identical_submissions_are_graded_once_and_every_sender_is_credited(tmp_
     assert [(v.uid, v.passed, v.response_latency_ms) for v in signed.verdicts] == [(1, True, 100), (2, True, 200), (3, False, 300), (4, True, 400)]
     assert verify_round("validator", signed.signature, signed.challenge_id, signed.task_id, 1, signed.verdicts)
     assert ledger.pending() == []  # delivered, so nothing is kept
+    # ...and another validator, reading the ledger, admits it and scores on it exactly as we paid
+    served = LedgerRound(
+        validator_hotkey="validator", challenge_id=signed.challenge_id, task_id=signed.task_id, round_seq=1,
+        verdicts=signed.verdicts, recorded_at="2026-10-05T12:00:00Z", signature=signed.signature,
+    )
+    other = LedgerPool(own_hotkey="other", cap_per_validator=50, window_s=4 * 86_400, speed_half_life_ms=180_000, speed_floor=0.95)
+    assert other.ingest(
+        LedgerPage(protocol_version=3, rounds=[served], next_cursor=None),
+        admitted=lambda hk: hk == "validator", hotkeys=["hk-0", *(f"hk-{uid}" for uid in contents)],
+        now=pool_module.parse_recorded_at("2026-10-05T12:00:00Z"),
+    ) == (1, 0)
+    pooled = other.scores(["hk-0", *(f"hk-{uid}" for uid in contents)], {}, min_samples=1, now=pool_module.parse_recorded_at("2026-10-05T12:00:00Z"))
+    assert pooled[1:] == pytest.approx([payments[uid] for uid in contents])  # the same payments this validator computed
 
     # a cleanup fault after grading a shared submission still records every sender
     def broken_cleanup(path):

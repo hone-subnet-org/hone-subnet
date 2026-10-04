@@ -8,9 +8,9 @@ into internal components; the production entrypoint always uses
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
 import hashlib
 import json
+from dataclasses import asdict, dataclass
 
 
 @dataclass(frozen=True)
@@ -70,6 +70,13 @@ class ValidatorPolicy:
     # The least time a lease may leave miners. A shorter lease is refused, so
     # the server cannot starve miners into a quorum failure and a fresh draw.
     v3_min_lease_s: int = 600
+    # Pooled scoring over the shared ledger of signed rounds. A validator's
+    # rounds count only while it is validating and holds this share of stake,
+    # each admitted validator counts equally, and one validator contributes at
+    # most this many rounds per miner inside the window.
+    v3_pool_min_stake_share: float = 0.0075
+    v3_pool_cap_per_validator: int = 50
+    v3_pool_window_s: int = 4 * 86_400
 
     def __post_init__(self) -> None:
         if not 0.0 < self.dispatch_fraction <= 1.0:
@@ -119,10 +126,14 @@ class ValidatorPolicy:
             self.v3_miners_per_task,
             self.v3_commit_quorum,
             self.v3_min_lease_s,
+            self.v3_pool_cap_per_validator,
+            self.v3_pool_window_s,
             self.v3_problem_response_read_bytes,
         ):
             if type(value) is not int or value <= 0:
                 raise ValueError("V3 resource limits must be positive integers")
+        if not 0.0 < self.v3_pool_min_stake_share < 1.0:
+            raise ValueError("V3 pool stake share must be a fraction")
 
     @property
     def fingerprint(self) -> str:

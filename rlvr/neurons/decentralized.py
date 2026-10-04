@@ -6,8 +6,10 @@ import asyncio
 import json
 import os
 import shutil
+import time
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 import numpy as np
@@ -25,7 +27,8 @@ from ..problemserver.client import (
 from ..scoring.eval_engine import EvalEngine
 from ..v3.client import V3ProblemServerClient
 from ..v3.diagnostics import EvaluationLog
-from ..v3.ledger import RETRY_MIN_S, RoundLedger, next_backoff, pass_interval
+from ..v3.ledger import RoundLedger
+from ..v3.pool import LedgerPool, validating_with_stake
 from ..v3.reasons import RoundReason
 from ..v3.release import default_grading_concurrency
 from ..v3.release import round_policy as v3_round_policy
@@ -223,23 +226,96 @@ def _grading_concurrency(settings: Settings, policy: ValidatorPolicy, state_dir:
     return sized
 
 
-async def _resend_feedback(ledger: RoundLedger, client: V3ProblemServerClient) -> None:
-    """Keep sending kept rounds until the server has them. Backs off while it
-    keeps refusing, polls slowly when idle, and never touches a round in progress."""
-    backoff = RETRY_MIN_S
-    still_pending = True  # a restart may find kept rounds: look soon
-    while True:
-        await asyncio.sleep(pass_interval(backoff, still_pending))
+POOL_SYNC_BUDGET_S = 20.0  # the most of a round the ledger pull may take
+POOL_PAGES_PER_SYNC = 5  # pages pulled per completed round; the rest waits for the next
+
+
+def _ledger_admission(metagraph: Any, policy: ValidatorPolicy):
+    """Who counts right now: validating with enough stake, looked up once per hotkey."""
+    cache: dict[str, bool] = {}
+
+    def admit(hotkey: str) -> bool:
+        if hotkey not in cache:
+            cache[hotkey] = validating_with_stake(metagraph, hotkey, min_share=policy.v3_pool_min_stake_share)
+        return cache[hotkey]
+
+    return admit
+
+
+async def _sync_pool(
+    pool: LedgerPool,
+    client: V3ProblemServerClient,
+    metagraph: Any,
+    policy: ValidatorPolicy,
+    path: Path,
+    *,
+    now: float | None = None,
+) -> None:
+    """Pull what the ledger has since our cursor, a bounded number of pages,
+    admit by signature, permit, trust and stake, and keep the state on disk.
+    A 404 means the server does not serve the ledger yet: nothing changes."""
+    current = time.time() if now is None else now
+    admit = _ledger_admission(metagraph, policy)
+    taken = dropped = pages = 0
+    started = time.monotonic()
+    for _ in range(POOL_PAGES_PER_SYNC):
+        remaining = POOL_SYNC_BUDGET_S - (time.monotonic() - started)
+        if remaining <= 0:
+            break  # the rest waits for the next round; the cursor is where we stopped
+        before = pool.cursor
         try:
-            still_pending = await ledger.retry_pending(client)
-        except Exception:  # noqa: BLE001 - the resender must outlive any one failure
-            still_pending = True
-        backoff = next_backoff(backoff, still_pending)
+            # The whole fetch, retries and body included, must fit what is left
+            # of the budget: a server trickling bytes cannot hold the round loop.
+            fetched = await asyncio.wait_for(client.fetch_rounds(since=before), timeout=remaining)
+        except asyncio.TimeoutError:
+            print(f"[validator] ledger: fetch exceeded the {POOL_SYNC_BUDGET_S:g} s budget; keeping the pool as it is")
+            break
+        if fetched.status == 404:
+            break  # the server does not serve the ledger yet
+        if fetched.page is None:
+            print(f"[validator] ledger: fetch failed (HTTP {fetched.status}); keeping the pool as it is")
+            break
+        pages += 1
+        got, lost = pool.ingest(fetched.page, admitted=admit, hotkeys=list(metagraph.hotkeys), now=current)
+        taken += got
+        dropped += lost
+        page = fetched.page
+        # Stop when the server has nothing more, or is not moving us forward:
+        # no rounds, no cursor, or the same cursor back. A page of rounds we
+        # did not take, expired or already held, still moves the cursor on.
+        if not page.rounds or not page.next_cursor or page.next_cursor == before:
+            break
+    pool.settle(list(metagraph.hotkeys), current, admitted=admit)
+    if pool.seen:
+        # Saved after every pull, pages or not, so what settle took out stays out across a restart.
+        try:
+            await asyncio.to_thread(pool.save, path)
+        except OSError as error:
+            print(f"[validator] WARN: ledger pool state not saved: {type(error).__name__}")
+    if pages:
+        print(
+            f"[validator] ledger: {taken} round(s) admitted, {dropped} dropped, "
+            f"pooling {len(pool.entries)} validator(s)"
+        )
 
 
 def _weight_observation_count(engine: EvalEngine) -> int:
     """Largest authoritative per-uid history available for weight evidence."""
     return max((len(history) for history in engine.histories.values()), default=0)
+
+
+def _pooled_weights(
+    engine: EvalEngine, pool: LedgerPool, hotkeys: Sequence[str], policy: ValidatorPolicy, now: float, admit
+):
+    """L1-normalized weights from the local window plus the admitted ledger
+    rounds, the same way the engine normalizes its own scores."""
+    scores = np.array(
+        pool.scores(hotkeys, engine.histories, min_samples=policy.score_window_min_samples, now=now, admitted=admit),
+        dtype=np.float64,
+    )
+    scores = np.clip(np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0), 0.0, None)
+    total = scores.sum()
+    return np.zeros_like(scores) if total <= 0.0 or not np.isfinite(total) else scores / total
 
 
 def _submit_local_weights(
@@ -249,21 +325,35 @@ def _submit_local_weights(
     *,
     log_response_repr: bool = False,
     policy: ValidatorPolicy = RELEASE_POLICY,
+    pool: LedgerPool | None = None,
 ) -> Optional[bool]:
-    """Submit normalized local weights only after enough completed evidence."""
-    observations = _weight_observation_count(engine)
+    """Submit normalized weights only after enough completed evidence. With
+    admitted ledger rounds the window is pooled; otherwise it is local alone."""
+    hotkeys = list(validator.metagraph.hotkeys)
+    now = time.time()
+    admit = _ledger_admission(validator.metagraph, policy)
+    if pool is not None:
+        pool.settle(hotkeys, now, admitted=admit)  # decide local-or-pooled on what still counts
+    pooled = pool is not None and pool.active
+    observations = (
+        pool.observation_count(hotkeys, engine.histories, now=now, admitted=admit)
+        if pooled
+        else _weight_observation_count(engine)
+    )
     required = policy.min_weight_observations
     if observations < required:
         print(
-            "[validator] local weight evidence "
+            f"[validator] {'pooled' if pooled else 'local'} weight evidence "
             f"{observations}/{required}; skipping submission"
         )
         return None
 
-    weights = engine.get_weights(n=len(validator.metagraph.hotkeys))
+    weights = (
+        _pooled_weights(engine, pool, hotkeys, policy, now, admit) if pooled else engine.get_weights(n=len(hotkeys))
+    )
 
     if float(sum(weights)) <= 0.0:
-        print("[validator] local miner weights are all-zero; skipping")
+        print(f"[validator] {'pooled' if pooled else 'local'} miner weights are all-zero; skipping")
         return None
     uids = [int(uid) for uid in validator.metagraph.uids]
     result = validator.subtensor.set_weights(
@@ -548,6 +638,16 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
             if validator.wallet is not None
             else None
         )
+        pool = LedgerPool(
+            own_hotkey=str(validator.wallet.hotkey.ss58_address) if validator.wallet is not None else "",
+            cap_per_validator=policy.v3_pool_cap_per_validator,
+            window_s=policy.v3_pool_window_s,
+            speed_half_life_ms=policy.payment_speed_half_life_ms,
+            speed_floor=policy.payment_speed_floor,
+        )
+        pool_path = state_dir / "ledger_pool.json"
+        if pool.load(pool_path, now=time.time()):
+            print(f"[validator] ledger pool restored: {len(pool.entries)} validator(s) in the window")
         offer_state: dict[str, list[tuple[int, str]] | None] = {"order": None}
 
         async def round_callback(v: ValidatorNeuron) -> dict[int, float]:
@@ -632,6 +732,13 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
                     )
                 except Exception:  # noqa: BLE001 - feedback never interrupts validation
                     print("[validator] WARN: failure notices could not be sent")
+            if saved and result.status == "completed":
+                # Pull the ledger once per completed round; an incomplete round
+                # makes no further requests, as before.
+                try:
+                    await _sync_pool(pool, client, v.metagraph, policy, pool_path)
+                except Exception as error:  # noqa: BLE001 - pooling never interrupts validation
+                    print(f"[validator] WARN: ledger sync failed: {type(error).__name__}")
             if saved and settings.validator_trace_check_url:
                 try:
                     await send_trace_checks(
@@ -656,21 +763,20 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
                 engine,
                 settings,
                 log_response_repr=not weight_response_logged,
+                pool=pool,
             )
             if result is not None:
                 weight_response_logged = True
 
         validator.set_round_callback(round_callback)
         validator.set_weight_setter(weight_setter)
-        resender = asyncio.create_task(_resend_feedback(ledger, client)) if ledger is not None else None
+        sender = asyncio.create_task(ledger.run(client)) if ledger is not None else None
         try:
             await validator.run()
         finally:
-            if resender is not None:
-                resender.cancel()
-                await asyncio.gather(resender, return_exceptions=True)
-            if ledger is not None:
-                await ledger.close()  # before the HTTP client closes
+            if sender is not None:
+                sender.cancel()  # before the HTTP client closes; kept rounds wait for next time
+                await asyncio.gather(sender, return_exceptions=True)
 
 
 # The longest a server "retry later" reply may silence leasing. A server that

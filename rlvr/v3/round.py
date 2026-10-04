@@ -244,17 +244,17 @@ async def _report_signed_round(
     expires_at: int,
 ) -> bool:
     """Number, sign and keep the round for the shared ledger, naming every
-    miner the lease was issued for, then send it without holding the round
-    up: the first attempt runs in the background and the resender takes over
-    if it fails. Returns whether the round was kept."""
+    miner the lease was issued for, then wake the ledger's worker to send it
+    without holding the round up. Returns whether the round was kept."""
     try:
         by_registration = {(item.uid, item.hotkey): item for item in evaluations}
         verdicts = [_round_verdict(uid, hotkey, by_registration.get((uid, hotkey))) for uid, hotkey in dict.fromkeys(pool)]
-        kept = await asyncio.to_thread(ledger.prepare, challenge_id, task_id, verdicts, expires_at=expires_at)
+        await asyncio.to_thread(ledger.prepare, challenge_id, task_id, verdicts, expires_at=expires_at)
+        return True
     except Exception:  # noqa: BLE001 - the ledger never ends a round
         return False
-    ledger.send_in_background(client, kept)
-    return True
+    finally:
+        ledger.notify()  # whatever reached the disk is sent; a spare wake-up costs nothing
 
 
 async def _send_diagnostic_feedback(

@@ -34,9 +34,8 @@ from .verdicts import sign_round, verify_round
 
 Delivery = Literal["delivered", "retry", "dropped"]
 
-RETRY_MIN_S = 5.0
-RETRY_MAX_S = 900.0
-IDLE_S = 60.0
+SEND_TIMEOUT_S = 60.0  # one attempt, connect to last byte; a server trickling a reply cannot hold the worker
+RETRY_S = 60.0  # between passes while a round is still kept
 
 _RECORD = re.compile(r"^round-(\d{12,16})\.json$")  # zero-padded to 12; the wire allows up to 2**53
 RECORD_FORMAT = 1  # bump, and migrate in _load, if a kept record ever changes shape
@@ -59,8 +58,7 @@ class RoundLedger:
         self._lock = threading.RLock()
         self._depth = 0
         self._handle: int | None = None
-        self._in_flight: set[int] = set()
-        self._sends: set[asyncio.Task] = set()
+        self._wake: asyncio.Event | None = None
 
     # ---- one holder at a time, in this process and across processes
     @contextlib.contextmanager
@@ -87,28 +85,25 @@ class RoundLedger:
                     finally:
                         os.close(handle)  # closing drops the lock even if unlocking failed
 
-    # ---- first sends run in the background and are owned here
-    def send_in_background(self, client: Any, kept: KeptRound) -> asyncio.Task:
-        """The first attempt, without holding the round up. A failure is the
-        resender's job; close() cancels any still running at shutdown."""
-        task = asyncio.create_task(self.deliver(client, kept))
-        self._sends.add(task)
+    # ---- one worker sends everything kept, oldest first
+    async def run(self, client: Any) -> None:
+        """Send kept rounds until the server has them: a pass right away, a
+        pass whenever a round is prepared, and a pass every RETRY_S while
+        anything is still kept. Cancel it before the HTTP client closes."""
+        self._wake = asyncio.Event()
+        while True:
+            self._wake.clear()  # a wake during the pass asks for another pass
+            try:
+                still_pending = await self.retry_pending(client)
+            except Exception:  # noqa: BLE001 - the worker outlives any one failure
+                still_pending = True
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._wake.wait(), timeout=RETRY_S if still_pending else None)
 
-        def done(finished: asyncio.Task) -> None:
-            self._sends.discard(finished)
-            if not finished.cancelled():
-                finished.exception()  # retrieved: a failed first send is retried from disk
-
-        task.add_done_callback(done)
-        return task
-
-    async def close(self) -> None:
-        """Cancel and wait for any first send still running, so nothing uses
-        the HTTP client after it closes. Kept records survive for next time."""
-        sends = list(self._sends)
-        for task in sends:
-            task.cancel()
-        await asyncio.gather(*sends, return_exceptions=True)
+    def notify(self) -> None:
+        """A round was prepared: send it now, without holding the round up."""
+        if self._wake is not None:
+            self._wake.set()
 
     # ---- the validator's own round sequence
     def last_seq(self) -> int:
@@ -188,22 +183,21 @@ class RoundLedger:
 
     async def deliver(self, client: Any, kept: KeptRound, *, now: float | None = None) -> Delivery:
         """One attempt with the kept bytes. The record goes away once the
-        server has the round, or once sending it again could never help. A
-        round already on its way is left alone."""
+        server has the round, or once sending it again could never help."""
         if kept.expires_at <= (time.time() if now is None else now):
             print(f"[validator] WARN: round {kept.seq} expired before the server accepted it")
             await asyncio.to_thread(self._forget, kept.seq)
             return "dropped"
-        if kept.seq in self._in_flight:
-            return "retry"
-        self._in_flight.add(kept.seq)
         try:
-            status = await client.signed_round_status(kept.body)
-        finally:
-            self._in_flight.discard(kept.seq)
+            status = await asyncio.wait_for(client.signed_round_status(kept.body), timeout=SEND_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            print(f"[validator] WARN: round {kept.seq}: no answer within {SEND_TIMEOUT_S:g} s; kept for retry")
+            status = None
         if status == 409:
             # The server holds a round for this number or this challenge
-            # already, or the challenge was never ours. Sending again cannot help.
+            # already, or the challenge was never ours. Sending again cannot
+            # help. Repeated conflicts mean the counter file was lost: rounds
+            # are refused until the numbering passes the server's.
             print(f"[validator] WARN: round {kept.seq} conflicts with what the server holds (HTTP 409); stopped")
         if status in (200, 409):
             await asyncio.to_thread(self._forget, kept.seq)
@@ -254,20 +248,6 @@ def _seq_of(path: Path) -> int:
     if match is None:
         raise ValueError(f"not a kept round: {path.name}")
     return int(match.group(1))
-
-
-def next_backoff(previous: float, still_pending: bool) -> float:
-    """The failure backoff after a pass: doubling up to fifteen minutes while
-    something is still kept, reset to the minimum once nothing is."""
-    if not still_pending:
-        return RETRY_MIN_S
-    return min(RETRY_MAX_S, max(RETRY_MIN_S, previous * 2))
-
-
-def pass_interval(backoff: float, still_pending: bool) -> float:
-    """How long to sleep before the next pass: the backoff while something is
-    kept, otherwise the idle poll."""
-    return backoff if still_pending else IDLE_S
 
 
 def _write_atomic(path: Path, data: bytes) -> None:
