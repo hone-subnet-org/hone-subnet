@@ -49,6 +49,17 @@ grading time.
 The validator stores its scoring window in `data/validator_scores.json`.
 Preserve that file across restarts.
 
+Scoring is pooled across validators. After each round the validator posts
+its signed verdicts to the problem server's ledger and reads the other
+validators' signed rounds back. A round counts when its signature verifies
+and the signing validator is validating and holds at least 0.75% of stake;
+every admitted round counts equally, and one validator contributes at most
+50 rounds per miner inside a four-day window. A miner's score is the
+plain mean of this validator's own observations and the admitted ones, so a
+validator that cannot reach the ledger scores exactly as before. The pool is
+kept in `data/ledger_pool.json` and rounds waiting for the server in
+`data/feedback-outbox/`; both are rebuilt from the server if lost.
+
 ## Protocol
 
 ```text
