@@ -253,6 +253,41 @@ class ProblemServerClient:
                 raise RuntimeError("problem-server response exceeds byte limit")
         return bytes(body)
 
+    async def get(self, path: str) -> Optional[httpx.Response]:
+        """Signed GET over an empty body, bounded like POST, retried on 5xx and
+        the retryable statuses. None when nothing usable came back."""
+        for attempt in range(1, self._retries + 1):
+            headers = sign_message(self._wallet, b"")
+            try:
+                async with self._http.stream(
+                    "GET", f"{self._url}{path}", headers=headers, timeout=self._timeout
+                ) as streamed:
+                    status_code = streamed.status_code
+                    try:
+                        content = await self._read_bounded(streamed)
+                    except RuntimeError:
+                        return None  # a body past the cap is a protocol refusal, never retried
+                    response = httpx.Response(
+                        status_code=status_code,
+                        headers={
+                            name: value for name, value in streamed.headers.items()
+                            if name.lower() not in ("content-encoding", "content-length", "transfer-encoding")
+                        },
+                        content=content,
+                        request=streamed.request,
+                    )
+            except httpx.HTTPError:
+                if attempt < self._retries:
+                    await asyncio.sleep(min(0.25 * (2 ** (attempt - 1)), 2.0))
+                    continue
+                return None
+            retryable = status_code >= 500 or status_code in _RETRYABLE_STATUSES
+            if retryable and attempt < self._retries:
+                await asyncio.sleep(min(0.25 * (2 ** (attempt - 1)), 2.0))
+                continue
+            return response
+        return None
+
     async def post(self, path: str, body: bytes) -> Optional[httpx.Response]:
         outcome = await self.post_result(path, body)
         # Preserve the pre-existing contract for commit/reveal/feedback: an

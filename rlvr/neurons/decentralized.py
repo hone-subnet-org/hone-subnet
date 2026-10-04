@@ -6,8 +6,10 @@ import asyncio
 import json
 import os
 import shutil
+import time
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 import numpy as np
@@ -26,6 +28,7 @@ from ..scoring.eval_engine import EvalEngine
 from ..v3.client import V3ProblemServerClient
 from ..v3.diagnostics import EvaluationLog
 from ..v3.ledger import RETRY_MIN_S, RoundLedger, next_backoff, pass_interval
+from ..v3.pool import LedgerPool, validating_with_stake
 from ..v3.reasons import RoundReason
 from ..v3.release import default_grading_concurrency
 from ..v3.release import round_policy as v3_round_policy
@@ -223,6 +226,52 @@ def _grading_concurrency(settings: Settings, policy: ValidatorPolicy, state_dir:
     return sized
 
 
+async def _sync_pool(
+    pool: LedgerPool,
+    client: V3ProblemServerClient,
+    metagraph: Any,
+    policy: ValidatorPolicy,
+    path: Path,
+    *,
+    now: float | None = None,
+) -> None:
+    """Pull what the ledger has since our cursor, a bounded number of pages,
+    admit by signature, permit, trust and stake, and keep the state on disk.
+    A 404 means the server does not serve the ledger yet: nothing changes."""
+    current = time.time() if now is None else now
+    admitted = {}
+
+    def admit(hotkey: str) -> bool:
+        if hotkey not in admitted:
+            admitted[hotkey] = validating_with_stake(metagraph, hotkey, min_share=policy.v3_pool_min_stake_share)
+        return admitted[hotkey]
+
+    taken = dropped = pages = 0
+    for _ in range(policy.v3_pool_pages_per_round):
+        fetched = await client.fetch_rounds(since=pool.cursor)
+        if fetched.status == 404:
+            return
+        if fetched.page is None:
+            print(f"[validator] ledger: fetch failed (HTTP {fetched.status}); keeping the pool as it is")
+            break
+        pages += 1
+        got, lost = pool.ingest(fetched.page, admitted=admit, hotkeys=list(metagraph.hotkeys), now=current)
+        taken += got
+        dropped += lost
+        if not fetched.page.next_cursor or not fetched.page.rounds:
+            break
+    pool.prune(current)
+    if pages:
+        try:
+            await asyncio.to_thread(pool.save, path)
+        except OSError as error:
+            print(f"[validator] WARN: ledger pool state not saved: {type(error).__name__}")
+        print(
+            f"[validator] ledger: {taken} round(s) admitted, {dropped} dropped, "
+            f"pooling {len(pool.entries)} validator(s)"
+        )
+
+
 async def _resend_feedback(ledger: RoundLedger, client: V3ProblemServerClient) -> None:
     """Keep sending kept rounds until the server has them. Backs off while it
     keeps refusing, polls slowly when idle, and never touches a round in progress."""
@@ -242,6 +291,18 @@ def _weight_observation_count(engine: EvalEngine) -> int:
     return max((len(history) for history in engine.histories.values()), default=0)
 
 
+def _pooled_weights(engine: EvalEngine, pool: LedgerPool, hotkeys: Sequence[str], policy: ValidatorPolicy, now: float):
+    """L1-normalized weights from the local window plus the admitted ledger
+    rounds, the same way the engine normalizes its own scores."""
+    scores = np.array(
+        pool.scores(hotkeys, engine.histories, min_samples=policy.score_window_min_samples, now=now),
+        dtype=np.float64,
+    )
+    scores = np.clip(np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0), 0.0, None)
+    total = scores.sum()
+    return np.zeros_like(scores) if total <= 0.0 or not np.isfinite(total) else scores / total
+
+
 def _submit_local_weights(
     validator: ValidatorNeuron,
     engine: EvalEngine,
@@ -249,21 +310,32 @@ def _submit_local_weights(
     *,
     log_response_repr: bool = False,
     policy: ValidatorPolicy = RELEASE_POLICY,
+    pool: LedgerPool | None = None,
 ) -> Optional[bool]:
-    """Submit normalized local weights only after enough completed evidence."""
-    observations = _weight_observation_count(engine)
+    """Submit normalized weights only after enough completed evidence. With
+    admitted ledger rounds the window is pooled; otherwise it is local alone."""
+    hotkeys = list(validator.metagraph.hotkeys)
+    now = time.time()
+    if pool is not None:
+        pool.settle(hotkeys, now)  # decide local-or-pooled on what still counts
+    pooled = pool is not None and pool.active
+    observations = (
+        pool.observation_count(hotkeys, engine.histories, now=now)
+        if pooled
+        else _weight_observation_count(engine)
+    )
     required = policy.min_weight_observations
     if observations < required:
         print(
-            "[validator] local weight evidence "
+            f"[validator] {'pooled' if pooled else 'local'} weight evidence "
             f"{observations}/{required}; skipping submission"
         )
         return None
 
-    weights = engine.get_weights(n=len(validator.metagraph.hotkeys))
+    weights = _pooled_weights(engine, pool, hotkeys, policy, now) if pooled else engine.get_weights(n=len(hotkeys))
 
     if float(sum(weights)) <= 0.0:
-        print("[validator] local miner weights are all-zero; skipping")
+        print(f"[validator] {'pooled' if pooled else 'local'} miner weights are all-zero; skipping")
         return None
     uids = [int(uid) for uid in validator.metagraph.uids]
     result = validator.subtensor.set_weights(
@@ -548,6 +620,16 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
             if validator.wallet is not None
             else None
         )
+        pool = LedgerPool(
+            own_hotkey=str(validator.wallet.hotkey.ss58_address) if validator.wallet is not None else "",
+            cap_per_validator=policy.v3_pool_cap_per_validator,
+            window_s=policy.v3_pool_window_s,
+            speed_half_life_ms=policy.payment_speed_half_life_ms,
+            speed_floor=policy.payment_speed_floor,
+        )
+        pool_path = state_dir / "ledger_pool.json"
+        if pool.load(pool_path, now=time.time()):
+            print(f"[validator] ledger pool restored: {len(pool.entries)} validator(s) in the window")
         offer_state: dict[str, list[tuple[int, str]] | None] = {"order": None}
 
         async def round_callback(v: ValidatorNeuron) -> dict[int, float]:
@@ -632,6 +714,13 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
                     )
                 except Exception:  # noqa: BLE001 - feedback never interrupts validation
                     print("[validator] WARN: failure notices could not be sent")
+            if saved and result.status == "completed":
+                # Pull the ledger once per completed round; an incomplete round
+                # makes no further requests, as before.
+                try:
+                    await _sync_pool(pool, client, v.metagraph, policy, pool_path)
+                except Exception as error:  # noqa: BLE001 - pooling never interrupts validation
+                    print(f"[validator] WARN: ledger sync failed: {type(error).__name__}")
             if saved and settings.validator_trace_check_url:
                 try:
                     await send_trace_checks(
@@ -656,6 +745,7 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
                 engine,
                 settings,
                 log_response_repr=not weight_response_logged,
+                pool=pool,
             )
             if result is not None:
                 weight_response_logged = True

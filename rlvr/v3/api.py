@@ -430,6 +430,27 @@ class SignedRound(WireModel):
         return self
 
 
+class LedgerRound(WireModel):
+    """One validator's signed round as the server serves it back."""
+
+    validator_hotkey: BoundedIdentifier
+    challenge_id: BoundedIdentifier
+    task_id: HexDigest
+    round_seq: Annotated[int, Field(ge=1, le=SAFE_INTEGER_MAX)]
+    verdicts: Annotated[list[RoundVerdict], Field(min_length=1, max_length=1_024)]
+    recorded_at: Annotated[str, Field(min_length=1, max_length=64)]
+    signature: Annotated[str, Field(pattern=r"^0x(?:[0-9a-f]{2}){1,256}$")]
+
+
+LEDGER_PAGE_LIMIT = 200
+
+
+class LedgerPage(WireModel):
+    protocol_version: ProtocolVersion
+    rounds: Annotated[list[LedgerRound], Field(max_length=LEDGER_PAGE_LIMIT)]
+    next_cursor: Annotated[str, Field(min_length=1, max_length=512)] | None = None
+
+
 def serialize_signed_round(report: SignedRound) -> bytes:
     if type(report) is not SignedRound:
         raise TypeError("report must be a signed round")

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import quote
 from uuid import uuid4
 
 from ..problemserver.client import (
@@ -14,16 +15,24 @@ from ..problemserver.client import (
     status_category,
 )
 from .api import (
+    LEDGER_PAGE_LIMIT,
     ChallengeCommitRequest,
     ChallengeFeedbackRequest,
     ChallengeFeedbackResponse,
     CommitRevealResponse,
     LeaseRequest,
     LeaseResponse,
+    LedgerPage,
     MinerCandidate,
     serialize_commit_request,
     serialize_feedback_request,
 )
+
+
+@dataclass(frozen=True)
+class LedgerFetch:
+    status: int | None
+    page: LedgerPage | None
 
 
 @dataclass(frozen=True)
@@ -103,6 +112,21 @@ class V3ProblemServerClient:
         except Exception as error:  # noqa: BLE001
             print(f"[validator] WARN: invalid V3 commit response: {error}")
             return None
+
+    async def fetch_rounds(self, *, since: str | None, limit: int = LEDGER_PAGE_LIMIT) -> LedgerFetch:
+        """One page of the shared ledger. status None when nothing answered;
+        page None unless the answer was a valid 200."""
+        query = f"?limit={int(limit)}" + (f"&since={quote(since, safe='')}" if since else "")
+        response = await self._transport.get(f"/v3/rounds{query}")
+        if response is None:
+            return LedgerFetch(None, None)
+        if response.status_code != 200:
+            return LedgerFetch(response.status_code, None)
+        try:
+            return LedgerFetch(200, LedgerPage.model_validate_json(response.content))
+        except Exception as error:  # noqa: BLE001 - a malformed page is dropped whole
+            print(f"[validator] WARN: invalid ledger page: {bounded_detail(str(error))}")
+            return LedgerFetch(200, None)
 
     async def signed_round_status(self, body: bytes) -> int | None:
         """POST one signed round exactly as given; the HTTP status, or None
