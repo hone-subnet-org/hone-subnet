@@ -47,7 +47,7 @@ def test_startup_summary_is_stable_and_nonsecret():
     assert f"hash={RELEASE_POLICY.fingerprint}" in summary
     assert "protocol=3" in summary
     assert f"execution_profile={RELEASE_POLICY.v3_execution_profile_id}" in summary
-    assert "score_samples=200" in summary
+    assert "score_samples=100" in summary
     assert summary.endswith("owner_burn=0")
 
 
