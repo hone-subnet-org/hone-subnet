@@ -1,16 +1,16 @@
-"""Contract tests for the count-only 200-problem scoring window.
+"""Contract tests for the count-only 100-problem scoring window.
 
-  * a uid's score averages the latest 200 COMPLETED problems observed since its
+  * a uid's score averages the latest 100 COMPLETED problems observed since its
     current registration -- a pure count window, no age component;
-  * with fewer than 200 observations the denominator is the observed count, not
+  * with fewer than 100 observations the denominator is the observed count, not
     the cap, floored at the four-problem startup gate;
   * the previous 16-hour expiry must no longer affect scores: an observation
-    leaves a history only when a 201st observation pushes it out;
+    leaves a history only when a 101st observation pushes it out;
   * a hotkey change at a uid still clears the whole history (a new registration
     starts empty);
-  * defaults become cap=200 with the startup gate unchanged at 4;
+  * defaults are cap=100 with the startup gate unchanged at 4;
   * an existing persisted six-entry state loads intact -- no reset, no data
-    loss -- and then keeps growing under the larger cap.
+    loss -- and then keeps growing up to the cap.
 
 `window_seconds` remains accepted by the constructor and written to the v2
 state file for rollback compatibility, but it no longer prunes observations.
@@ -32,7 +32,7 @@ from rlvr.scoring.eval_engine import EvalEngine
 from rlvr.policy import LEGACY_SCORE_WINDOW_SECONDS, RELEASE_POLICY
 
 DEFAULTS = Settings(_env_file=None)
-TARGET_SAMPLES = 200
+TARGET_SAMPLES = 100
 STARTUP_GATE = 4
 
 
@@ -66,9 +66,9 @@ def _observe(engine: EvalEngine, count: int, reward: float = 1.0, uid: int = 0):
 
 
 # --------------------------------------------------------------------------- #
-# Count boundary: 199 / 200 / 201
+# Count boundary: 99 / 100 / 101
 # --------------------------------------------------------------------------- #
-def test_one_hundred_ninety_nine_observations_divide_by_their_own_count():
+def test_one_below_the_cap_divides_by_the_observed_count():
     engine = _engine(clock=_advancing_clock())
     _observe(engine, 1, reward=0.0)
     _observe(engine, TARGET_SAMPLES - 2, reward=1.0)
@@ -77,17 +77,17 @@ def test_one_hundred_ninety_nine_observations_divide_by_their_own_count():
     assert engine.scores[0] == pytest.approx((TARGET_SAMPLES - 2) / (TARGET_SAMPLES - 1))
 
 
-def test_two_hundredth_observation_is_retained_not_evicted():
+def test_the_observation_at_the_cap_is_retained_not_evicted():
     engine = _engine(clock=_advancing_clock())
     _observe(engine, 1, reward=0.0)
     _observe(engine, TARGET_SAMPLES - 1, reward=1.0)
 
     assert len(engine.histories[0]) == TARGET_SAMPLES
-    # The single miss is still inside the window and still costs exactly 1/200.
+    # The single miss is still inside the window and still costs exactly 1/100.
     assert engine.scores[0] == pytest.approx((TARGET_SAMPLES - 1) / TARGET_SAMPLES)
 
 
-def test_two_hundred_first_observation_evicts_only_the_oldest():
+def test_the_observation_past_the_cap_evicts_only_the_oldest():
     engine = _engine(clock=_advancing_clock())
     _observe(engine, 1, reward=0.0)
     _observe(engine, TARGET_SAMPLES, reward=1.0)
@@ -180,7 +180,7 @@ def test_four_problem_startup_gate_still_floors_thin_evidence(observations, expe
 # --------------------------------------------------------------------------- #
 # Registration change resets the whole window
 # --------------------------------------------------------------------------- #
-def test_hotkey_change_clears_a_full_two_hundred_problem_history():
+def test_hotkey_change_clears_a_full_history():
     engine = _engine(clock=_advancing_clock())
     engine.set_hotkeys({0: "incumbent"})
     _observe(engine, TARGET_SAMPLES, reward=1.0)
@@ -223,7 +223,7 @@ def test_persisted_history_is_still_reset_by_a_hotkey_change_after_reload(tmp_pa
 # --------------------------------------------------------------------------- #
 # Defaults
 # --------------------------------------------------------------------------- #
-def test_default_score_window_cap_is_two_hundred():
+def test_default_score_window_cap_is_one_hundred():
     assert RELEASE_POLICY.score_window_max_samples == TARGET_SAMPLES
 
 
@@ -232,7 +232,7 @@ def test_default_startup_gates_stay_at_four():
     assert RELEASE_POLICY.min_weight_observations == STARTUP_GATE
 
 
-def test_default_engine_accumulates_two_hundred_observations():
+def test_default_engine_accumulates_a_full_window_of_observations():
     engine = _engine(clock=_advancing_clock())
     _observe(engine, TARGET_SAMPLES, reward=1.0)
 
@@ -305,7 +305,7 @@ def test_loaded_ancient_entries_are_not_expired_by_the_next_record(tmp_path):
     assert engine.scores[0] == pytest.approx(5.0 / 7.0)
 
 
-def test_two_hundred_entry_state_roundtrips_through_persistence(tmp_path):
+def test_a_full_window_of_state_roundtrips_through_persistence(tmp_path):
     path = tmp_path / "scores-full-window.json"
     source = _engine(clock=_advancing_clock())
     source.set_hotkeys({0: "incumbent"})
@@ -321,6 +321,23 @@ def test_two_hundred_entry_state_roundtrips_through_persistence(tmp_path):
 
     assert restored.histories == source.histories
     assert restored.scores == pytest.approx(source.scores)
+
+
+def test_a_previous_release_window_of_two_hundred_loads_as_its_newest_hundred(tmp_path):
+    path = tmp_path / "scores-200.json"
+    previous = _engine(clock=_advancing_clock(), max_samples=200)
+    previous.set_hotkeys({0: "incumbent"})
+    _observe(previous, 100, reward=0.0)  # the older half: all misses
+    _observe(previous, 100, reward=1.0)  # the newer half: all passes
+    _save_scores(previous, str(path))
+    assert json.loads(path.read_text())["max_samples"] == 200
+
+    current = _engine(num_uids=0, clock=_advancing_clock())
+    _load_scores(current, str(path))
+
+    assert len(current.histories[0]) == TARGET_SAMPLES == 100
+    assert all(reward == 1.0 for _, reward in current.histories[0])  # only the newest hundred survive
+    assert current.scores[0] == pytest.approx(1.0)
 
 
 def test_reducing_the_cap_keeps_only_the_latest_observations(tmp_path):

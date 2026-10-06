@@ -22,7 +22,7 @@ class ValidatorPolicy:
     payment_speed_half_life_ms: float = 180_000.0
     payment_speed_floor: float = 0.95
     owner_burn_share: float = 0.0
-    score_window_max_samples: int = 200
+    score_window_max_samples: int = 100
     score_window_min_samples: int = 4
     min_weight_observations: int = 4
     decay_nonresponders: bool = True
