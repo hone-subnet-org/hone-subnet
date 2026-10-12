@@ -12,6 +12,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from rlvr.policy import RELEASE_POLICY
 from rlvr.scoring.eval_engine import EvalEngine
 from rlvr.v3.api import (
     EPISTULA_HEADERS,
@@ -606,6 +607,22 @@ def test_payments_reward_relative_speed_among_passing_miners():
     far_behind = RoundResult("completed", "", (passed(1, 1), passed(2, 10**9)))
     slow = compute_round_payments(far_behind, speed_half_life_ms=180_000, speed_floor=0.95)
     assert slow[2] == pytest.approx(0.95)  # the floor bounds what slowness can cost
+
+
+def test_the_release_policy_pays_every_pass_in_full_whatever_its_speed():
+    def passed(uid, latency_ms):
+        return MinerEvaluation(uid, f"hk-{uid}", latency_ms, EvaluationResult("passed", "", (), None))
+
+    release = {
+        "speed_half_life_ms": RELEASE_POLICY.payment_speed_half_life_ms,
+        "speed_floor": RELEASE_POLICY.payment_speed_floor,
+    }
+    failed = MinerEvaluation(4, "hk-4", 1, EvaluationResult("failed", "x", (), None))
+    result = RoundResult("completed", "", (passed(1, 1), passed(2, 180_000), passed(3, 10**9), passed(5, 0), failed))
+    payments = compute_round_payments(result, **release)
+    assert payments == {1: 1.0, 2: 1.0, 3: 1.0, 5: 1.0, 4: 0.0}  # the speed factor is off: a pass is a pass
+    unusable = RoundResult("completed", "", (passed(1, 0), passed(2, 0)))  # no usable latency at all
+    assert compute_round_payments(unusable, **release) == {1: 1.0, 2: 1.0}
 
 
 def test_scoring_ignores_stale_or_unknown_registrations():

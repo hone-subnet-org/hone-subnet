@@ -285,10 +285,10 @@ task, miner and trajectory role, and match the size and hash of what it fetched.
 
 ## Scoring interpretation
 
-An eligible passing miner gets a contribution between the release speed floor
-and 1, relative to the fastest positive response time among eligible passers.
-The current floor is 0.95 and the speed half-life is 180 seconds. Failed or
-rejected evaluations contribute zero. Abandoned rounds add no observations.
+An eligible passing miner contributes 1. Response latency is measured and
+reported in diagnostics but does not change the contribution: the release
+speed floor is 1, which switches the speed factor off. Failed or rejected
+evaluations contribute zero. Abandoned rounds add no observations.
 
 The score window retains up to 100 recorded observations, with a startup
 denominator of at least four. This is not necessarily 100 wall-clock rounds:
