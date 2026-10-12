@@ -19,8 +19,10 @@ class ValidatorPolicy:
     challenges_per_round: int = 1
     verification_runs: int = 1
     dispatch_fraction: float = 0.5
+    # A floor of 1 switches the speed factor off: every pass pays 1 whatever
+    # its latency. Lower it to pay slower passes less again.
     payment_speed_half_life_ms: float = 180_000.0
-    payment_speed_floor: float = 0.95
+    payment_speed_floor: float = 1.0
     owner_burn_share: float = 0.0
     score_window_max_samples: int = 100
     score_window_min_samples: int = 4
