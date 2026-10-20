@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import shutil
+import socket
 from pathlib import Path
 from typing import Optional
 
@@ -198,6 +199,46 @@ def _validator_http_limits(settings: Settings) -> httpx.Limits:
         # while every configured miner-dispatch permit is in use.
         max_connections=dispatch + 8,
         max_keepalive_connections=min(dispatch, 64),
+    )
+
+
+# TCP keepalive on every validator connection. A /solve request is silent
+# while the miner works, up to the whole solve window, and some networks drop
+# a TCP connection after ~10 idle minutes; that validator then loses every
+# answer slower than that. A probe and its ACK every minute help keep stateful
+# NATs and firewalls from expiring the connection. Application-level timeouts
+# on the path (an L7 proxy in front of a miner) are untouched. The probe count
+# is sized so unanswered probes cannot run out before the solve deadline:
+# 60 s + 60 probes x 60 s = 3660 s, more than SOLVE_DEADLINE_CEILING_S plus
+# the dispatch grace. A busy miner's kernel answers probes, so only a dead
+# path ever fails this way, and a path that answers probes with a reset
+# fails at once; that is the keepalive trade-off.
+KEEPALIVE_IDLE_S = 60
+KEEPALIVE_INTERVAL_S = 60
+KEEPALIVE_PROBES = 60
+
+
+def _keepalive_socket_options() -> list[tuple[int, int, int]]:
+    """Socket options that turn on TCP keepalive with the tuning above (Linux names)."""
+    return [
+        (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+        (socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, KEEPALIVE_IDLE_S),
+        (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, KEEPALIVE_INTERVAL_S),
+        (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, KEEPALIVE_PROBES),
+    ]
+
+
+def _validator_http_transport(settings: Settings) -> httpx.AsyncHTTPTransport:
+    """The validator's connection pool: sized for a full-pool wave, kept alive while miners think.
+
+    An explicit transport is the only place httpx takes socket options. With
+    one, httpx no longer reads HTTP_PROXY, HTTPS_PROXY or ALL_PROXY from the environment,
+    so the validator always connects directly. Client-level limits would be
+    ignored too; they belong here.
+    """
+    return httpx.AsyncHTTPTransport(
+        limits=_validator_http_limits(settings),
+        socket_options=_keepalive_socket_options(),
     )
 
 
@@ -517,7 +558,7 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
         else settings.validator_diagnostics_file
     )
 
-    async with httpx.AsyncClient(limits=_validator_http_limits(settings)) as http:
+    async with httpx.AsyncClient(transport=_validator_http_transport(settings)) as http:
         client = V3ProblemServerClient(
             settings.problem_server_url,
             validator.wallet,

@@ -15,6 +15,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .policy import RELEASE_POLICY, RELEASE_POLICY_ENV_KEYS
 
+# The longest a validator can be told to wait for one miner's answer.
+SOLVE_DEADLINE_CEILING_S = 3600.0
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -29,7 +32,7 @@ class Settings(BaseSettings):
     # Upper bound on how long a validator waits for one miner. The validator
     # waits the shorter of this and the lease expiry, so with the default the
     # lease expiry set by the problem server is the per-task limit.
-    solve_deadline_s: float = Field(default=3600.0, gt=0.0, le=3600.0)
+    solve_deadline_s: float = Field(default=SOLVE_DEADLINE_CEILING_S, gt=0.0, le=SOLVE_DEADLINE_CEILING_S)
     # --- Difficulty classification ---
     band_low: float = Field(default=0.35, ge=0.0, le=1.0)
     band_high: float = Field(default=0.65, ge=0.0, le=1.0)
