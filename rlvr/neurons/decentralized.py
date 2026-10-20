@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import shutil
+import socket
 from pathlib import Path
 from typing import Optional
 
@@ -198,6 +199,29 @@ def _validator_http_limits(settings: Settings) -> httpx.Limits:
         # while every configured miner-dispatch permit is in use.
         max_connections=dispatch + 8,
         max_keepalive_connections=min(dispatch, 64),
+    )
+
+
+def _keepalive_socket_options() -> list[tuple[int, int, int]]:
+    """Probe idle connections every 60 s so NATs and firewalls keep long /solve requests alive.
+
+    A /solve request is silent while the miner works, up to the whole solve
+    window. Some networks drop a TCP connection after ~10 idle minutes, and the
+    validator then loses every answer slower than that. Keepalive probes count
+    as traffic on that path, at the cost of one tiny packet a minute.
+    """
+    options = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+    for name, value in (("TCP_KEEPIDLE", 60), ("TCP_KEEPINTVL", 60), ("TCP_KEEPCNT", 5)):
+        if hasattr(socket, name):  # Linux has all three; macOS lacks TCP_KEEPIDLE
+            options.append((socket.IPPROTO_TCP, getattr(socket, name), value))
+    return options
+
+
+def _validator_http_transport(settings: Settings) -> httpx.AsyncHTTPTransport:
+    """The validator's connection pool: sized for a full-pool wave, kept alive while miners think."""
+    return httpx.AsyncHTTPTransport(
+        limits=_validator_http_limits(settings),
+        socket_options=_keepalive_socket_options(),
     )
 
 
@@ -517,7 +541,7 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
         else settings.validator_diagnostics_file
     )
 
-    async with httpx.AsyncClient(limits=_validator_http_limits(settings)) as http:
+    async with httpx.AsyncClient(transport=_validator_http_transport(settings)) as http:
         client = V3ProblemServerClient(
             settings.problem_server_url,
             validator.wallet,
