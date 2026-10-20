@@ -2,7 +2,9 @@
 
 A /solve request is silent for the whole solve window. Networks that drop idle
 TCP connections after ~10 minutes made one validator lose every slow answer,
-so its pool enables keepalive and probes once a minute.
+so its pool enables keepalive and probes once a minute. The probes only keep
+middleboxes from expiring the connection: they never give up on a miner
+before the solve deadline does.
 """
 
 from __future__ import annotations
@@ -11,9 +13,22 @@ import asyncio
 import socket
 
 import httpx
+import pytest
 
 from rlvr.config import Settings
 from rlvr.neurons import decentralized
+from rlvr.neurons.live import _SOLVE_DEADLINE_GRACE_S
+
+linux_keepalive = pytest.mark.skipif(
+    not hasattr(socket, "TCP_KEEPIDLE"), reason="keepalive tuning needs the Linux socket options"
+)
+
+
+def test_keepalive_never_gives_up_before_the_solve_deadline():
+    ceiling_s = max(bound.le for bound in Settings.model_fields["solve_deadline_s"].metadata if hasattr(bound, "le"))
+    longest_wait_s = ceiling_s + _SOLVE_DEADLINE_GRACE_S
+    budget_s = decentralized.KEEPALIVE_IDLE_S + decentralized.KEEPALIVE_PROBES * decentralized.KEEPALIVE_INTERVAL_S
+    assert budget_s > longest_wait_s
 
 
 def test_transport_keeps_the_pool_size():
@@ -25,6 +40,7 @@ def test_transport_keeps_the_pool_size():
     assert pool._max_keepalive_connections == limits.max_keepalive_connections
 
 
+@linux_keepalive
 async def test_a_real_connection_has_keepalive_enabled():
     handlers: list[asyncio.Task] = []
 
@@ -49,7 +65,7 @@ async def test_a_real_connection_has_keepalive_enabled():
                 assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE) == 1
                 assert sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE) == 60
                 assert sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL) == 60
-                assert sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT) == 5
+                assert sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT) == 60
                 assert await response.aread() == b"ok"
     finally:
         server.close()

@@ -20,6 +20,10 @@ Requirements:
   validator itself and Docker
 - a registered validator hotkey on Finney NETUID 5
 - a system clock synchronized with NTP
+- a direct route to miners and the problem server: the validator's HTTP
+  client ignores `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`, and sends a TCP
+  keepalive probe every minute while a miner works so idle-connection
+  timeouts on the path do not drop slow answers
 
 From the repository root:
 

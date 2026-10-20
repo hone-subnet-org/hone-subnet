@@ -202,23 +202,44 @@ def _validator_http_limits(settings: Settings) -> httpx.Limits:
     )
 
 
-def _keepalive_socket_options() -> list[tuple[int, int, int]]:
-    """Probe idle connections every 60 s so NATs and firewalls keep long /solve requests alive.
+# TCP keepalive on every validator connection. A /solve request is silent
+# while the miner works, up to the whole solve window, and some networks drop
+# a TCP connection after ~10 idle minutes; that validator then loses every
+# answer slower than that. A probe and its ACK every minute help keep stateful
+# NATs and firewalls from expiring the connection; application-level timeouts
+# on the path (an L7 proxy in front of a miner) are untouched. The probe count
+# is sized so the kernel never gives up on a silent miner before the solve
+# deadline does: 60 s + 60 probes x 60 s exceeds the one-hour SOLVE_DEADLINE_S
+# ceiling.
+KEEPALIVE_IDLE_S = 60
+KEEPALIVE_INTERVAL_S = 60
+KEEPALIVE_PROBES = 60
 
-    A /solve request is silent while the miner works, up to the whole solve
-    window. Some networks drop a TCP connection after ~10 idle minutes, and the
-    validator then loses every answer slower than that. Keepalive probes count
-    as traffic on that path, at the cost of one tiny packet a minute.
-    """
+
+def _keepalive_socket_options() -> list[tuple[int, int, int]]:
+    """Socket options that turn on TCP keepalive with the tuning above."""
     options = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
-    for name, value in (("TCP_KEEPIDLE", 60), ("TCP_KEEPINTVL", 60), ("TCP_KEEPCNT", 5)):
-        if hasattr(socket, name):  # Linux has all three; macOS lacks TCP_KEEPIDLE
+    tuning = (
+        ("TCP_KEEPIDLE", KEEPALIVE_IDLE_S),
+        ("TCP_KEEPINTVL", KEEPALIVE_INTERVAL_S),
+        ("TCP_KEEPCNT", KEEPALIVE_PROBES),
+    )
+    for name, value in tuning:
+        # Linux has all three. macOS lacks TCP_KEEPIDLE, so there keepalive
+        # runs on the kernel default (hours) and does not help with this.
+        if hasattr(socket, name):
             options.append((socket.IPPROTO_TCP, getattr(socket, name), value))
     return options
 
 
 def _validator_http_transport(settings: Settings) -> httpx.AsyncHTTPTransport:
-    """The validator's connection pool: sized for a full-pool wave, kept alive while miners think."""
+    """The validator's connection pool: sized for a full-pool wave, kept alive while miners think.
+
+    An explicit transport is the only place httpx takes socket options. With
+    one, httpx no longer reads HTTP_PROXY, HTTPS_PROXY or ALL_PROXY from the environment,
+    so the validator always connects directly. Client-level limits would be
+    ignored too; they belong here.
+    """
     return httpx.AsyncHTTPTransport(
         limits=_validator_http_limits(settings),
         socket_options=_keepalive_socket_options(),
