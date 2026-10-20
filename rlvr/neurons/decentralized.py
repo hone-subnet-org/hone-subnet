@@ -206,30 +206,26 @@ def _validator_http_limits(settings: Settings) -> httpx.Limits:
 # while the miner works, up to the whole solve window, and some networks drop
 # a TCP connection after ~10 idle minutes; that validator then loses every
 # answer slower than that. A probe and its ACK every minute help keep stateful
-# NATs and firewalls from expiring the connection; application-level timeouts
+# NATs and firewalls from expiring the connection. Application-level timeouts
 # on the path (an L7 proxy in front of a miner) are untouched. The probe count
-# is sized so the kernel never gives up on a silent miner before the solve
-# deadline does: 60 s + 60 probes x 60 s exceeds the one-hour SOLVE_DEADLINE_S
-# ceiling.
+# is sized so unanswered probes cannot run out before the solve deadline:
+# 60 s + 60 probes x 60 s = 3660 s, more than SOLVE_DEADLINE_CEILING_S plus
+# the dispatch grace. A busy miner's kernel answers probes, so only a dead
+# path ever fails this way, and a path that answers probes with a reset
+# fails at once; that is the keepalive trade-off.
 KEEPALIVE_IDLE_S = 60
 KEEPALIVE_INTERVAL_S = 60
 KEEPALIVE_PROBES = 60
 
 
 def _keepalive_socket_options() -> list[tuple[int, int, int]]:
-    """Socket options that turn on TCP keepalive with the tuning above."""
-    options = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
-    tuning = (
-        ("TCP_KEEPIDLE", KEEPALIVE_IDLE_S),
-        ("TCP_KEEPINTVL", KEEPALIVE_INTERVAL_S),
-        ("TCP_KEEPCNT", KEEPALIVE_PROBES),
-    )
-    for name, value in tuning:
-        # Linux has all three. macOS lacks TCP_KEEPIDLE, so there keepalive
-        # runs on the kernel default (hours) and does not help with this.
-        if hasattr(socket, name):
-            options.append((socket.IPPROTO_TCP, getattr(socket, name), value))
-    return options
+    """Socket options that turn on TCP keepalive with the tuning above (Linux names)."""
+    return [
+        (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+        (socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, KEEPALIVE_IDLE_S),
+        (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, KEEPALIVE_INTERVAL_S),
+        (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, KEEPALIVE_PROBES),
+    ]
 
 
 def _validator_http_transport(settings: Settings) -> httpx.AsyncHTTPTransport:
