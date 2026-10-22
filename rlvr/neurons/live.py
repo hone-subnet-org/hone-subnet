@@ -45,8 +45,14 @@ def _signature_skew_s(timestamp_header: str) -> float | None:
 
 
 def _first_validation_error(error: ValidationError) -> str:
+    """The first problem pydantic found, as "field: message".
+
+    The field path can hold a key the miner chose, so it is kept to printable
+    text and a short length; the message is pydantic's own wording.
+    """
     first = error.errors()[0]
-    field = ".".join(str(part) for part in first["loc"]) or "body"
+    path = ".".join(str(part) for part in first["loc"]) or "body"
+    field = "".join(ch for ch in path if ch.isprintable())[:80] or "body"
     return f"{field}: {first['msg']}"
 
 
@@ -208,6 +214,8 @@ class LiveSolverClient:
             return failed("lease too short to dispatch")
         timeout_s = min(self._settings.solve_deadline_s, lease_budget)
         overall_deadline = time.monotonic() + timeout_s + _SOLVE_DEADLINE_GRACE_S
+        # What the miner is told it had: the solve window plus the grace actually waited.
+        waited = f"no response within {timeout_s + _SOLVE_DEADLINE_GRACE_S:.0f} s"
 
         async def exchange():
             try:
@@ -269,7 +277,7 @@ class LiveSolverClient:
                     parsed,
                 )
             except httpx.ReadTimeout:
-                return failed(f"no response within {timeout_s:.0f} s")
+                return failed(waited)
             except httpx.HTTPError as error:
                 # The class names the transport failure: ConnectError,
                 # ConnectTimeout, PoolTimeout, ReadError, RemoteProtocolError. Its
@@ -299,7 +307,7 @@ class LiveSolverClient:
                 try:
                     return await asyncio.wait_for(exchange_task, timeout=remaining)
                 except asyncio.TimeoutError:
-                    return failed(f"no response within {timeout_s:.0f} s")
+                    return failed(waited)
             exchange_task.cancel()
             await asyncio.gather(exchange_task, return_exceptions=True)
             return failed("request body did not reach transport before signature deadline")

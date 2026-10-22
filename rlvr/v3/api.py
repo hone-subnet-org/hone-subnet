@@ -303,6 +303,10 @@ class CommitRevealResponse(WireModel):
 
 
 DISPATCH_DETAIL_MAX_CHARS = 200
+# The local outcomes of dispatch; a notice may name one of these, nothing else.
+DISPATCH_CODES = frozenset({
+    MinerReason.NOT_SERVING, MinerReason.DISPATCH_FAILED, MinerReason.RESPONSE_UNAVAILABLE,
+})
 
 
 class FailureExplanation(WireModel):
@@ -348,6 +352,10 @@ class FailureExplanation(WireModel):
             self.dispatch_reason_code is not None or self.dispatch_detail is not None
         ):
             raise ValueError("a pass has no dispatch failure to explain")
+        if self.dispatch_reason_code is not None and self.dispatch_reason_code not in DISPATCH_CODES:
+            raise ValueError("the dispatch code must be a dispatch outcome")
+        if self.dispatch_detail is not None and self.dispatch_reason_code is not MinerReason.RESPONSE_UNAVAILABLE:
+            raise ValueError("only a rejected response carries a detail")
         return self
 
 

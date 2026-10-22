@@ -72,8 +72,9 @@ def build_notice(
         else None
     )
     # What the validator saw locally when it got no usable response. Only the
-    # solver's own description of this miner's response is forwarded; a
-    # validator exception stays in the local record, its code alone goes out.
+    # solver's own description of this miner's response is forwarded, which
+    # may be "validator error: <class>" so the miner knows it was not at
+    # fault; a solver that raised stays in the local record, code alone out.
     local_code = (
         dispatch_reason_code
         if code != "passed" and type(dispatch_reason_code) is MinerReason

@@ -63,7 +63,8 @@ line that does not parse. Run only one validator writer for each log path.
   send in time, or `validator error: <class>` when the validator itself
   failed before or inside the exchange, with the message printed to the
   validator's journal only. For `dispatch_failed` it is the exception class
-  and message, cut to 512 bytes. `null` without a dispatch code.
+  and message, cut to 512 bytes; the submission committed to the problem
+  server carries the class alone. `null` without a dispatch code.
 - `checks_passed`, `checks_executed`, `checks_total`, `checks_skipped`: count
   passed outcomes, passed or failed outcomes, all manifest checks, and remaining
   checks. Totals are `null` until the verifier manifest is loaded. These count

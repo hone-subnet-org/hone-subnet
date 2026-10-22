@@ -37,7 +37,7 @@ from tests.test_demo_miner_feedback import deliver_notice, make_receiver, rememb
 from tests.test_v3_api import lease, slot_set
 from tests.test_v3_archive import compress, make_tar
 from tests.test_v3_grading import eval_repo, eval_term, result as container, runner  # noqa: F401 - fixture
-from tests.test_v3_round import artifact_ref, policy, streamed
+from tests.test_v3_round import Solver, artifact_ref, policy, streamed
 
 TASK = "a" * 64
 
@@ -210,7 +210,7 @@ def cases():
         ("http-error", http_error, r"HTTP 503: maintenance at proxy 10\.0\.0\.7 \(secrets\)"),
         ("dropped", dropped, r"RemoteProtocolError"),
         ("read-error", read_error_about_the_validator, r"ReadError"),
-        ("timed-out", timed_out, r"no response within 3600 s"),
+        ("timed-out", timed_out, r"no response within 3610 s"),  # the solve window plus grace
         ("unreachable", unreachable, r"ConnectTimeout"),
         ("pool-exhausted", pool_exhausted, r"PoolTimeout"),
         ("huge-timestamp", huge_timestamp, r"signature does not verify"),
@@ -256,8 +256,9 @@ async def test_the_exact_cause_reaches_the_record_and_the_notice(name, build, pa
     assert parsed is None
     assert re.fullmatch(pattern, committed.error), committed.error
     assert type(committed.latency_ms) is int and committed.latency_ms >= 0
-    # Whatever the validator's own exceptions said stays out of what is committed;
-    # an HTTP error body is the one miner-sent text that is kept locally.
+    # Whatever the validator's own exceptions said stays out of what is committed.
+    # An HTTP error body is the miner's own response and was always committed;
+    # it is the notice that must not carry it.
     assert "secrets" not in committed.error or name == "http-error"
     journal = capsys.readouterr().out
     if name == "validator-bug":
@@ -371,7 +372,7 @@ async def test_round_keeps_the_solver_error_and_times_an_exception(tmp_path):
     )
     task_id = compute_task_id(identity)
     slots = []
-    for uid in (1, 2, 3):
+    for uid in (1, 2, 3, 4):
         current = slot_set(uid=uid, hotkey=f"hk-{uid}", prefix=f"u{uid}")
         slots.append(current.model_validate({
             "submission": current.submission.model_dump() | {"task_id": task_id},
@@ -382,11 +383,17 @@ async def test_round_keeps_the_solver_error_and_times_an_exception(tmp_path):
         workspace=workspace_ref, verifier=verifier_ref, expires_at=2**53 - 1,
     ))
 
+    committed = {}
+
     async def handler(request):
         if request.url.path == "/v3/challenges/lease":
             return httpx.Response(200, content=leased.model_dump_json())
         if request.url.path == "/workspace":
             return streamed(workspace_blob)
+        if request.url.path == "/v3/challenges/commit":
+            for item in json.loads(await request.aread())["submissions"]:
+                committed[item["uid"]] = item["error"]
+            return httpx.Response(403)  # the round ends here; the commit body is what matters
         return httpx.Response(404)
 
     class Rejecting:
@@ -421,13 +428,20 @@ async def test_round_keeps_the_solver_error_and_times_an_exception(tmp_path):
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         client = V3ProblemServerClient("https://problems.invalid", "validator", http, retries=1)
         result = await evaluate_round(
-            client, http, [Rejecting(), Exploding(), Mute()],
+            client, http, [Rejecting(), Exploding(), Mute(), Solver(4, "hk-4", b"pass")],
             dataclasses.replace(policy(tmp_path), commit_quorum=1),
             cache_dir=tmp_path / "cache", work_dir=tmp_path / "work",
-            candidates=[(1, "hk-1"), (2, "hk-2"), (3, "hk-3")],
+            candidates=[(1, "hk-1"), (2, "hk-2"), (3, "hk-3"), (4, "hk-4")],
         )
-    # No exception took the round down: it ended on quorum, after dispatch.
-    assert (result.status, result.reason_code) == ("abandoned", RoundReason.QUORUM_NOT_MET)
+    # No exception took the round down: the one signed response met quorum and
+    # the round went on to commit, where the fixture server refused it.
+    assert (result.status, result.reason_code) == ("abandoned", RoundReason.COMMIT_FAILED)
+    assert result.signed_responses == 1
+    # The problem server gets the solver's own words, and for a validator
+    # exception the class alone; the message stays in the local record.
+    assert committed == {
+        1: "signature does not verify", 2: "validator error: ValueError", 3: "validator error: Unprintable", 4: "",
+    }
     rejected, exploded, mute = result.dispatch_failures
     assert rejected == DispatchFailure(1, "hk-1", MinerReason.RESPONSE_UNAVAILABLE, "signature does not verify", 77)
     assert exploded.code is MinerReason.DISPATCH_FAILED
@@ -438,7 +452,7 @@ async def test_round_keeps_the_solver_error_and_times_an_exception(tmp_path):
     assert (records[1]["dispatch_detail"], records[1]["response_latency_ms"]) == ("signature does not verify", 77)
     assert (records[2]["dispatch_detail"], records[2]["response_latency_ms"]) == (exploded.detail, exploded.latency_ms)
     assert records[3]["dispatch_detail"] == "Unprintable"
-    assert dispatch_summary(result) == "dispatch: 0 ok, 1 rejected (1 signature does not verify), 2 dispatch failed"
+    assert dispatch_summary(result) == "dispatch: 1 ok, 1 rejected (1 signature does not verify), 2 dispatch failed"
 
 
 # --------------------------------------------------------------------------- #
@@ -664,6 +678,33 @@ async def test_a_validator_exception_stays_in_the_record_and_out_of_the_notice()
         "dispatch_reason_code": "dispatch_failed",
     }
     assert b"secrets" not in received[0]
+
+
+def test_notice_refuses_a_detail_on_anything_but_a_rejected_response():
+    with pytest.raises(ValueError):
+        FailureExplanation(version=1, reason_code=MinerReason.ARTIFACT_INVALID,
+                           dispatch_reason_code=MinerReason.DISPATCH_FAILED, dispatch_detail="x")
+    with pytest.raises(ValueError):
+        FailureExplanation(version=1, reason_code=MinerReason.ARTIFACT_INVALID, dispatch_detail="orphan")
+    with pytest.raises(ValueError):
+        FailureExplanation(version=1, reason_code=MinerReason.ARTIFACT_INVALID,
+                           dispatch_reason_code=MinerReason.CHECK_FAILED)
+    assert FailureExplanation(version=1, reason_code=MinerReason.ARTIFACT_INVALID,
+                              dispatch_reason_code=MinerReason.DISPATCH_FAILED).dispatch_detail is None
+
+
+def test_a_miner_chosen_key_in_a_parse_error_is_kept_short_and_printable():
+    from pydantic import ValidationError
+    from rlvr.neurons.live import _first_validation_error
+
+    task = task_for("hk-7")
+    body = good_response(task, **{"evil\n\x1b[31m" + "k" * 300: 1})  # an extra key inside the submission
+    with pytest.raises(ValidationError) as caught:
+        MinerTaskResponse.model_validate_json(body)
+    text = _first_validation_error(caught.value)
+    assert text.startswith("submission.evil[31mkkk") and text.isprintable()
+    assert len(text.split(":")[0]) <= 80
+    assert text.endswith("Extra inputs are not permitted")
 
 
 def test_notice_detail_bounds_count_characters_and_the_largest_notice_fits():

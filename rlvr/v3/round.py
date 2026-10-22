@@ -514,18 +514,19 @@ async def evaluate_round(
                         )
                     return submission, parsed
                 except Exception as error:  # noqa: BLE001
-                    # Bounded before it goes anywhere: the committed submission's
-                    # error field refuses more than 4 KiB, and a refusal here would
-                    # take the whole round down.
-                    detail = _describe(error)
+                    # The local record keeps class and message, bounded. The
+                    # committed submission, which the problem server reads, gets
+                    # the class alone: the message is the validator's own business.
                     dispatch_failures[registration] = DispatchFailure(
                         *registration,
                         MinerReason.DISPATCH_FAILED,
-                        detail,
+                        _describe(error),
                         int((time.monotonic() - started) * 1000),
                     )
                     return (
-                        _failed_submission(lease.challenge_id, *registration, detail),
+                        _failed_submission(
+                            lease.challenge_id, *registration, f"validator error: {type(error).__name__}"
+                        ),
                         None,
                     )
 
