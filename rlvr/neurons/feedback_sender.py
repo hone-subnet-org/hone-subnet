@@ -85,6 +85,13 @@ def build_notice(
         if local_code is MinerReason.RESPONSE_UNAVAILABLE
         else None
     )
+    if local_detail is not None:
+        try:
+            FailureExplanation(
+                version=1, reason_code=code, dispatch_reason_code=local_code, dispatch_detail=local_detail
+            )
+        except Exception:  # noqa: BLE001 - a detail the wire refuses is left out; the code still goes
+            local_detail = None
     for attempt in ((display, None) if display is not None else (None,)):
         try:
             return MinerFailureNotice(

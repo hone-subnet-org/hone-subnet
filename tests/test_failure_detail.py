@@ -197,6 +197,21 @@ def cases():
             return signed(miner, good_response(task), request, **{"Epistula-Timestamp": "9" * 400})
         return handler
 
+    def absurd_timestamp(task, validator, miner, other):
+        # Still a float, 1e305 s off: not a clock that is off, so no skew is named.
+        async def handler(request):
+            return signed(miner, good_response(task), request, **{"Epistula-Timestamp": "9" * 308})
+        return handler
+
+    def format_character_key(task, validator, miner, other):
+        # The key is NFC on the wire only because U+200D blocks composition;
+        # with the format character dropped, "e" + U+0301 would not be.
+        key = "e\u200d\u0301"
+
+        async def handler(request):
+            return signed(miner, good_response(task, **{key: 1}), request)
+        return handler
+
     return [
         ("different-hotkey", different_hotkey, r"signed by a different hotkey"),
         ("stale-timestamp", stale_timestamp, r"signature timestamp outside the ±8 s window: off by -(19|20|21)\.\d s"),
@@ -214,6 +229,8 @@ def cases():
         ("unreachable", unreachable, r"ConnectTimeout"),
         ("pool-exhausted", pool_exhausted, r"PoolTimeout"),
         ("huge-timestamp", huge_timestamp, r"signature does not verify"),
+        ("absurd-timestamp", absurd_timestamp, r"signature does not verify"),
+        ("format-character-key", format_character_key, r"response does not parse: submission\.\u00e9: Extra inputs are not permitted"),
     ]
 
 
@@ -629,6 +646,12 @@ def test_dispatch_summary_counts_by_cause():
     )
 
 
+def test_dispatch_summary_is_printable_whatever_a_solver_said():
+    result = completed([server_verdict(1)], [rejection(1, "signature\x00 does\x1b[2J not\u2028 verify: x")])
+    summary = dispatch_summary(result)
+    assert summary == "dispatch: 0 ok, 1 rejected (1 signature does[2J not verify)" and summary.isprintable()
+
+
 def test_dispatch_summary_of_a_clean_round():
     result = RoundResult("completed", "", (), challenge_id="chal-1", task_id=TASK,
                          assigned_miners=((1, "hk-1"), (2, "hk-2")), signed_responses=2)
@@ -816,6 +839,24 @@ def test_a_full_multibyte_record_is_written_within_4_kib_and_reads_back(tmp_path
     assert miner["dispatch_detail"].startswith("HTTP 503: ±") and len(miner["dispatch_detail"].encode()) <= 512
     assert "\ufffd" not in miner["dispatch_detail"]
     assert miner["reason"] == "±" * 100
+
+
+@pytest.mark.usefixtures("offline_signatures")
+async def test_a_detail_the_wire_refuses_is_left_out_and_the_code_still_goes():
+    received = []
+
+    async def handler(request):
+        received.append(json.loads(await request.aread())["failure"])
+        return httpx.Response(200)
+
+    # Printable and short, but not NFC, which the wire model refuses.
+    detail = "response does not parse: submission.e\u0301: Extra inputs are not permitted"
+    result = completed([server_verdict(1)], [rejection(1, detail)])
+    assert await deliver(result, handler) == 1
+    assert received == [{
+        "version": 1, "reason_code": "artifact_invalid", "failed_check": None,
+        "dispatch_reason_code": "response_unavailable",
+    }]
 
 
 @pytest.mark.usefixtures("offline_signatures")

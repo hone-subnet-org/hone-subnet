@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import unicodedata
 from typing import Optional
 from uuid import uuid4
 
@@ -39,9 +40,11 @@ _COMMIT_RESERVE_S = 30.0
 def _signature_skew_s(timestamp_header: str) -> float | None:
     """How far the response signature's timestamp is from now, in seconds."""
     try:
-        return (int(timestamp_header) - time.time() * 1000) / 1000
+        skew_s = (int(timestamp_header) - time.time() * 1000) / 1000
     except (ValueError, OverflowError):  # not a number, or absurdly large
         return None
+    # Beyond a few decades it is not a clock that is off, so no skew is named.
+    return skew_s if abs(skew_s) < 1e9 else None
 
 
 def _journal_text(error: BaseException) -> str:
@@ -63,11 +66,13 @@ def _first_validation_error(error: ValidationError) -> str:
     """The first problem pydantic found, as "field: message".
 
     The field path can hold a key the miner chose, so it is kept to printable
-    text and a short length; the message is pydantic's own wording.
+    text, a short length and NFC, which dropping a format character can undo;
+    the message is pydantic's own wording.
     """
     first = error.errors()[0]
     path = ".".join(str(part) for part in first["loc"]) or "body"
-    field = "".join(ch for ch in path if ch.isprintable())[:80] or "body"
+    field = "".join(ch for ch in path if ch.isprintable())[:80]
+    field = unicodedata.normalize("NFC", field) or "body"
     return f"{field}: {first['msg']}"
 
 

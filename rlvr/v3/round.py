@@ -195,8 +195,11 @@ def dispatch_summary(result: RoundResult) -> str | None:
     parts = [f"{result.signed_responses} ok"]
     rejected = [item for item in failures if item.code is MinerReason.RESPONSE_UNAVAILABLE]
     if rejected:
-        # Details read "cause: specifics", so the text before the colon groups them.
-        causes = collections.Counter(item.detail.split(":")[0][:80] for item in rejected)
+        # Details read "cause: specifics", so the text before the colon groups
+        # them. It is printed, so it is kept to printable text.
+        causes = collections.Counter(
+            "".join(ch for ch in item.detail.split(":")[0][:80] if ch.isprintable()) for item in rejected
+        )
         listed = ", ".join(f"{count} {cause}" for cause, count in causes.most_common())
         parts.append(f"{len(rejected)} rejected ({listed})")
     for code, label in (
