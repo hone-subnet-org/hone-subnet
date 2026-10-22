@@ -481,6 +481,7 @@ SERVED_TASK_LIMIT = 256
 SERVED_TASK_TTL_S = 7_200.0
 NOTICE_PRINT_SLOTS = 4
 FEEDBACK_PRINT_HEADER_CHARS = 120
+FEEDBACK_PRINT_LOCAL_CHARS = 512  # a reason code and a 200-char detail, escaped
 
 
 class ServedTasks:
@@ -584,17 +585,20 @@ def print_feedback(lines: list[str]) -> None:
         pass
 
 
-def feedback_lines(header: str, display: str | None) -> list[str]:
+def feedback_lines(header: str, display: str | None, local: str | None = None) -> list[str]:
     """Build every line printed for one notice, header included.
 
-    The header is escaped and cut, since it is only identifiers. The display is
-    escaped but NEVER cut: a shortened expected answer would be a different test.
-    Any display a validator may send is printed whole; a larger one is omitted
-    with a reason instead.
+    The header is escaped and cut, since it is only identifiers. The local line,
+    what the validator saw of this miner's own response, is escaped and cut
+    too. The display is escaped but NEVER cut: a shortened expected answer
+    would be a different test. Any display a validator may send is printed
+    whole; a larger one is omitted with a reason instead.
     """
 
     prefix = "[demo-miner] feedback: "
     lines = [prefix + printable(header)[:FEEDBACK_PRINT_HEADER_CHARS]]
+    if local:
+        lines.append(prefix + "  " + printable(local)[:FEEDBACK_PRINT_LOCAL_CHARS])
     if not display:
         return lines
     if not is_bounded_display(display):
@@ -713,7 +717,12 @@ class DemoMiner:
                 f"challenge {notice.challenge_id[:32]} "
                 f"task {notice.task_id[:16]}"
             )
-            lines = feedback_lines(header, notice.failure.failed_check)
+            local = None
+            if notice.failure.dispatch_reason_code is not None:
+                local = f"validator saw: {notice.failure.dispatch_reason_code.value}"
+                if notice.failure.dispatch_detail:
+                    local += f", {notice.failure.dispatch_detail}"
+            lines = feedback_lines(header, notice.failure.failed_check, local)
             self.printing_notices += 1
             printing = asyncio.create_task(asyncio.to_thread(print_feedback, lines))
             # The slot is freed when the write finishes, even if this request is

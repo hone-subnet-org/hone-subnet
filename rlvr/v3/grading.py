@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import stat
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -110,9 +111,11 @@ def _stop(
     )
 
 
-def _container_failure(result: ContainerResult) -> str | None:
+def _container_failure(
+    result: ContainerResult, what: str, timeout_s: int, elapsed_s: float
+) -> str | None:
     if result.timed_out:
-        return "container timed out"
+        return f"{what} timed out: limit {timeout_s} s, ran {elapsed_s:.1f} s"
     if result.oom_killed:
         return "container exceeded its memory limit"
     if result.stdout_overflow or result.stderr_overflow:
@@ -269,8 +272,11 @@ def _run_checks(
                     stderr_bytes=check.max_stderr_bytes,
                     trusted=True,
                 )
+            started = time.monotonic()
             container = run_container(request, supervisor_policy, docker_binary)
-            failure = _container_failure(container)
+            failure = _container_failure(
+                container, f"check {check.check_id}", check.timeout_s, time.monotonic() - started
+            )
             infrastructure = False
             if (
                 failure is None
@@ -386,6 +392,7 @@ def _run_setup(
     if manifest.setup is not None:
         try:
             setup = manifest.setup
+            started = time.monotonic()
             result = run_container(
                 _request(
                     name=f"{run_prefix}-setup",
@@ -401,7 +408,9 @@ def _run_setup(
                 supervisor_policy,
                 docker_binary,
             )
-            failure = _container_failure(result)
+            failure = _container_failure(
+                result, "setup", setup.timeout_s, time.monotonic() - started
+            )
             if failure is None and result.exit_code != 0:
                 failure = "task setup failed"
             if failure is not None:
@@ -558,6 +567,7 @@ def evaluate_terminal(
             script_path = submission / "script.sh"
             script_path.write_bytes(script)
             script_path.chmod(0o444)
+            started = time.monotonic()
             result = run_container(
                 _request(
                     name=f"{run_prefix}-script",
@@ -592,7 +602,7 @@ def evaluate_terminal(
             stage=Stage.SCRIPT,
         )
 
-    failure = _container_failure(result)
+    failure = _container_failure(result, "script", script_timeout_s, time.monotonic() - started)
     if failure is not None:
         return _stop(
             "failed",

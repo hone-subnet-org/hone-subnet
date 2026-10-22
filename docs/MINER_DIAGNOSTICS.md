@@ -27,9 +27,10 @@ Writes are best effort: a storage failure can leave only some records for a
 round. A missing miner record is not evidence of success, failure, or score credit.
 
 The log uses `schema_version: 1`. Consumers should tolerate additional reason
-codes and skip record types they do not recognize. Each serialized line is at
-most 4 KiB; to meet that cap the optional `failed_check` is dropped first, then
-the optional reason. An interrupted write can leave a malformed line anywhere in
+codes and fields and skip record types they do not recognize. Each serialized
+line is at most 4 KiB; to meet that cap the optional `failed_check` is dropped
+first, then the optional `dispatch_detail`, then the optional reason. An
+interrupted write can leave a malformed line anywhere in
 the file, since the next write ends it and carries on; readers should skip any
 line that does not parse. Run only one validator writer for each log path.
 
@@ -44,6 +45,20 @@ line that does not parse. Run only one validator writer for each log path.
 - `dispatch_reason_code`: records a local dispatch problem independently of
   the server's artifact verdict. For example, `not_serving` can accompany
   a server verdict of `artifact_invalid`.
+- `dispatch_detail`: with a dispatch code, the exact local cause in one
+  bounded sentence, as the validator saw it at the time. For
+  `response_unavailable` it names the check the response failed: `signed by a
+  different hotkey`, `signature timestamp outside the ±8 s window: off by
+  +9.4 s`, `signature does not verify`, `response does not parse:
+  submission.sha256: ...` (the first validation error), `submission does not
+  match its slot: upload ID` (or role, format, or size over the limit), `HTTP
+  503: ...` (the status and up to 512 bytes of the body), the transport
+  exception class alone such as `RemoteProtocolError` or `ReadError` (its
+  message could describe the validator's own network), `no response within
+  1170 s`, or `validator error: <class>` when the validator itself failed
+  inside the exchange, with the message printed to the validator's journal
+  only. For `dispatch_failed` it is the exception class and message. `null`
+  without a dispatch code.
 - `checks_passed`, `checks_executed`, `checks_total`, `checks_skipped`: count
   passed outcomes, passed or failed outcomes, all manifest checks, and remaining
   checks. Totals are `null` until the verifier manifest is loaded. These count
@@ -51,7 +66,13 @@ line that does not parse. Run only one validator writer for each log path.
   before an outcome is recorded can leave that check marked skipped.
   Early stopping is unchanged.
 - `grading_duration_ms` and `response_latency_ms`: describe grading and response
-  time when available. They are `null` for miners without an evaluation record.
+  time when available. A failed dispatch is timed too: `response_latency_ms`
+  is the time until the failure, so a fast rejection can be told from a
+  timeout. It is `null` when no request was made (`not_serving`) and
+  `grading_duration_ms` is `null` for miners without an evaluation record.
+- `reason`: for a `timeout` verdict it names what timed out, its limit and how
+  long it ran, for example `check c03 timed out: limit 30 s, ran 31.2 s`,
+  `setup timed out: ...` or `script timed out: ...`.
 - `failed_check`: the six-line description of the failing check that was
   available for this evaluation, when one could be rendered; otherwise `null`. It
   states what the check required, never what the miner printed. It is not proof
@@ -93,6 +114,12 @@ Dispatch codes describe local observations, not a new fault-attribution policy.
 For example, a local signing or transport-start failure can currently result
 in no signed response. The diagnostic code does not change how that outcome
 is handled by the existing round and server logic.
+
+Once dispatch has run, the validator also prints one journal line per round
+summing it up by cause, for example
+`[validator] dispatch: 110 ok, 12 rejected (8 signature timestamp outside the ±8 s window, 3 response does not parse, 1 no response within 1170 s), 2 not serving`.
+`ok` counts signed, slot-matched responses. Rejections are grouped by the
+text before the colon of their detail.
 
 ## Round and infrastructure reason codes
 
@@ -146,6 +173,17 @@ holding `version`, `reason_code` and an optional `failed_check` display. For an
 inline check the display carries the check's script itself, so the miner sees the
 test it failed.
 
+When the validator got no usable response from the miner, the `failure` object
+also carries `dispatch_reason_code`, and for `response_unavailable` a
+`dispatch_detail`: the same sentence the validator recorded for itself, at
+most 200 printable characters, describing only that miner's own response. So
+a miner can tell "your response was rejected because its signature timestamp
+was 9 s off" from a bad upload. A `dispatch_failed` code goes out alone: the
+exception behind it is the validator's own and stays in its local record.
+Both keys are absent, not null, when there is nothing to say. A miner on the
+previous release refuses unknown keys; it is then sent the reason alone,
+once, like a display it refuses.
+
 The reason codes are the miner and submission codes tabled above, plus `passed`
 for a submission that passed every check. A round or infrastructure cause, or a
 missing code, is reported as the generic `evaluation_failed`. The `failed_check` display is only ever attached to
@@ -178,6 +216,13 @@ The reference miner adds the route and prints what it receives, for example:
 [demo-miner] feedback:   Required exit code: 0
 [demo-miner] feedback:   Required stdout: "red-fox\n"
 [demo-miner] feedback:   Required stderr: not checked
+```
+
+A rejected response adds one line saying what the validator saw:
+
+```
+[demo-miner] feedback: artifact_invalid challenge chal-8f21 task 9c4f000000000000
+[demo-miner] feedback:   validator saw: response_unavailable, signature timestamp outside the \xb18 s window: off by +9.4 s
 ```
 
 A pass is the header alone:

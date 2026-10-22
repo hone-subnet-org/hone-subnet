@@ -302,12 +302,31 @@ class CommitRevealResponse(WireModel):
         return self
 
 
+DISPATCH_DETAIL_MAX_CHARS = 200
+
+
 class FailureExplanation(WireModel):
-    """How one graded submission did: `passed`, or the reason it did not."""
+    """How one graded submission did: `passed`, or the reason it did not.
+
+    `dispatch_reason_code` and `dispatch_detail` say what the validator saw
+    locally when it got no usable response: which check of the response failed,
+    in a short bounded sentence. They describe the miner's own response only.
+    """
 
     version: exact_int_literal(1)
     reason_code: MinerReason | Literal["evaluation_failed", "passed"]
     failed_check: str | None = None
+    dispatch_reason_code: MinerReason | None = None
+    dispatch_detail: str | None = None
+
+    @field_validator("dispatch_detail")
+    @classmethod
+    def bound_dispatch_detail(cls, value: str | None) -> str | None:
+        if value is not None and (
+            not value or len(value) > DISPATCH_DETAIL_MAX_CHARS or not value.isprintable()
+        ):
+            raise ValueError("dispatch detail must be short printable text")
+        return value
 
     @field_validator("failed_check")
     @classmethod
@@ -325,6 +344,10 @@ class FailureExplanation(WireModel):
     def validate_failed_check_reason(self) -> FailureExplanation:
         if self.failed_check is not None and self.reason_code != MinerReason.CHECK_FAILED:
             raise ValueError("only a failed comparison can include a check")
+        if self.reason_code == "passed" and (
+            self.dispatch_reason_code is not None or self.dispatch_detail is not None
+        ):
+            raise ValueError("a pass has no dispatch failure to explain")
         return self
 
 
@@ -420,7 +443,13 @@ def serialize_failure_notice(notice: MinerFailureNotice) -> bytes:
     if type(notice) is not MinerFailureNotice:
         raise TypeError("notice must be a V3 miner failure notice")
     validated = MinerFailureNotice.model_validate(notice.model_dump(mode="python"))
-    body = validated.model_dump_json().encode("utf-8")
+    payload = validated.model_dump(mode="json")
+    # Miners on the previous release refuse keys they do not know, even null
+    # ones. The local-cause fields go on the wire only when they say something.
+    for key in ("dispatch_reason_code", "dispatch_detail"):
+        if payload["failure"][key] is None:
+            del payload["failure"][key]
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     if len(body) > FAILURE_NOTICE_MAX_BYTES:
         raise ValueError("failure notice exceeds its byte limit")
     return body
@@ -450,17 +479,20 @@ def validate_miner_response(
         raise ValueError("miner response does not match its task")
     if response.response_type != task.identity.task_type:
         raise ValueError("miner response type does not match its task")
-    for artifact, slot in (
-        (response.submission, task.slots.submission),
-        (response.trajectory, task.slots.trajectory),
+    for name, artifact, slot in (
+        ("submission", response.submission, task.slots.submission),
+        ("trajectory", response.trajectory, task.slots.trajectory),
     ):
-        if (
-            artifact.upload_id != slot.upload_id
-            or artifact.artifact_role != slot.artifact_role
-            or artifact.artifact_format != slot.artifact_format
-            or artifact.size_bytes > slot.max_bytes
-        ):
-            raise ValueError("miner artifact does not match its upload slot")
+        if artifact.upload_id != slot.upload_id:
+            raise ValueError(f"{name} does not match its slot: upload ID")
+        if artifact.artifact_role != slot.artifact_role:
+            raise ValueError(f"{name} does not match its slot: role")
+        if artifact.artifact_format != slot.artifact_format:
+            raise ValueError(f"{name} does not match its slot: format")
+        if artifact.size_bytes > slot.max_bytes:
+            raise ValueError(
+                f"{name} does not match its slot: {artifact.size_bytes} bytes, limit {slot.max_bytes}"
+            )
 
 
 def validate_commit_reveal(

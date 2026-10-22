@@ -70,14 +70,15 @@ def round_records(result: RoundResult, validator_hotkey: str):
         (item.uid, item.hotkey): item
         for item in result.diagnostic_evaluations or result.evaluations
     }
-    dispatch = {(uid, hotkey): code for uid, hotkey, code in result.dispatch_failures}
+    dispatch = {(item.uid, item.hotkey): item for item in result.dispatch_failures}
     for uid, hotkey in result.assigned_miners:
         item = evaluations.get((uid, hotkey))
         evaluation = None if item is None else item.result
         checks = () if evaluation is None else evaluation.checks
         executed = sum(check.outcome != "skipped" for check in checks)
         total = result.checks_total
-        dispatch_code = dispatch.get((uid, hotkey))
+        failure = dispatch.get((uid, hotkey))
+        dispatch_code = None if failure is None else failure.code
         yield record(
             "miner_evaluation",
             uid=uid,
@@ -96,8 +97,15 @@ def round_records(result: RoundResult, validator_hotkey: str):
             checks_total=total,
             checks_skipped=None if total is None else total - executed,
             grading_duration_ms=None if item is None else item.grading_duration_ms,
-            response_latency_ms=None if item is None else item.latency_ms,
+            # A failed dispatch is timed to the failure, whatever the server then
+            # said about the empty submission: a fast rejection and a timeout differ.
+            response_latency_ms=(
+                failure.latency_ms
+                if failure is not None
+                else None if item is None else item.latency_ms
+            ),
             failed_check=None if evaluation is None else evaluation.failed_check,
+            dispatch_detail=None if failure is None else _detail(failure.detail),
         )
 
 
@@ -181,6 +189,9 @@ class EvaluationLog:
                 # Optional fields go first, so the base record always survives.
                 if len(raw) > MAX_RECORD_BYTES and record.get("failed_check") is not None:
                     record["failed_check"] = None
+                    raw = _encode(record)
+                if len(raw) > MAX_RECORD_BYTES and record.get("dispatch_detail") is not None:
+                    record["dispatch_detail"] = None
                     raw = _encode(record)
                 if len(raw) > MAX_RECORD_BYTES:
                     record["reason"] = ""

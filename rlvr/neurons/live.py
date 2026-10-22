@@ -8,9 +8,17 @@ from typing import Optional
 from uuid import uuid4
 
 import httpx
+from pydantic import ValidationError
 
 from ..config import Settings
-from ..protocol import SignedSolution, SolutionPayload, TaskRequest, sign_message, verify_signature
+from ..protocol import (
+    SIGNATURE_WINDOW_MS,
+    SignedSolution,
+    SolutionPayload,
+    TaskRequest,
+    sign_message,
+    verify_signature,
+)
 from ..types import Problem, SolutionResponse
 from ..v3.api import (
     EPISTULA_HEADERS,
@@ -26,6 +34,20 @@ _SEND_START_BUDGET_S = 6.0
 _SOLVE_DEADLINE_GRACE_S = 10.0
 # Time kept back from the lease for the commit that must follow every dispatch.
 _COMMIT_RESERVE_S = 30.0
+
+
+def _signature_skew_s(timestamp_header: str) -> float | None:
+    """How far the response signature's timestamp is from now, in seconds."""
+    try:
+        return (int(timestamp_header) - time.time() * 1000) / 1000
+    except ValueError:
+        return None
+
+
+def _first_validation_error(error: ValidationError) -> str:
+    first = error.errors()[0]
+    field = ".".join(str(part) for part in first["loc"]) or "body"
+    return f"{field}: {first['msg']}"
 
 
 class _SendPermit:
@@ -200,21 +222,34 @@ class LiveSolverClient:
                     response_headers = {
                         name: response.headers.get(name, "") for name in EPISTULA_HEADERS
                     }
-                if (
-                    response_headers["Epistula-Signed-By"] != self.hotkey
-                    or not verify_signature(
-                        response_headers,
-                        response_body,
-                        expected_signed_for=headers["Epistula-Signed-By"],
-                    )
+                # Each check names its own failure, so a miner can be told why.
+                if response_headers["Epistula-Signed-By"] != self.hotkey:
+                    return failed("signed by a different hotkey")
+                if not verify_signature(
+                    response_headers,
+                    response_body,
+                    expected_signed_for=headers["Epistula-Signed-By"],
                 ):
-                    return failed("invalid or unauthenticated miner response")
+                    # verify_signature alone decides; this only names the likely cause.
+                    skew_s = _signature_skew_s(response_headers["Epistula-Timestamp"])
+                    if skew_s is not None and abs(skew_s) * 1000 > SIGNATURE_WINDOW_MS:
+                        window_s = SIGNATURE_WINDOW_MS // 1000
+                        return failed(
+                            f"signature timestamp outside the ±{window_s} s window: off by {skew_s:+.1f} s"
+                        )
+                    return failed("signature does not verify")
                 try:
                     response_text = response_body.decode("utf-8")
+                except UnicodeError:
+                    return failed("response is not UTF-8")
+                try:
                     parsed = MinerTaskResponse.model_validate_json(response_body)
+                except ValidationError as error:
+                    return failed(f"response does not parse: {_first_validation_error(error)}")
+                try:
                     validate_miner_response(task, parsed)
-                except (UnicodeError, ValueError):
-                    return failed("invalid V3 miner response")
+                except ValueError as error:
+                    return failed(str(error))
                 return (
                     V3MinerSubmission(
                         uid=self.uid,
@@ -227,8 +262,21 @@ class LiveSolverClient:
                     ),
                     parsed,
                 )
+            except httpx.TimeoutException:
+                return failed(f"no response within {timeout_s:.0f} s")
+            except httpx.HTTPError as error:
+                # The class names the transport failure: ConnectError, ReadError,
+                # RemoteProtocolError. Its message can describe this validator's
+                # own network, so the class is all that is recorded or told.
+                return failed(type(error).__name__)
             except Exception as error:  # noqa: BLE001
-                return failed(f"dispatch failed: {error}")
+                # Not about the miner's response. The message goes to the
+                # journal for the operator; the record and the miner get the class.
+                print(
+                    f"[validator] WARN: dispatch to uid {self.uid} failed inside the exchange: "
+                    f"{type(error).__name__}: {str(error)[:200]}"
+                )
+                return failed(f"validator error: {type(error).__name__}")
 
         exchange_task = asyncio.create_task(exchange())
         consumed_task = asyncio.create_task(body_consumed.wait())
@@ -243,7 +291,7 @@ class LiveSolverClient:
                 try:
                     return await asyncio.wait_for(exchange_task, timeout=remaining)
                 except asyncio.TimeoutError:
-                    return failed("miner response exceeded the solve deadline")
+                    return failed(f"no response within {timeout_s:.0f} s")
             exchange_task.cancel()
             await asyncio.gather(exchange_task, return_exceptions=True)
             return failed("request body did not reach transport before signature deadline")

@@ -29,7 +29,7 @@ from ..v3.diagnostics import EvaluationLog
 from ..v3.reasons import RoundReason
 from ..v3.release import default_grading_concurrency
 from ..v3.release import round_policy as v3_round_policy
-from ..v3.round import apply_round_scores, evaluate_round
+from ..v3.round import apply_round_scores, dispatch_summary, evaluate_round
 from ..v3.selection import eligible_miners, next_offer
 from .feedback_sender import send_failure_notices
 from .live import SendGate, _solver_clients
@@ -608,6 +608,9 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
                 work_dir=state_dir / "v3-rounds",
                 candidates=offered,
             )
+            summary = dispatch_summary(result)
+            if summary:
+                print(f"[validator] {summary}")
             if result.status == "completed" or result.reason_code is RoundReason.QUORUM_NOT_MET:
                 # A completed round earns a fresh draw. So does a quorum
                 # failure: that is decided by the miners' own responses against
