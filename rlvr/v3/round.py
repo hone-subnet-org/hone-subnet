@@ -214,6 +214,16 @@ def _short(text: str, limit: int = 512) -> str:
     return text.encode("utf-8", "replace")[:limit].decode("utf-8", "ignore")
 
 
+def _describe(error: BaseException) -> str:
+    """Class and message, bounded; the class alone when the message itself cannot be built."""
+    name = type(error).__name__
+    try:
+        message = str(error)
+    except Exception:  # noqa: BLE001 - a broken __str__ must not escape the dispatch handler
+        message = ""
+    return _short(f"{name}: {message}" if message else name)
+
+
 def _failed_submission(challenge_id: str, uid: int, hotkey: str, error: str) -> MinerSubmission:
     return MinerSubmission(
         uid=uid,
@@ -507,7 +517,7 @@ async def evaluate_round(
                     # Bounded before it goes anywhere: the committed submission's
                     # error field refuses more than 4 KiB, and a refusal here would
                     # take the whole round down.
-                    detail = _short(f"{type(error).__name__}: {error}" if str(error) else type(error).__name__)
+                    detail = _describe(error)
                     dispatch_failures[registration] = DispatchFailure(
                         *registration,
                         MinerReason.DISPATCH_FAILED,

@@ -31,9 +31,13 @@ NOTICE_MAX_RECIPIENTS = 1_024
 
 
 def short_detail(value: str | None) -> str | None:
-    """One printable line of at most DISPATCH_DETAIL_MAX_CHARS, or None."""
+    """What a miner may be told: one printable line of at most DISPATCH_DETAIL_MAX_CHARS, or None."""
     if not value:
         return None
+    if value.startswith("HTTP "):
+        # The body of an HTTP error is unsigned text from whatever answered,
+        # which may not have been the miner; it gets the status alone.
+        value = value.split(":", 1)[0]
     clean = "".join(ch for ch in " ".join(value.split()) if ch.isprintable())
     return clean[:DISPATCH_DETAIL_MAX_CHARS] or None
 

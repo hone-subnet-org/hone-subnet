@@ -181,7 +181,9 @@ test it failed.
 When the validator got no usable response from the miner, the `failure` object
 also carries `dispatch_reason_code`, and for `response_unavailable` a
 `dispatch_detail`: the same sentence the validator recorded for itself, at
-most 200 printable characters, describing only that miner's own response. So
+most 200 printable characters, describing only that miner's own response. For
+an HTTP error the miner gets the status alone, `HTTP 503`, since the body is
+unsigned text from whatever answered. So
 a miner can tell "your response was rejected because its signature timestamp
 was 9 s off" from a bad upload. A `dispatch_failed` code goes out alone: the
 exception behind it is the validator's own and stays in its local record.

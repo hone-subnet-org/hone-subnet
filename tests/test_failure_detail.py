@@ -164,7 +164,7 @@ def cases():
 
     def http_error(task, validator, miner, other):
         async def handler(request):
-            return httpx.Response(503, content=b"maintenance")
+            return httpx.Response(503, content=b"maintenance at proxy 10.0.0.7 (secrets)")
         return handler
 
     def dropped(task, validator, miner, other):
@@ -207,7 +207,7 @@ def cases():
         ("wrong-role", wrong_role, r"response does not parse: body: .+"),
         ("wrong-format", wrong_format, r"response does not parse: submission: .+"),
         ("validator-bug", validator_bug, r"validator error: RuntimeError"),
-        ("http-error", http_error, r"HTTP 503: maintenance"),
+        ("http-error", http_error, r"HTTP 503: maintenance at proxy 10\.0\.0\.7 \(secrets\)"),
         ("dropped", dropped, r"RemoteProtocolError"),
         ("read-error", read_error_about_the_validator, r"ReadError"),
         ("timed-out", timed_out, r"no response within 3600 s"),
@@ -256,8 +256,9 @@ async def test_the_exact_cause_reaches_the_record_and_the_notice(name, build, pa
     assert parsed is None
     assert re.fullmatch(pattern, committed.error), committed.error
     assert type(committed.latency_ms) is int and committed.latency_ms >= 0
-    # Whatever the validator's own exceptions said stays out of what is committed.
-    assert "secrets" not in committed.error
+    # Whatever the validator's own exceptions said stays out of what is committed;
+    # an HTTP error body is the one miner-sent text that is kept locally.
+    assert "secrets" not in committed.error or name == "http-error"
     journal = capsys.readouterr().out
     if name == "validator-bug":
         assert "RuntimeError: /home/validator/.secrets leaked" in journal  # the operator still sees it
@@ -269,7 +270,10 @@ async def test_the_exact_cause_reaches_the_record_and_the_notice(name, build, pa
     assert record["dispatch_detail"] == committed.error
     assert record["response_latency_ms"] == committed.latency_ms
     assert notice["dispatch_reason_code"] == "response_unavailable"
-    assert notice["dispatch_detail"] == committed.error[:200]
+    if name == "http-error":
+        assert notice["dispatch_detail"] == "HTTP 503"  # the unsigned body stays local
+    else:
+        assert notice["dispatch_detail"] == committed.error[:200]
     assert notice["reason_code"] == "artifact_invalid"
     assert "secrets" not in json.dumps(notice)
 
@@ -367,7 +371,7 @@ async def test_round_keeps_the_solver_error_and_times_an_exception(tmp_path):
     )
     task_id = compute_task_id(identity)
     slots = []
-    for uid in (1, 2):
+    for uid in (1, 2, 3):
         current = slot_set(uid=uid, hotkey=f"hk-{uid}", prefix=f"u{uid}")
         slots.append(current.model_validate({
             "submission": current.submission.model_dump() | {"task_id": task_id},
@@ -404,25 +408,37 @@ async def test_round_keeps_the_solver_error_and_times_an_exception(tmp_path):
             # multibyte, so a careless cut would not even be valid UTF-8.
             raise ValueError("boom " + "±" * 5_000)
 
+    class Unprintable(Exception):
+        def __str__(self):
+            raise RuntimeError("no message for you")
+
+    class Mute:
+        uid, hotkey = 3, "hk-3"
+
+        async def solve_v3(self, task):
+            raise Unprintable()
+
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         client = V3ProblemServerClient("https://problems.invalid", "validator", http, retries=1)
         result = await evaluate_round(
-            client, http, [Rejecting(), Exploding()],
+            client, http, [Rejecting(), Exploding(), Mute()],
             dataclasses.replace(policy(tmp_path), commit_quorum=1),
             cache_dir=tmp_path / "cache", work_dir=tmp_path / "work",
-            candidates=[(1, "hk-1"), (2, "hk-2")],
+            candidates=[(1, "hk-1"), (2, "hk-2"), (3, "hk-3")],
         )
-    # The exception did not take the round down: it ended on quorum, after dispatch.
+    # No exception took the round down: it ended on quorum, after dispatch.
     assert (result.status, result.reason_code) == ("abandoned", RoundReason.QUORUM_NOT_MET)
-    rejected, exploded = result.dispatch_failures
+    rejected, exploded, mute = result.dispatch_failures
     assert rejected == DispatchFailure(1, "hk-1", MinerReason.RESPONSE_UNAVAILABLE, "signature does not verify", 77)
     assert exploded.code is MinerReason.DISPATCH_FAILED
     assert exploded.detail.startswith("ValueError: boom ±") and len(exploded.detail.encode()) <= 512
     assert exploded.latency_ms >= 20
+    assert (mute.code, mute.detail) == (MinerReason.DISPATCH_FAILED, "Unprintable")
     records = miner_records(result)
     assert (records[1]["dispatch_detail"], records[1]["response_latency_ms"]) == ("signature does not verify", 77)
     assert (records[2]["dispatch_detail"], records[2]["response_latency_ms"]) == (exploded.detail, exploded.latency_ms)
-    assert dispatch_summary(result) == "dispatch: 0 ok, 1 rejected (1 signature does not verify), 1 dispatch failed"
+    assert records[3]["dispatch_detail"] == "Unprintable"
+    assert dispatch_summary(result) == "dispatch: 0 ok, 1 rejected (1 signature does not verify), 2 dispatch failed"
 
 
 # --------------------------------------------------------------------------- #
@@ -624,10 +640,10 @@ async def test_notice_detail_is_one_short_printable_line():
         received.append(json.loads(await request.aread())["failure"])
         return httpx.Response(200)
 
-    result = completed([server_verdict(1)], [rejection(1, "HTTP 503: \x1b[31m" + "x\n" * 300)])
+    result = completed([server_verdict(1)], [rejection(1, "response does not parse: \x1b[31m" + "x\n" * 300)])
     await deliver(result, handler)
     detail = received[0]["dispatch_detail"]
-    assert detail.startswith("HTTP 503: [31mx x") and len(detail) == 200 and detail.isprintable()
+    assert detail.startswith("response does not parse: [31mx x") and len(detail) == 200 and detail.isprintable()
 
 
 @pytest.mark.usefixtures("offline_signatures")
@@ -681,8 +697,8 @@ def test_a_full_multibyte_record_is_written_within_4_kib_and_reads_back(tmp_path
     result = completed([MinerEvaluation(1, "hk-1", 10, verdict)], [rejection(1, "HTTP 503: " + "±" * 1_000)])
     log = EvaluationLog(str(tmp_path / "log.jsonl"))
     assert log.record_round(result, "validator") is True
-    lines = (tmp_path / "log.jsonl").read_bytes().splitlines()
-    assert all(len(line) <= diagnostics.MAX_RECORD_BYTES for line in lines)
+    lines = (tmp_path / "log.jsonl").read_bytes().splitlines(keepends=True)
+    assert all(len(line) <= diagnostics.MAX_RECORD_BYTES for line in lines)  # the newline counts
     miner = next(json.loads(line) for line in lines if json.loads(line)["record_type"] == "miner_evaluation")
     assert miner["failed_check"] is None  # dropped first to make the line fit
     assert miner["dispatch_detail"].startswith("HTTP 503: ±") and len(miner["dispatch_detail"].encode()) <= 512
