@@ -44,6 +44,21 @@ def _signature_skew_s(timestamp_header: str) -> float | None:
         return None
 
 
+def _journal_text(error: BaseException) -> str:
+    """Class and message for the operator's journal: one printable line, bounded.
+
+    The message is the validator's own, but it is printed to a terminal, so
+    control characters are dropped and a message that cannot be built is left out.
+    """
+    try:
+        message = " ".join(str(error).split())
+    except Exception:  # noqa: BLE001 - a broken __str__ must not replace the real failure
+        message = ""
+    message = "".join(ch for ch in message if ch.isprintable())[:200]
+    name = type(error).__name__
+    return f"{name}: {message}" if message else name
+
+
 def _first_validation_error(error: ValidationError) -> str:
     """The first problem pydantic found, as "field: message".
 
@@ -198,10 +213,7 @@ class LiveSolverClient:
             permit.release()
             # The validator's own fault, and the message can name its wallet
             # files: journal for the operator, class only for everyone else.
-            print(
-                f"[validator] WARN: signing the task for uid {self.uid} failed: "
-                f"{type(error).__name__}: {str(error)[:200]}"
-            )
+            print(f"[validator] WARN: signing the task for uid {self.uid} failed: {_journal_text(error)}")
             return failed(f"validator error: {type(error).__name__}")
         headers["Content-Type"] = "application/json"
         headers["Content-Length"] = str(len(body))
@@ -290,7 +302,7 @@ class LiveSolverClient:
                 # journal for the operator; the record and the miner get the class.
                 print(
                     f"[validator] WARN: dispatch to uid {self.uid} failed inside the exchange: "
-                    f"{type(error).__name__}: {str(error)[:200]}"
+                    f"{_journal_text(error)}"
                 )
                 return failed(f"validator error: {type(error).__name__}")
 

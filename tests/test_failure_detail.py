@@ -343,6 +343,35 @@ async def test_a_signing_failure_names_the_class_and_keeps_the_wallet_path_in_th
 
 
 @pytest.mark.skipif(not crypto_available(), reason="no sr25519 crypto stack installed")
+async def test_the_journal_line_for_a_validator_exception_is_one_printable_line(capsys):
+    from bittensor_wallet import Keypair
+
+    validator = Keypair.create_from_uri("//Alice")
+    miner = Keypair.create_from_uri("//Dave")
+
+    class Unprintable(Exception):
+        def __str__(self):
+            raise RuntimeError("no message for you")
+
+    async def control_sequence(request):
+        raise RuntimeError("failure\n\x1b[2Jforged journal entry " + "x" * 300)
+
+    async def cannot_print(request):
+        raise Unprintable()
+
+    committed, parsed = await dispatch(control_sequence, validator, miner)
+    assert parsed is None and committed.error == "validator error: RuntimeError"
+    (line,) = capsys.readouterr().out.splitlines()
+    assert line.startswith("[validator] WARN: dispatch to uid 7 failed inside the exchange: RuntimeError: failure [2Jforged")
+    assert line.isprintable() and len(line) < 300
+
+    committed, parsed = await dispatch(cannot_print, validator, miner)
+    assert parsed is None and committed.error == "validator error: Unprintable"
+    (line,) = capsys.readouterr().out.splitlines()
+    assert line.endswith("failed inside the exchange: Unprintable")
+
+
+@pytest.mark.skipif(not crypto_available(), reason="no sr25519 crypto stack installed")
 async def test_a_failed_dispatch_is_timed_until_the_failure():
     from bittensor_wallet import Keypair
 
@@ -716,10 +745,14 @@ def test_notice_detail_bounds_count_characters_and_the_largest_notice_fits():
         version=1, reason_code=MinerReason.CHECK_FAILED, failed_check=largest_display,
         dispatch_reason_code=MinerReason.RESPONSE_UNAVAILABLE, dispatch_detail=multibyte,
     )
+    rejected = {
+        "version": 1, "reason_code": MinerReason.TIMEOUT, "dispatch_reason_code": MinerReason.RESPONSE_UNAVAILABLE,
+    }
+    assert FailureExplanation(**rejected, dispatch_detail=multibyte).dispatch_detail == multibyte
     with pytest.raises(ValueError):
-        FailureExplanation(version=1, reason_code=MinerReason.TIMEOUT, dispatch_detail=multibyte + "±")
+        FailureExplanation(**rejected, dispatch_detail=multibyte + "±")
     with pytest.raises(ValueError):
-        FailureExplanation(version=1, reason_code=MinerReason.TIMEOUT, dispatch_detail="tab\there")
+        FailureExplanation(**rejected, dispatch_detail="tab\there")
     notice = MinerFailureNotice(
         protocol_version=3, message_type="failure_notice_v1", challenge_id="\x00" * 128, task_id=TASK,
         uid=7, hotkey="\x00" * 128, failure=explanation,
