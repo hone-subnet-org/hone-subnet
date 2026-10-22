@@ -115,7 +115,7 @@ def _container_failure(
     result: ContainerResult, what: str, timeout_s: int, elapsed_s: float
 ) -> str | None:
     if result.timed_out:
-        return f"{what} timed out: limit {timeout_s} s, ran {elapsed_s:.1f} s"
+        return f"{what} timed out: limit {timeout_s} s, elapsed {elapsed_s:.1f} s"
     if result.oom_killed:
         return "container exceeded its memory limit"
     if result.stdout_overflow or result.stderr_overflow:

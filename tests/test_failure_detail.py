@@ -272,7 +272,7 @@ async def test_the_exact_cause_reaches_the_record_and_the_notice(name, build, pa
     assert record["response_latency_ms"] == committed.latency_ms
     assert notice["dispatch_reason_code"] == "response_unavailable"
     if name == "http-error":
-        assert notice["dispatch_detail"] == "HTTP 503"  # the unsigned body stays local
+        assert notice["dispatch_detail"] == "HTTP 503"  # the unsigned body is not forwarded to the miner
     else:
         assert notice["dispatch_detail"] == committed.error[:200]
     assert notice["reason_code"] == "artifact_invalid"
@@ -592,21 +592,21 @@ def test_check_timeout_reason_names_the_check_its_limit_and_elapsed(tmp_path, ru
     runner.responses = [container(), container(timed_out=True, exit_code=124)]
     verdict = eval_repo(tmp_path, runner)
     assert verdict.status == "failed" and verdict.reason_code is MinerReason.TIMEOUT
-    assert re.fullmatch(r"check c01 timed out: limit \d+ s, ran \d+\.\d s", verdict.reason), verdict.reason
+    assert re.fullmatch(r"check c01 timed out: limit \d+ s, elapsed \d+\.\d s", verdict.reason), verdict.reason
 
 
 def test_script_timeout_reason_names_the_script(tmp_path, runner):
     runner.responses = [container(timed_out=True, exit_code=124)]
     verdict = eval_term(tmp_path, runner)
     assert verdict.status == "failed" and verdict.reason_code is MinerReason.TIMEOUT
-    assert re.fullmatch(r"script timed out: limit \d+ s, ran \d+\.\d s", verdict.reason), verdict.reason
+    assert re.fullmatch(r"script timed out: limit \d+ s, elapsed \d+\.\d s", verdict.reason), verdict.reason
 
 
 def test_setup_timeout_reason_names_setup(tmp_path, runner):
     runner.responses = [container(timed_out=True, exit_code=124)]
     verdict = eval_repo(tmp_path, runner)
     assert verdict.status == "failed" and verdict.reason_code is MinerReason.TIMEOUT
-    assert re.fullmatch(r"setup timed out: limit \d+ s, ran \d+\.\d s", verdict.reason), verdict.reason
+    assert re.fullmatch(r"setup timed out: limit \d+ s, elapsed \d+\.\d s", verdict.reason), verdict.reason
 
 
 # --------------------------------------------------------------------------- #

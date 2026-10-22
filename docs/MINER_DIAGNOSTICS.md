@@ -77,7 +77,7 @@ line that does not parse. Run only one validator writer for each log path.
   timeout. It is `null` for `not_serving`, where the validator never tried,
   and `grading_duration_ms` is `null` for miners without an evaluation record.
 - `reason`: for a `timeout` verdict it names what timed out, its limit and how
-  long it ran, for example `check c03 timed out: limit 30 s, ran 31.2 s`,
+  long it ran, for example `check c03 timed out: limit 30 s, elapsed 31.2 s`,
   `setup timed out: ...` or `script timed out: ...`.
 - `failed_check`: the six-line description of the failing check that was
   available for this evaluation, when one could be rendered; otherwise `null`. It
