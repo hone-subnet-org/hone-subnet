@@ -481,7 +481,7 @@ SERVED_TASK_LIMIT = 256
 SERVED_TASK_TTL_S = 7_200.0
 NOTICE_PRINT_SLOTS = 4
 FEEDBACK_PRINT_HEADER_CHARS = 120
-FEEDBACK_PRINT_LOCAL_CHARS = 512  # a reason code and a 200-char detail, escaped
+FEEDBACK_PRINT_LOCAL_CHARS = 512  # room for a reason code and a 200-char detail; longer escapes are cut
 
 
 class ServedTasks:

@@ -117,6 +117,7 @@ def previous_release(tmp_path_factory):
         yield ask
     finally:
         process.stdin.close()
+        process.stdout.close()
         try:
             process.wait(timeout=10)
         except subprocess.TimeoutExpired:

@@ -169,7 +169,8 @@ is stored centrally. Two settings control it, both on by default:
 
 - `VALIDATOR_FAILURE_NOTICES` sends the notices at all.
 - `VALIDATOR_FAILED_CHECK_DETAILS` adds the failing check's command and expected
-  output. With it off, a miner gets the reason code alone.
+  output. With it off, a miner gets the reason code and, for a rejected response, the
+  short local cause described below, but never a check display.
 
 A notice is `POST {miner axon}/v3/failure`, signed the same way a task is, and
 carries the protocol version, the fixed message type `failure_notice_v1`, the
