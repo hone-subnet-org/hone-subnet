@@ -184,7 +184,7 @@ async def test_v3_live_transport_has_a_total_response_deadline(monkeypatch):
         await http.aclose()
     assert time.monotonic() - started < 1
     assert parsed is None
-    assert "deadline" in committed.error
+    assert "no response within" in committed.error
 
 
 async def test_v3_live_dispatch_fits_inside_the_lease_when_the_solve_limit_is_longer(monkeypatch):
@@ -224,7 +224,7 @@ async def test_v3_live_dispatch_fits_inside_the_lease_when_the_solve_limit_is_lo
         committed, parsed = await client.solve_v3(task)
     finally:
         await http.aclose()
-    assert parsed is None and "deadline" in committed.error
+    assert parsed is None and "no response within" in committed.error
     assert time.monotonic() - started < 2.0  # gave up before the lease expired, grace and reserve kept
 
 

@@ -35,6 +35,7 @@ from rlvr.v3.diagnostics import EvaluationLog, round_records
 from rlvr.v3.grading import CheckResult, EvaluationResult
 from rlvr.v3.reasons import MinerReason, RoundReason, Stage
 from rlvr.v3.round import (
+    DispatchFailure,
     MinerEvaluation,
     RoundResult,
     apply_round_scores,
@@ -56,7 +57,7 @@ MINER_KEYS = {
     "round_status", "round_reason_code", "score_effect", "record_id", "record_type",
     "uid", "miner_hotkey", "status", "reason_code", "dispatch_reason_code", "stage",
     "reason", "checks_passed", "checks_executed", "checks_total", "checks_skipped",
-    "grading_duration_ms", "response_latency_ms", "failed_check",
+    "grading_duration_ms", "response_latency_ms", "failed_check", "dispatch_detail",
 }
 
 
@@ -157,7 +158,7 @@ def test_completed_round_records_every_assigned_miner_with_exact_schema():
     result = completed(
         evaluations=[evaluation(1, PASSED), evaluation(2, STOPPED, 20, 7), evaluation(3, REJECTED)],
         assigned=registrations(1, 2, 3, 4),
-        dispatch_failures=((4, "hk-4", MinerReason.NOT_SERVING),),
+        dispatch_failures=(DispatchFailure(4, "hk-4", MinerReason.NOT_SERVING, "miner is not serving", None),),
     )
     items = records(result)
     assert [item["record_type"] for item in items] == ["round_outcome"] + ["miner_evaluation"] * 4
@@ -204,7 +205,7 @@ def test_local_dispatch_code_is_kept_beside_the_server_artifact_outcome(dispatch
     )
     result = completed(
         evaluations=[evaluation(4, server_rejection, latency_ms=0)],
-        dispatch_failures=((4, "hk-4", dispatch),),
+        dispatch_failures=(DispatchFailure(4, "hk-4", dispatch, "what the validator saw", 42),),
     )
     miner = by_uid(records(result))[4]
     assert (miner["status"], miner["reason_code"], miner["stage"]) == (

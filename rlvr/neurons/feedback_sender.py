@@ -14,7 +14,12 @@ from collections.abc import Sequence
 import httpx
 
 from ..protocol import sign_message
-from ..v3.api import FailureExplanation, MinerFailureNotice, serialize_failure_notice
+from ..v3.api import (
+    DISPATCH_DETAIL_MAX_CHARS,
+    FailureExplanation,
+    MinerFailureNotice,
+    serialize_failure_notice,
+)
 from ..v3.reasons import MinerReason, Stage
 from .live import LiveSolverClient
 
@@ -23,6 +28,18 @@ NOTICE_CONCURRENCY = 32
 NOTICE_TIMEOUT_S = 2.0
 NOTICE_BATCH_DEADLINE_S = 15.0
 NOTICE_MAX_RECIPIENTS = 1_024
+
+
+def short_detail(value: str | None) -> str | None:
+    """What a miner may be told: one printable line of at most DISPATCH_DETAIL_MAX_CHARS, or None."""
+    if not value:
+        return None
+    if value.startswith("HTTP "):
+        # The body of an HTTP error is unsigned text from whatever answered,
+        # which may not have been the miner; it gets the status alone.
+        value = value.split(":", 1)[0]
+    clean = "".join(ch for ch in " ".join(value.split()) if ch.isprintable())
+    return clean[:DISPATCH_DETAIL_MAX_CHARS] or None
 
 
 def build_notice(
@@ -36,6 +53,8 @@ def build_notice(
     failed_check: str | None,
     *,
     include_details: bool,
+    dispatch_reason_code: object = None,
+    dispatch_detail: str | None = None,
 ) -> MinerFailureNotice | None:
     """Build one notice, or None when this outcome does not earn one."""
 
@@ -52,6 +71,27 @@ def build_notice(
         and stage == Stage.CHECK
         else None
     )
+    # What the validator saw locally when it got no usable response. Only the
+    # solver's own description of this miner's response is forwarded, which
+    # may be "validator error: <class>" so the miner knows it was not at
+    # fault; a solver that raised stays in the local record, code alone out.
+    local_code = (
+        dispatch_reason_code
+        if code != "passed" and type(dispatch_reason_code) is MinerReason
+        else None
+    )
+    local_detail = (
+        short_detail(dispatch_detail)
+        if local_code is MinerReason.RESPONSE_UNAVAILABLE
+        else None
+    )
+    if local_detail is not None:
+        try:
+            FailureExplanation(
+                version=1, reason_code=code, dispatch_reason_code=local_code, dispatch_detail=local_detail
+            )
+        except Exception:  # noqa: BLE001 - a detail the wire refuses is left out; the code still goes
+            local_detail = None
     for attempt in ((display, None) if display is not None else (None,)):
         try:
             return MinerFailureNotice(
@@ -62,7 +102,11 @@ def build_notice(
                 uid=uid,
                 hotkey=hotkey,
                 failure=FailureExplanation(
-                    version=1, reason_code=code, failed_check=attempt
+                    version=1,
+                    reason_code=code,
+                    failed_check=attempt,
+                    dispatch_reason_code=local_code,
+                    dispatch_detail=local_detail,
                 ),
             )
         except Exception:  # noqa: BLE001, S112 - fall back to the reason, then give up
@@ -73,6 +117,16 @@ def build_notice(
 def reason_only(notice: MinerFailureNotice) -> MinerFailureNotice:
     return notice.model_copy(
         update={"failure": FailureExplanation(version=1, reason_code=notice.failure.reason_code)}
+    )
+
+
+def has_extras(notice: MinerFailureNotice) -> bool:
+    """True when the notice carries anything beyond the reason code."""
+    failure = notice.failure
+    return (
+        failure.failed_check is not None
+        or failure.dispatch_reason_code is not None
+        or failure.dispatch_detail is not None
     )
 
 
@@ -99,6 +153,10 @@ async def send_failure_notices(
 
     clients = {(client.uid, client.hotkey): client for client in solvers}
     assigned = set(getattr(result, "assigned_miners", ()) or ())
+    failures = {
+        (item.uid, item.hotkey): item
+        for item in getattr(result, "dispatch_failures", ()) or ()
+    }
     jobs = []
     seen: set[tuple[int, str]] = set()
     for item in result.evaluations:
@@ -108,6 +166,7 @@ async def send_failure_notices(
         client = clients.get(registration)
         if client is None:
             continue
+        failure = failures.get(registration)
         notice = build_notice(
             challenge_id,
             task_id,
@@ -118,6 +177,8 @@ async def send_failure_notices(
             getattr(item.result, "stage", None),
             getattr(item.result, "failed_check", None),
             include_details=include_details,
+            dispatch_reason_code=None if failure is None else failure.code,
+            dispatch_detail=None if failure is None else failure.detail,
         )
         if notice is None:
             continue
@@ -155,9 +216,9 @@ async def send_failure_notices(
         permit = await client.gate.acquire()
         try:
             status = await post(client, notice)
-            if status in (400, 413) and notice.failure.failed_check is not None:
+            if status in (400, 413) and has_extras(notice):
                 # A miner on an older release refuses a display larger than its
-                # own cap. It still gets the reason, once.
+                # own cap, or fields it does not know. It still gets the reason, once.
                 status = await post(client, reason_only(notice))
             if status == 200:
                 delivered += 1
