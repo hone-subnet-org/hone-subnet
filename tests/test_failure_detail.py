@@ -187,6 +187,16 @@ def cases():
             raise httpx.ConnectTimeout("")
         return handler
 
+    def pool_exhausted(task, validator, miner, other):
+        async def handler(request):
+            raise httpx.PoolTimeout("")
+        return handler
+
+    def huge_timestamp(task, validator, miner, other):
+        async def handler(request):
+            return signed(miner, good_response(task), request, **{"Epistula-Timestamp": "9" * 400})
+        return handler
+
     return [
         ("different-hotkey", different_hotkey, r"signed by a different hotkey"),
         ("stale-timestamp", stale_timestamp, r"signature timestamp outside the ±8 s window: off by -(19|20|21)\.\d s"),
@@ -202,6 +212,8 @@ def cases():
         ("read-error", read_error_about_the_validator, r"ReadError"),
         ("timed-out", timed_out, r"no response within 3600 s"),
         ("unreachable", unreachable, r"ConnectTimeout"),
+        ("pool-exhausted", pool_exhausted, r"PoolTimeout"),
+        ("huge-timestamp", huge_timestamp, r"signature does not verify"),
     ]
 
 
@@ -292,6 +304,37 @@ async def test_the_timestamp_message_never_changes_what_verification_accepts(off
     else:
         assert parsed is None
         assert re.fullmatch(r"signature timestamp outside the ±8 s window: off by [+-]\d+\.\d s", committed.error), committed.error
+
+
+@pytest.mark.skipif(not crypto_available(), reason="no sr25519 crypto stack installed")
+async def test_a_signing_failure_names_the_class_and_keeps_the_wallet_path_in_the_journal(monkeypatch, capsys):
+    from bittensor_wallet import Keypair
+
+    miner = Keypair.create_from_uri("//Dave")
+
+    class UnreadableWallet:
+        @property
+        def hotkey(self):
+            raise RuntimeError("Keyfile at: /home/validator/.bittensor/wallets/vali/hotkeys/default is not readable")
+
+    async def never_called(request):
+        raise AssertionError("no request may leave without a signature")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(never_called))
+    client = LiveSolverClient(
+        uid=7, hotkey=miner.ss58_address, url="http://miner",
+        wallet=UnreadableWallet(), settings=get_settings(), http=http,
+    )
+    try:
+        committed, parsed = await client.solve_v3(task_for(miner.ss58_address))
+    finally:
+        await http.aclose()
+    assert parsed is None and committed.error == "validator error: RuntimeError"
+    assert "Keyfile at: /home/validator/.bittensor" in capsys.readouterr().out
+    record, notice = await through_record_and_notice(committed, monkeypatch)
+    assert record["dispatch_detail"] == "validator error: RuntimeError"
+    assert notice["dispatch_detail"] == "validator error: RuntimeError"
+    assert ".bittensor" not in json.dumps(notice)
 
 
 @pytest.mark.skipif(not crypto_available(), reason="no sr25519 crypto stack installed")

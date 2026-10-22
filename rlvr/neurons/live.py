@@ -40,7 +40,7 @@ def _signature_skew_s(timestamp_header: str) -> float | None:
     """How far the response signature's timestamp is from now, in seconds."""
     try:
         return (int(timestamp_header) - time.time() * 1000) / 1000
-    except ValueError:
+    except (ValueError, OverflowError):  # not a number, or absurdly large
         return None
 
 
@@ -190,7 +190,13 @@ class LiveSolverClient:
             headers = sign_message(self._wallet, body, signed_for=self.hotkey)
         except Exception as error:  # noqa: BLE001
             permit.release()
-            return failed(f"dispatch signing failed: {error}")
+            # The validator's own fault, and the message can name its wallet
+            # files: journal for the operator, class only for everyone else.
+            print(
+                f"[validator] WARN: signing the task for uid {self.uid} failed: "
+                f"{type(error).__name__}: {str(error)[:200]}"
+            )
+            return failed(f"validator error: {type(error).__name__}")
         headers["Content-Type"] = "application/json"
         headers["Content-Length"] = str(len(body))
         # The exchange, its grace and the commit that follows must all fit
@@ -262,15 +268,14 @@ class LiveSolverClient:
                     ),
                     parsed,
                 )
-            except httpx.ConnectTimeout as error:
-                # Never reached the miner at all: not a slow answer.
-                return failed(type(error).__name__)
-            except httpx.TimeoutException:
+            except httpx.ReadTimeout:
                 return failed(f"no response within {timeout_s:.0f} s")
             except httpx.HTTPError as error:
-                # The class names the transport failure: ConnectError, ReadError,
-                # RemoteProtocolError. Its message can describe this validator's
-                # own network, so the class is all that is recorded or told.
+                # The class names the transport failure: ConnectError,
+                # ConnectTimeout, PoolTimeout, ReadError, RemoteProtocolError. Its
+                # message can describe this validator's own network, so the
+                # class is all that is recorded or told. Only a read timeout is
+                # a miner that was reached and did not answer.
                 return failed(type(error).__name__)
             except Exception as error:  # noqa: BLE001
                 # Not about the miner's response. The message goes to the

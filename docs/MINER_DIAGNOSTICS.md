@@ -49,17 +49,21 @@ line that does not parse. Run only one validator writer for each log path.
   bounded sentence, as the validator saw it at the time. For
   `response_unavailable` it names the check the response failed: `signed by a
   different hotkey`, `signature timestamp outside the ±8 s window: off by
-  +9.4 s`, `signature does not verify`, `response does not parse:
-  submission.sha256: ...` (the first validation error), `submission does not
-  match its slot: upload ID` (or role, format, or size over the limit), `HTTP
-  503: ...` (the status and up to 512 bytes of the body), the transport
-  exception class alone such as `ConnectError`, `ConnectTimeout`,
-  `RemoteProtocolError` or `ReadError` (its message could describe the
-  validator's own network), `no response within 1170 s` for a miner that was
-  reached but did not answer in time, or `validator error: <class>` when the validator itself failed
-  inside the exchange, with the message printed to the validator's journal
-  only. For `dispatch_failed` it is the exception class and message, cut to
-  512 bytes. `null` without a dispatch code.
+  +9.4 s`, `signature does not verify`, `response is not UTF-8`, `response
+  does not parse: submission.sha256: ...` (the first validation error; a
+  wrong role or format fails here, since the response type pins both),
+  `submission does not match its slot: upload ID` or `... 70000 bytes, limit
+  65536`, `miner response exceeds byte limit`, `HTTP 503: ...` (the status
+  and up to 512 bytes of the body), the transport exception class alone such
+  as `ConnectError`, `ConnectTimeout`, `PoolTimeout`, `RemoteProtocolError` or
+  `ReadError` (its message could describe the validator's own network), `no
+  response within 1170 s` for a miner that was reached but did not answer in
+  time, `lease too short to dispatch` or `request body did not reach
+  transport before signature deadline` for a request the validator could not
+  send in time, or `validator error: <class>` when the validator itself
+  failed before or inside the exchange, with the message printed to the
+  validator's journal only. For `dispatch_failed` it is the exception class
+  and message, cut to 512 bytes. `null` without a dispatch code.
 - `checks_passed`, `checks_executed`, `checks_total`, `checks_skipped`: count
   passed outcomes, passed or failed outcomes, all manifest checks, and remaining
   checks. Totals are `null` until the verifier manifest is loaded. These count
@@ -69,8 +73,8 @@ line that does not parse. Run only one validator writer for each log path.
 - `grading_duration_ms` and `response_latency_ms`: describe grading and response
   time when available. A failed dispatch is timed too: `response_latency_ms`
   is the time until the failure, so a fast rejection can be told from a
-  timeout. It is `null` when no request was made (`not_serving`) and
-  `grading_duration_ms` is `null` for miners without an evaluation record.
+  timeout. It is `null` for `not_serving`, where the validator never tried,
+  and `grading_duration_ms` is `null` for miners without an evaluation record.
 - `reason`: for a `timeout` verdict it names what timed out, its limit and how
   long it ran, for example `check c03 timed out: limit 30 s, ran 31.2 s`,
   `setup timed out: ...` or `script timed out: ...`.
