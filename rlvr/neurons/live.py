@@ -226,8 +226,10 @@ class LiveSolverClient:
             return failed("validator could not send: lease too short to dispatch")
         timeout_s = min(self._settings.solve_deadline_s, lease_budget)
         overall_deadline = time.monotonic() + timeout_s + _SOLVE_DEADLINE_GRACE_S
-        # What the miner is told it had: the solve window plus the grace actually waited.
-        waited = f"no response within {timeout_s + _SOLVE_DEADLINE_GRACE_S:.0f} s"
+
+        def waited() -> str:
+            """What the miner is told: how long the validator waited without a usable response."""
+            return f"no response within {elapsed_ms() / 1000:.0f} s"
 
         async def exchange():
             try:
@@ -289,7 +291,7 @@ class LiveSolverClient:
                     parsed,
                 )
             except httpx.ReadTimeout:
-                return failed(waited)
+                return failed(waited())
             except httpx.HTTPError as error:
                 # The class names the transport failure: ConnectError,
                 # ConnectTimeout, PoolTimeout, ReadError, RemoteProtocolError. Its
@@ -319,7 +321,7 @@ class LiveSolverClient:
                 try:
                     return await asyncio.wait_for(exchange_task, timeout=remaining)
                 except asyncio.TimeoutError:
-                    return failed(waited)
+                    return failed(waited())
             exchange_task.cancel()
             await asyncio.gather(exchange_task, return_exceptions=True)
             return failed("validator could not send: request body did not reach transport before signature deadline")

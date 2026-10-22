@@ -503,6 +503,7 @@ async def evaluate_round(
                 started = time.monotonic()
                 try:
                     async with semaphore:
+                        started = time.monotonic()  # the miner's time, not the validator's queue
                         submission, parsed = await solver.solve_v3(task)
                     if parsed is None:
                         # The solver's error says exactly which check the response failed.

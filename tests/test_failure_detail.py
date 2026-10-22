@@ -210,7 +210,7 @@ def cases():
         ("http-error", http_error, r"HTTP 503: maintenance at proxy 10\.0\.0\.7 \(secrets\)"),
         ("dropped", dropped, r"RemoteProtocolError"),
         ("read-error", read_error_about_the_validator, r"ReadError"),
-        ("timed-out", timed_out, r"no response within 3610 s"),  # the solve window plus grace
+        ("timed-out", timed_out, r"no response within \d+ s"),  # the time actually waited
         ("unreachable", unreachable, r"ConnectTimeout"),
         ("pool-exhausted", pool_exhausted, r"PoolTimeout"),
         ("huge-timestamp", huge_timestamp, r"signature does not verify"),
@@ -372,6 +372,22 @@ async def test_the_journal_line_for_a_validator_exception_is_one_printable_line(
 
 
 @pytest.mark.skipif(not crypto_available(), reason="no sr25519 crypto stack installed")
+async def test_the_timeout_message_states_the_time_actually_waited():
+    from bittensor_wallet import Keypair
+
+    validator = Keypair.create_from_uri("//Alice")
+    miner = Keypair.create_from_uri("//Dave")
+
+    async def silent_for_a_while(request):
+        await asyncio.sleep(1.2)
+        raise httpx.ReadTimeout("")
+
+    committed, parsed = await dispatch(silent_for_a_while, validator, miner)
+    assert parsed is None and committed.error == "no response within 1 s"
+    assert committed.latency_ms >= 1_200
+
+
+@pytest.mark.skipif(not crypto_available(), reason="no sr25519 crypto stack installed")
 async def test_a_failed_dispatch_is_timed_until_the_failure():
     from bittensor_wallet import Keypair
 
@@ -482,6 +498,20 @@ async def test_round_keeps_the_solver_error_and_times_an_exception(tmp_path):
     assert (records[2]["dispatch_detail"], records[2]["response_latency_ms"]) == (exploded.detail, exploded.latency_ms)
     assert records[3]["dispatch_detail"] == "Unprintable"
     assert dispatch_summary(result) == "dispatch: 1 ok, 1 rejected (1 signature does not verify), 2 dispatch failed"
+
+
+async def test_a_round_that_never_dispatched_has_no_summary(tmp_path):
+    async def handler(request):
+        return httpx.Response(503)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = V3ProblemServerClient("https://problems.invalid", "validator", http, retries=1)
+        result = await evaluate_round(
+            client, http, [Solver(1, "hk-1", b"pass")], policy(tmp_path),
+            cache_dir=tmp_path / "cache", work_dir=tmp_path / "work", candidates=[(1, "hk-1")],
+        )
+    assert result.status != "completed"
+    assert result.signed_responses is None and dispatch_summary(result) is None
 
 
 # --------------------------------------------------------------------------- #
@@ -617,25 +647,34 @@ def test_no_dispatch_summary_before_dispatch_ran():
 # --------------------------------------------------------------------------- #
 # Grading timeouts say which check, its limit and how long it ran
 # --------------------------------------------------------------------------- #
-def test_check_timeout_reason_names_the_check_its_limit_and_elapsed(tmp_path, runner):
-    runner.responses = [container(), container(timed_out=True, exit_code=124)]
-    verdict = eval_repo(tmp_path, runner)
+def slow_timeout(request):
+    """A container that runs for a while and is then stopped for its time limit."""
+    time.sleep(0.15)
+    return container(timed_out=True, exit_code=124)
+
+
+def timed_out_reason(verdict, runner, what):
+    """The limit and elapsed time the reason states, checked against the request made and the time taken."""
     assert verdict.status == "failed" and verdict.reason_code is MinerReason.TIMEOUT
-    assert re.fullmatch(r"check c01 timed out: limit \d+ s, elapsed \d+\.\d s", verdict.reason), verdict.reason
+    found = re.fullmatch(what + r" timed out: limit (\d+) s, elapsed (\d+\.\d) s", verdict.reason)
+    assert found, verdict.reason
+    assert int(found.group(1)) == runner.requests[-1].timeout_s
+    assert float(found.group(2)) >= 0.1
+
+
+def test_check_timeout_reason_names_the_check_its_limit_and_elapsed(tmp_path, runner):
+    runner.responses = [container(), slow_timeout]
+    timed_out_reason(eval_repo(tmp_path, runner), runner, "check c01")
 
 
 def test_script_timeout_reason_names_the_script(tmp_path, runner):
-    runner.responses = [container(timed_out=True, exit_code=124)]
-    verdict = eval_term(tmp_path, runner)
-    assert verdict.status == "failed" and verdict.reason_code is MinerReason.TIMEOUT
-    assert re.fullmatch(r"script timed out: limit \d+ s, elapsed \d+\.\d s", verdict.reason), verdict.reason
+    runner.responses = [slow_timeout]
+    timed_out_reason(eval_term(tmp_path, runner), runner, "script")
 
 
 def test_setup_timeout_reason_names_setup(tmp_path, runner):
-    runner.responses = [container(timed_out=True, exit_code=124)]
-    verdict = eval_repo(tmp_path, runner)
-    assert verdict.status == "failed" and verdict.reason_code is MinerReason.TIMEOUT
-    assert re.fullmatch(r"setup timed out: limit \d+ s, elapsed \d+\.\d s", verdict.reason), verdict.reason
+    runner.responses = [slow_timeout]
+    timed_out_reason(eval_repo(tmp_path, runner), runner, "setup")
 
 
 # --------------------------------------------------------------------------- #
