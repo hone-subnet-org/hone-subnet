@@ -53,12 +53,13 @@ line that does not parse. Run only one validator writer for each log path.
   submission.sha256: ...` (the first validation error), `submission does not
   match its slot: upload ID` (or role, format, or size over the limit), `HTTP
   503: ...` (the status and up to 512 bytes of the body), the transport
-  exception class alone such as `RemoteProtocolError` or `ReadError` (its
-  message could describe the validator's own network), `no response within
-  1170 s`, or `validator error: <class>` when the validator itself failed
+  exception class alone such as `ConnectError`, `ConnectTimeout`,
+  `RemoteProtocolError` or `ReadError` (its message could describe the
+  validator's own network), `no response within 1170 s` for a miner that was
+  reached but did not answer in time, or `validator error: <class>` when the validator itself failed
   inside the exchange, with the message printed to the validator's journal
-  only. For `dispatch_failed` it is the exception class and message. `null`
-  without a dispatch code.
+  only. For `dispatch_failed` it is the exception class and message, cut to
+  512 bytes. `null` without a dispatch code.
 - `checks_passed`, `checks_executed`, `checks_total`, `checks_skipped`: count
   passed outcomes, passed or failed outcomes, all manifest checks, and remaining
   checks. Totals are `null` until the verifier manifest is loaded. These count

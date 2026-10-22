@@ -209,6 +209,11 @@ def dispatch_summary(result: RoundResult) -> str | None:
     return "dispatch: " + ", ".join(parts)
 
 
+def _short(text: str, limit: int = 512) -> str:
+    """At most `limit` bytes of valid UTF-8, the way the solver bounds its own errors."""
+    return text.encode("utf-8", "replace")[:limit].decode("utf-8", "ignore")
+
+
 def _failed_submission(challenge_id: str, uid: int, hotkey: str, error: str) -> MinerSubmission:
     return MinerSubmission(
         uid=uid,
@@ -499,7 +504,10 @@ async def evaluate_round(
                         )
                     return submission, parsed
                 except Exception as error:  # noqa: BLE001
-                    detail = f"{type(error).__name__}: {error}" if str(error) else type(error).__name__
+                    # Bounded before it goes anywhere: the committed submission's
+                    # error field refuses more than 4 KiB, and a refusal here would
+                    # take the whole round down.
+                    detail = _short(f"{type(error).__name__}: {error}" if str(error) else type(error).__name__)
                     dispatch_failures[registration] = DispatchFailure(
                         *registration,
                         MinerReason.DISPATCH_FAILED,

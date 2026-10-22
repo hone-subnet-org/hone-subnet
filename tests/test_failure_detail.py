@@ -182,6 +182,11 @@ def cases():
             raise httpx.ReadTimeout("")
         return handler
 
+    def unreachable(task, validator, miner, other):
+        async def handler(request):
+            raise httpx.ConnectTimeout("")
+        return handler
+
     return [
         ("different-hotkey", different_hotkey, r"signed by a different hotkey"),
         ("stale-timestamp", stale_timestamp, r"signature timestamp outside the ±8 s window: off by -(19|20|21)\.\d s"),
@@ -196,6 +201,7 @@ def cases():
         ("dropped", dropped, r"RemoteProtocolError"),
         ("read-error", read_error_about_the_validator, r"ReadError"),
         ("timed-out", timed_out, r"no response within 3600 s"),
+        ("unreachable", unreachable, r"ConnectTimeout"),
     ]
 
 
@@ -258,7 +264,7 @@ async def test_the_exact_cause_reaches_the_record_and_the_notice(name, build, pa
 
 @pytest.mark.skipif(not crypto_available(), reason="no sr25519 crypto stack installed")
 @pytest.mark.parametrize("offset_ms, accepted", [(-7_500, True), (7_500, True), (-8_500, False), (8_500, False)])
-async def test_the_timestamp_message_never_changes_what_verification_accepts(offset_ms, accepted):
+async def test_the_timestamp_message_never_changes_what_verification_accepts(offset_ms, accepted, monkeypatch):
     from bittensor_wallet import Keypair
 
     validator = Keypair.create_from_uri("//Alice")
@@ -270,18 +276,17 @@ async def test_the_timestamp_message_never_changes_what_verification_accepts(off
         headers = sign_message(WalletLike(miner), body, signed_for=request.headers["Epistula-Signed-By"])
         return httpx.Response(200, content=body, headers=headers)
 
-    real_now = time.time()
-    # The miner's clock is off by offset_ms; the validator's is the real one.
-    original = protocol.time.time
-    protocol.time.time = lambda: real_now + offset_ms / 1000
-    try:
-        async def shifted(request):
-            response = await handler(request)
-            protocol.time.time = original
-            return response
-        committed, parsed = await dispatch(shifted, validator, miner)
-    finally:
-        protocol.time.time = original
+    # The miner signs with a clock off by offset_ms; the validator verifies with the real one.
+    real_clock = time.time
+    shift = [offset_ms / 1000]
+    monkeypatch.setattr(protocol.time, "time", lambda: real_clock() + shift[0])
+
+    async def shifted(request):
+        response = await handler(request)
+        shift[0] = 0.0
+        return response
+
+    committed, parsed = await dispatch(shifted, validator, miner)
     if accepted:
         assert parsed is not None and committed.error == ""
     else:
@@ -352,7 +357,9 @@ async def test_round_keeps_the_solver_error_and_times_an_exception(tmp_path):
 
         async def solve_v3(self, task):
             await asyncio.sleep(0.02)
-            raise ValueError("boom")
+            # Longer than the 4 KiB the committed error field accepts, and
+            # multibyte, so a careless cut would not even be valid UTF-8.
+            raise ValueError("boom " + "±" * 5_000)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         client = V3ProblemServerClient("https://problems.invalid", "validator", http, retries=1)
@@ -362,14 +369,16 @@ async def test_round_keeps_the_solver_error_and_times_an_exception(tmp_path):
             cache_dir=tmp_path / "cache", work_dir=tmp_path / "work",
             candidates=[(1, "hk-1"), (2, "hk-2")],
         )
+    # The exception did not take the round down: it ended on quorum, after dispatch.
     assert (result.status, result.reason_code) == ("abandoned", RoundReason.QUORUM_NOT_MET)
     rejected, exploded = result.dispatch_failures
     assert rejected == DispatchFailure(1, "hk-1", MinerReason.RESPONSE_UNAVAILABLE, "signature does not verify", 77)
-    assert (exploded.code, exploded.detail) == (MinerReason.DISPATCH_FAILED, "ValueError: boom")
+    assert exploded.code is MinerReason.DISPATCH_FAILED
+    assert exploded.detail.startswith("ValueError: boom ±") and len(exploded.detail.encode()) <= 512
     assert exploded.latency_ms >= 20
     records = miner_records(result)
     assert (records[1]["dispatch_detail"], records[1]["response_latency_ms"]) == ("signature does not verify", 77)
-    assert (records[2]["dispatch_detail"], records[2]["response_latency_ms"]) == ("ValueError: boom", exploded.latency_ms)
+    assert (records[2]["dispatch_detail"], records[2]["response_latency_ms"]) == (exploded.detail, exploded.latency_ms)
     assert dispatch_summary(result) == "dispatch: 0 ok, 1 rejected (1 signature does not verify), 1 dispatch failed"
 
 

@@ -262,6 +262,9 @@ class LiveSolverClient:
                     ),
                     parsed,
                 )
+            except httpx.ConnectTimeout as error:
+                # Never reached the miner at all: not a slow answer.
+                return failed(type(error).__name__)
             except httpx.TimeoutException:
                 return failed(f"no response within {timeout_s:.0f} s")
             except httpx.HTTPError as error:
