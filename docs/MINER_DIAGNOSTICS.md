@@ -58,9 +58,10 @@ line that does not parse. Run only one validator writer for each log path.
   as `ConnectError`, `ConnectTimeout`, `PoolTimeout`, `RemoteProtocolError` or
   `ReadError` (its message could describe the validator's own network), `no
   response within 1170 s` for a miner that was reached but did not answer in
-  time, `lease too short to dispatch` or `request body did not reach
-  transport before signature deadline` for a request the validator could not
-  send in time, or `validator error: <class>` when the validator itself
+  time, `validator could not send: lease too short to dispatch` or
+  `validator could not send: request body did not reach transport before
+  signature deadline` for a request that never left, or `validator error:
+  <class>` when the validator itself
   failed before or inside the exchange, with the message printed to the
   validator's journal only. For `dispatch_failed` it is the exception class
   and message, cut to 512 bytes; the submission committed to the problem
@@ -73,7 +74,8 @@ line that does not parse. Run only one validator writer for each log path.
   Early stopping is unchanged.
 - `grading_duration_ms` and `response_latency_ms`: describe grading and response
   time when available. A failed dispatch is timed too: `response_latency_ms`
-  is the time until the failure, so a fast rejection can be told from a
+  is the time until the failure, including any wait for a dispatch slot,
+  so a fast rejection can be told from a
   timeout. It is `null` for `not_serving`, where the validator never tried,
   and `grading_duration_ms` is `null` for miners without an evaluation record.
 - `reason`: for a `timeout` verdict it names what timed out, its limit and how

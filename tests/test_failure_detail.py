@@ -12,7 +12,7 @@ import httpx
 import pytest
 
 from rlvr import protocol
-from rlvr.config import get_settings
+from rlvr.config import Settings
 from rlvr.neurons import demo_miner
 from rlvr.neurons import feedback_sender as sender
 from rlvr.neurons.live import LiveSolverClient
@@ -100,7 +100,7 @@ async def dispatch(handler, validator, miner):
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     client = LiveSolverClient(
         uid=7, hotkey=miner.ss58_address, url="http://miner",
-        wallet=WalletLike(validator), settings=get_settings(), http=http,
+        wallet=WalletLike(validator), settings=Settings(_env_file=None), http=http,
     )
     try:
         return await client.solve_v3(task_for(miner.ss58_address))
@@ -234,7 +234,7 @@ async def through_record_and_notice(committed, monkeypatch):
         offline.setattr(protocol, "_HAVE_CRYPTO", False)
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
             client = LiveSolverClient(
-                committed.uid, committed.hotkey, "http://miner", "validator", get_settings(), http
+                committed.uid, committed.hotkey, "http://miner", "validator", Settings(_env_file=None), http
             )
             assert await sender.send_failure_notices(
                 result, [client], wallet="validator", http=http, include_details=True
@@ -328,7 +328,7 @@ async def test_a_signing_failure_names_the_class_and_keeps_the_wallet_path_in_th
     http = httpx.AsyncClient(transport=httpx.MockTransport(never_called))
     client = LiveSolverClient(
         uid=7, hotkey=miner.ss58_address, url="http://miner",
-        wallet=UnreadableWallet(), settings=get_settings(), http=http,
+        wallet=UnreadableWallet(), settings=Settings(_env_file=None), http=http,
     )
     try:
         committed, parsed = await client.solve_v3(task_for(miner.ss58_address))
@@ -618,7 +618,6 @@ def offline_signatures(monkeypatch):
 
 
 def solver(http, uid):
-    from rlvr.config import Settings
     return LiveSolverClient(uid, f"hk-{uid}", f"http://miner-{uid}", "validator", Settings(_env_file=None), http)
 
 

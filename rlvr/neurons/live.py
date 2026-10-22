@@ -211,7 +211,7 @@ class LiveSolverClient:
         lease_budget = task.expires_at - time.time() - _SOLVE_DEADLINE_GRACE_S - _COMMIT_RESERVE_S
         if lease_budget <= 0:
             permit.release()
-            return failed("lease too short to dispatch")
+            return failed("validator could not send: lease too short to dispatch")
         timeout_s = min(self._settings.solve_deadline_s, lease_budget)
         overall_deadline = time.monotonic() + timeout_s + _SOLVE_DEADLINE_GRACE_S
         # What the miner is told it had: the solve window plus the grace actually waited.
@@ -310,7 +310,7 @@ class LiveSolverClient:
                     return failed(waited)
             exchange_task.cancel()
             await asyncio.gather(exchange_task, return_exceptions=True)
-            return failed("request body did not reach transport before signature deadline")
+            return failed("validator could not send: request body did not reach transport before signature deadline")
         finally:
             consumed_task.cancel()
             if not exchange_task.done():
