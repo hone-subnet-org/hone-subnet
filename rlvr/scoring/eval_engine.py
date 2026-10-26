@@ -2,9 +2,12 @@
 
 Design choices:
   - Each uid retains its latest ``max_samples`` completed-problem payments.
-  - Scores divide by at least ``min_samples``, preventing one lucky first answer
-    from immediately receiving a full score while allowing a fuller window to
-    reduce the impact of one transient miss.
+  - A score is the mean payment raised to ``score_exponent``, then scaled by
+    ``min(observations / min_samples, 1)``. The exponent widens the gap
+    between better and worse miners; among miners past the ramp it never
+    changes their order. The ramp stops a few lucky first answers from
+    earning a full score, and stays linear because the exponent is applied
+    before it, not after.
   - Only completed challenges advance histories. Non-serving miners receive one
     zero per completed challenge, never for server pacing or empty rounds.
     Set ``decay=False`` to freeze histories on silence.
@@ -26,6 +29,20 @@ from typing import Callable, Iterable
 import numpy as np
 
 
+def history_score(
+    rewards: Iterable[float], min_samples: int, exponent: float
+) -> float:
+    """Mean payment to the power ``exponent``, ramped linearly up to ``min_samples``."""
+    values = list(rewards)
+    if not values:
+        return 0.0
+    quality = max(sum(values) / len(values), 0.0)
+    ramp = min(len(values) / min_samples, 1.0)
+    # numpy overflows to inf instead of raising; get_weights maps inf to 0.
+    with np.errstate(over="ignore"):
+        return float(np.power(quality, exponent) * ramp)
+
+
 class EvalEngine:
     """Per-uid bounded payment history -> normalized weights."""
 
@@ -37,6 +54,8 @@ class EvalEngine:
         min_samples: int,
         decay: bool = True,
         clock: Callable[[], float] = time.time,
+        *,
+        score_exponent: float = 1.0,
     ):
         if num_uids < 0:
             raise ValueError("num_uids must be non-negative")
@@ -54,10 +73,17 @@ class EvalEngine:
             or not 1 <= int(min_samples) <= int(max_samples)
         ):
             raise ValueError("min_samples must be between 1 and max_samples")
+        if (
+            isinstance(score_exponent, bool)
+            or not np.isfinite(score_exponent)
+            or float(score_exponent) <= 0.0
+        ):
+            raise ValueError("score_exponent must be finite and positive")
         self.window_seconds = float(window_seconds)
         self.max_samples = int(max_samples)
         self.min_samples = int(min_samples)
         self.decay = bool(decay)
+        self.score_exponent = float(score_exponent)
         self._clock = clock
         self.scores: np.ndarray = np.zeros(int(num_uids), dtype=np.float64)
         # Sparse so "never observed" remains distinct from "observed zero".
@@ -84,12 +110,8 @@ class EvalEngine:
 
     def _refresh_score(self, uid: int) -> None:
         history = self.histories.get(uid, [])
-        # Full-pool peers normally have equal history lengths, so this common
-        # startup divisor cancels during L1 normalization. It only suppresses
-        # genuinely thinner evidence, such as a newly registered uid.
-        denominator = max(len(history), self.min_samples)
-        self.scores[uid] = (
-            sum(reward for _, reward in history) / denominator if history else 0.0
+        self.scores[uid] = history_score(
+            (reward for _, reward in history), self.min_samples, self.score_exponent
         )
 
     def _record(self, uid: int, reward: float, observed_at: float) -> None:

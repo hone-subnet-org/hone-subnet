@@ -290,8 +290,14 @@ reported in diagnostics but does not change the contribution: the release
 speed floor is 1, which switches the speed factor off. Failed or rejected
 evaluations contribute zero. Abandoned rounds add no observations.
 
-The score window retains up to 100 recorded observations, with a startup
-denominator of at least four. This is not necessarily 100 wall-clock rounds:
+A miner's score is its mean contribution over the window raised to the power
+1.5, so a consistently better miner earns proportionally more than a worse
+one. A new miner's score ramps linearly to full over its first 20
+observations: after 10 it earns half of what the same results would earn once
+mature.
+
+The score window retains up to 100 recorded observations. This is not
+necessarily 100 wall-clock rounds:
 serving miners not sampled for a task do not receive an observation, while
 previously observed nonserving miners receive zero on completed rounds when
 nonresponder decay is enabled. A hotkey change resets the old registration's

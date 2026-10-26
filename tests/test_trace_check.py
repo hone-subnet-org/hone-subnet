@@ -12,11 +12,15 @@ from pydantic import ValidationError
 
 from rlvr.neurons import trace_check
 from rlvr.neurons.trace_check import send_trace_checks
+from rlvr.policy import RELEASE_POLICY
 from rlvr.v3.api import TraceCheckRequest, serialize_trace_check_request
 from rlvr.v3.artifacts import MinerArtifactRef
 from rlvr.v3.grading import EvaluationResult
 from rlvr.v3.reasons import MinerReason, Stage
 from rlvr.v3.round import MinerEvaluation, RoundResult, compute_round_payments
+
+# One pass from a new miner earns 1 / startup samples of a full score.
+ONE_PASS = 1 / RELEASE_POLICY.score_window_min_samples
 
 URL = "https://traces.invalid/check"
 SERVICE = "service-hotkey"
@@ -356,7 +360,7 @@ async def test_callback_sends_only_after_a_successful_score_save(tmp_path, monke
 
     await decentralized._run_decentralized_validator_async(settings)
 
-    assert len(returned) == 1 and returned[0][1] == 0.25  # the round was scored
+    assert len(returned) == 1 and returned[0][1] == ONE_PASS  # the round was scored
     if case == "save_failure":
         assert calls == []  # nothing is sent when the score file was not written
     else:

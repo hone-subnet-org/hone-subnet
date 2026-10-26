@@ -7,10 +7,14 @@ import pytest
 
 from rlvr.config import Settings
 from rlvr.neurons import decentralized
+from rlvr.policy import RELEASE_POLICY
 from rlvr.v3.diagnostics import EvaluationLog
 from rlvr.v3.grading import EvaluationResult
 from rlvr.v3.reasons import RoundReason, Stage
 from rlvr.v3.round import MinerEvaluation, RoundResult
+
+# One pass from a new miner earns 1 / startup samples of a full score.
+ONE_PASS = 1 / RELEASE_POLICY.score_window_min_samples
 
 
 def test_empty_environment_setting_disables_diagnostics(tmp_path, monkeypatch):
@@ -110,7 +114,7 @@ async def test_diagnostics_follow_persistence_and_cannot_interrupt_callback(
 
     assert log_calls == [(outcome, "validator")]
     assert len(returned) == 1
-    assert returned[0][1] == (0.25 if status == "completed" else 0)
+    assert returned[0][1] == (ONE_PASS if status == "completed" else 0)
     if logging_failure is None:
         if not leased:
             assert not diagnostic_file.exists()
