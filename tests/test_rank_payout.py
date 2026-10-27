@@ -20,7 +20,7 @@ from rlvr.neurons.decentralized import _load_scores, _save_scores
 from rlvr.policy import LEGACY_SCORE_WINDOW_SECONDS, RELEASE_POLICY, ValidatorPolicy
 from rlvr.scoring.eval_engine import EvalEngine, rank_weights
 
-DECAY = 0.9
+DECAY = 0.995
 
 
 def _engine(num_uids: int = 4, rank_decay: float | None = RELEASE_POLICY.rank_decay):
@@ -47,7 +47,7 @@ def _normalized(values: list[float]) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 # Shape
 # --------------------------------------------------------------------------- #
-def test_release_decay_is_nine_tenths():
+def test_release_decay_is_0_995():
     assert RELEASE_POLICY.rank_decay == DECAY
 
 
@@ -94,7 +94,7 @@ def test_top_share_with_one_hundred_scoring_miners():
     weights = engine.get_weights()
 
     assert weights[0] == pytest.approx((1 - DECAY) / (1 - DECAY**100))
-    assert weights[:10].sum() == pytest.approx(0.65, abs=0.01)
+    assert weights[:10].sum() == pytest.approx((1 - DECAY**10) / (1 - DECAY**100))
 
 
 def test_without_rank_decay_weights_stay_proportional():
@@ -143,7 +143,7 @@ def test_all_zero_scores_give_all_zero_weights():
 def test_ranks_are_taken_after_aligning_to_the_metagraph():
     engine = _engine(num_uids=3)
     # uid 2 is beyond a 2-slot metagraph. Ranking it first would leave the
-    # kept uids at ranks 0 and 2, giving [0.81, 1] instead of [0.9, 1].
+    # kept uids at ranks 0 and 2, giving [DECAY**2, 1] instead of [DECAY, 1].
     engine.scores[:] = [0.2, 0.9, 0.5]
 
     assert engine.get_weights(n=2) == pytest.approx(_normalized([DECAY, 1.0]))
@@ -165,7 +165,7 @@ def test_policy_rejects_an_unusable_decay(bad):
 
 
 def test_policy_summary_names_the_decay():
-    assert "rank_decay=0.9" in RELEASE_POLICY.summary()
+    assert "rank_decay=0.995" in RELEASE_POLICY.summary()
 
 
 # --------------------------------------------------------------------------- #

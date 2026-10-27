@@ -31,7 +31,7 @@ class ValidatorPolicy:
     score_window_min_samples: int = 20
     # Weights follow rank: each miner gets this fraction of the weight of the
     # miner ranked just above it. Ties go to the lower UID.
-    rank_decay: float = 0.9
+    rank_decay: float = 0.995
     min_weight_observations: int = 4
     decay_nonresponders: bool = True
     round_interval_blocks: int = 38

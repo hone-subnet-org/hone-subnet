@@ -277,7 +277,7 @@ def test_settings_fail_closed_to_docker_and_validate_difficulty_band():
     assert settings.problem_server_request_timeout_s == 60
     assert RELEASE_POLICY.score_window_max_samples == 100
     assert RELEASE_POLICY.score_window_min_samples == 20
-    assert RELEASE_POLICY.rank_decay == 0.9
+    assert RELEASE_POLICY.rank_decay == 0.995
     assert RELEASE_POLICY.min_weight_observations == 4
     with pytest.raises(ValueError, match="BAND_LOW"):
         Settings(_env_file=None, band_low=0.8, band_high=0.2)

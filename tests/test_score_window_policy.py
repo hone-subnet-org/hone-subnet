@@ -243,8 +243,8 @@ def test_default_ramp_is_twenty_and_weight_gate_stays_at_four():
     assert RELEASE_POLICY.min_weight_observations == WEIGHT_GATE
 
 
-def test_default_rank_decay_is_nine_tenths():
-    assert RELEASE_POLICY.rank_decay == 0.9
+def test_default_rank_decay_is_0_995():
+    assert RELEASE_POLICY.rank_decay == 0.995
 
 
 def test_default_engine_accumulates_a_full_window_of_observations():
