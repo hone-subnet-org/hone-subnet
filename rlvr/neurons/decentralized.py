@@ -610,7 +610,10 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
             )
             summary = dispatch_summary(result)
             if summary:
-                print(f"[validator] {summary}")
+                try:
+                    print(f"[validator] {summary}")
+                except (OSError, ValueError):
+                    pass  # a journal that cannot take the line must not cost the round its scores
             if result.status == "completed" or result.reason_code is RoundReason.QUORUM_NOT_MET:
                 # A completed round earns a fresh draw. So does a quorum
                 # failure: that is decided by the miners' own responses against

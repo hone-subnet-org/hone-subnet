@@ -214,7 +214,7 @@ def cases():
 
     return [
         ("different-hotkey", different_hotkey, r"signed by a different hotkey"),
-        ("stale-timestamp", stale_timestamp, r"signature timestamp outside the ±8 s window: off by -(19|20|21)\.\d s"),
+        ("stale-timestamp", stale_timestamp, r"signature timestamp outside the \+/-8 s window: off by -(19|20|21)\.\d s"),
         ("bad-signature", bad_signature, r"signature does not verify"),
         ("unparsable", unparsable, r"response does not parse: \S+: .+"),
         ("wrong-slot", wrong_slot, r"submission does not match its slot: upload ID"),
@@ -325,7 +325,7 @@ async def test_the_timestamp_message_never_changes_what_verification_accepts(off
         assert parsed is not None and committed.error == ""
     else:
         assert parsed is None
-        assert re.fullmatch(r"signature timestamp outside the ±8 s window: off by [+-]\d+\.\d s", committed.error), committed.error
+        assert re.fullmatch(r"signature timestamp outside the \+/-8 s window: off by [+-]\d+\.\d s", committed.error), committed.error
 
 
 @pytest.mark.skipif(not crypto_available(), reason="no sr25519 crypto stack installed")
@@ -632,8 +632,8 @@ def test_dispatch_summary_counts_by_cause():
         "completed", "", (), challenge_id="chal-1", task_id=TASK, signed_responses=3,
         assigned_miners=tuple((uid, f"hk-{uid}") for uid in range(1, 10)),
         dispatch_failures=(
-            rejection(1, "signature timestamp outside the ±8 s window: off by +9.4 s"),
-            rejection(2, "signature timestamp outside the ±8 s window: off by -12.0 s"),
+            rejection(1, "signature timestamp outside the +/-8 s window: off by +9.4 s"),
+            rejection(2, "signature timestamp outside the +/-8 s window: off by -12.0 s"),
             rejection(3, "response does not parse: submission.sha256: String should have at least 64 characters"),
             rejection(4, "no response within 1170 s"),
             rejection(5, "miner is not serving", MinerReason.NOT_SERVING, None),
@@ -641,7 +641,7 @@ def test_dispatch_summary_counts_by_cause():
         ),
     )
     assert dispatch_summary(result) == (
-        "dispatch: 3 ok, 4 rejected (2 signature timestamp outside the ±8 s window, "
+        "dispatch: 3 ok, 4 rejected (2 signature timestamp outside the +/-8 s window, "
         "1 response does not parse, 1 no response within 1170 s), 1 not serving, 1 dispatch failed"
     )
 
@@ -899,7 +899,7 @@ async def test_demo_miner_prints_what_the_validator_saw(monkeypatch):
         failure=FailureExplanation(
             version=1, reason_code=MinerReason.ARTIFACT_INVALID,
             dispatch_reason_code=MinerReason.RESPONSE_UNAVAILABLE,
-            dispatch_detail="signature timestamp outside the ±8 s window: off by +9.4 s",
+            dispatch_detail="signature timestamp outside the +/-8 s window: off by +9.4 s",
         ),
     )
     body = notice.model_dump_json().encode()
@@ -908,5 +908,5 @@ async def test_demo_miner_prints_what_the_validator_saw(monkeypatch):
     assert output == [[
         "[demo-miner] feedback: artifact_invalid challenge challenge task " + "a" * 16,
         "[demo-miner] feedback:   validator saw: response_unavailable, "
-        "signature timestamp outside the \\xb18 s window: off by +9.4 s",
+        "signature timestamp outside the +/-8 s window: off by +9.4 s",
     ]]

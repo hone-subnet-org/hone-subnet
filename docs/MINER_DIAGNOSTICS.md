@@ -48,7 +48,7 @@ line that does not parse. Run only one validator writer for each log path.
 - `dispatch_detail`: with a dispatch code, the exact local cause in one
   bounded sentence, as the validator saw it at the time. For
   `response_unavailable` it names the check the response failed: `signed by a
-  different hotkey`, `signature timestamp outside the ±8 s window: off by
+  different hotkey`, `signature timestamp outside the +/-8 s window: off by
   +9.4 s`, `signature does not verify`, `response is not UTF-8`, `response
   does not parse: submission.sha256: ...` (the first validation error; a
   wrong role or format fails here, since the response type pins both),
@@ -126,7 +126,7 @@ is handled by the existing round and server logic.
 
 Once dispatch has run, the validator also prints one journal line per round
 summing it up by cause, for example
-`[validator] dispatch: 110 ok, 12 rejected (8 signature timestamp outside the ±8 s window, 3 response does not parse, 1 no response within 1170 s), 2 not serving`.
+`[validator] dispatch: 110 ok, 12 rejected (8 signature timestamp outside the +/-8 s window, 3 response does not parse, 1 no response within 1170 s), 2 not serving`.
 `ok` counts signed, slot-matched responses. Rejections are grouped by the
 text before the colon of their detail.
 

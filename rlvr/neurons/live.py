@@ -268,7 +268,7 @@ class LiveSolverClient:
                     if skew_s is not None and abs(skew_s) * 1000 > SIGNATURE_WINDOW_MS:
                         window_s = SIGNATURE_WINDOW_MS // 1000
                         return failed(
-                            f"signature timestamp outside the ±{window_s} s window: off by {skew_s:+.1f} s"
+                            f"signature timestamp outside the +/-{window_s} s window: off by {skew_s:+.1f} s"
                         )
                     return failed("signature does not verify")
                 try:
