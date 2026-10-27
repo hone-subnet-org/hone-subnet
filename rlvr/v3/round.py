@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import hashlib
 import math
 import re
@@ -159,6 +160,17 @@ class MinerEvaluation:
 
 
 @dataclass(frozen=True)
+class DispatchFailure:
+    """Why one assigned miner gave no usable response, as this validator saw it."""
+
+    uid: int
+    hotkey: str
+    code: MinerReason
+    detail: str
+    latency_ms: int | None  # time until the failure; None when no request was made
+
+
+@dataclass(frozen=True)
 class RoundResult:
     status: Literal["completed", "unavailable", "abandoned"]
     reason: str
@@ -170,8 +182,49 @@ class RoundResult:
     task_id: str | None = None
     assigned_miners: tuple[tuple[int, str], ...] = ()
     diagnostic_evaluations: tuple[MinerEvaluation, ...] = ()
-    dispatch_failures: tuple[tuple[int, str, MinerReason], ...] = ()
+    dispatch_failures: tuple[DispatchFailure, ...] = ()
     checks_total: int | None = None
+    signed_responses: int | None = None  # None until dispatch has run
+
+
+def dispatch_summary(result: RoundResult) -> str | None:
+    """One journal line on how dispatch went, by cause; None before dispatch ran."""
+    if result.signed_responses is None:
+        return None
+    failures = result.dispatch_failures
+    parts = [f"{result.signed_responses} ok"]
+    rejected = [item for item in failures if item.code is MinerReason.RESPONSE_UNAVAILABLE]
+    if rejected:
+        # Details read "cause: specifics", so the text before the colon groups
+        # them. It is printed, so it is kept to printable text.
+        causes = collections.Counter(
+            "".join(ch for ch in item.detail.split(":")[0][:80] if ch.isprintable()) for item in rejected
+        )
+        listed = ", ".join(f"{count} {cause}" for cause, count in causes.most_common())
+        parts.append(f"{len(rejected)} rejected ({listed})")
+    for code, label in (
+        (MinerReason.NOT_SERVING, "not serving"),
+        (MinerReason.DISPATCH_FAILED, "dispatch failed"),
+    ):
+        count = sum(item.code is code for item in failures)
+        if count:
+            parts.append(f"{count} {label}")
+    return "dispatch: " + ", ".join(parts)
+
+
+def _short(text: str, limit: int = 512) -> str:
+    """At most `limit` bytes of valid UTF-8, the way the solver bounds its own errors."""
+    return text.encode("utf-8", "replace")[:limit].decode("utf-8", "ignore")
+
+
+def _describe(error: BaseException) -> str:
+    """Class and message, bounded; the class alone when the message itself cannot be built."""
+    name = type(error).__name__
+    try:
+        message = str(error)
+    except Exception:  # noqa: BLE001 - a broken __str__ must not escape the dispatch handler
+        message = ""
+    return _short(f"{name}: {message}" if message else name)
 
 
 def _failed_submission(challenge_id: str, uid: int, hotkey: str, error: str) -> MinerSubmission:
@@ -323,8 +376,9 @@ async def evaluate_round(
 
     stage = Stage.LEASE
     evaluations: list[MinerEvaluation] = []
-    dispatch_failures: dict[tuple[int, str], MinerReason] = {}
+    dispatch_failures: dict[tuple[int, str], DispatchFailure] = {}
     checks_total: int | None = None
+    signed_count: int | None = None
 
     def finish(
         status: Literal["completed", "abandoned"],
@@ -344,9 +398,10 @@ async def evaluate_round(
             ),
             diagnostic_evaluations=observed,
             dispatch_failures=tuple(
-                (uid, hotkey, failure) for (uid, hotkey), failure in sorted(dispatch_failures.items())
+                failure for _, failure in sorted(dispatch_failures.items())
             ),
             checks_total=checks_total,
+            signed_responses=signed_count,
         )
 
     try:
@@ -429,7 +484,9 @@ async def evaluate_round(
                 registration = (slots.submission.uid, slots.submission.hotkey)
                 solver = by_registration.get(registration)
                 if solver is None:
-                    dispatch_failures[registration] = MinerReason.NOT_SERVING
+                    dispatch_failures[registration] = DispatchFailure(
+                        *registration, MinerReason.NOT_SERVING, "miner is not serving", None
+                    )
                     return (
                         _failed_submission(
                             lease.challenge_id, *registration, "miner is not serving"
@@ -446,17 +503,33 @@ async def evaluate_round(
                     expires_at=lease.expires_at,
                     slots=slots,
                 )
+                started = time.monotonic()
                 try:
                     async with semaphore:
+                        started = time.monotonic()  # the miner's time, not the validator's queue
                         submission, parsed = await solver.solve_v3(task)
                     if parsed is None:
-                        dispatch_failures[registration] = MinerReason.RESPONSE_UNAVAILABLE
+                        # The solver's error says exactly which check the response failed.
+                        dispatch_failures[registration] = DispatchFailure(
+                            *registration,
+                            MinerReason.RESPONSE_UNAVAILABLE,
+                            submission.error,
+                            submission.latency_ms,
+                        )
                     return submission, parsed
-                except Exception:  # noqa: BLE001
-                    dispatch_failures[registration] = MinerReason.DISPATCH_FAILED
+                except Exception as error:  # noqa: BLE001
+                    # The local record keeps class and message, bounded. The
+                    # committed submission, which the problem server reads, gets
+                    # the class alone: the message is the validator's own business.
+                    dispatch_failures[registration] = DispatchFailure(
+                        *registration,
+                        MinerReason.DISPATCH_FAILED,
+                        _describe(error),
+                        int((time.monotonic() - started) * 1000),
+                    )
                     return (
                         _failed_submission(
-                            lease.challenge_id, *registration, "miner dispatch failed"
+                            lease.challenge_id, *registration, f"validator error: {type(error).__name__}"
                         ),
                         None,
                     )
@@ -475,6 +548,7 @@ async def evaluate_round(
                 for submission, parsed in dispatched
                 if parsed is not None
             }
+            signed_count = len(signed_responses)
             if len(signed_responses) < lease.commit_min_signed_responses:
                 return finish("abandoned", "signed response quorum was not met", RoundReason.QUORUM_NOT_MET)
             commit = ChallengeCommitRequest(

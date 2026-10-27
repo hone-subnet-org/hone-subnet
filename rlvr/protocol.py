@@ -186,6 +186,10 @@ def _keypair_address(hotkey: Any) -> str:
     return str(hotkey)
 
 
+# A signature is accepted this far either side of the receiver's clock.
+SIGNATURE_WINDOW_MS = 8000
+
+
 def sign_message(
     hotkey: Any,
     body: bytes,
@@ -241,7 +245,7 @@ def verify_signature(
     headers: Mapping[str, str],
     body: bytes,
     *,
-    allowed_delta_ms: int = 8000,
+    allowed_delta_ms: int = SIGNATURE_WINDOW_MS,
     now_ms: Optional[int] = None,
     expected_signed_for: Optional[str] = None,
 ) -> bool:

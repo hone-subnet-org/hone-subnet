@@ -122,3 +122,78 @@ async def test_diagnostics_follow_persistence_and_cannot_interrupt_callback(
             assert records[1]["score_effect"] == (
                 "not_reported" if status == "completed" else "unchanged"
             )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        UnicodeEncodeError("ascii", "±", 0, 1, "ordinal not in range(128)"),
+        BrokenPipeError(32, "Broken pipe"),
+        ValueError("I/O operation on closed file."),
+    ],
+)
+async def test_a_journal_that_refuses_the_dispatch_line_still_scores_the_round(
+    tmp_path, monkeypatch, failure
+):
+    score_file = tmp_path / "scores.json"
+    settings = Settings(
+        _env_file=None,
+        problem_server_url="https://problems.invalid",
+        validator_score_state_file=str(score_file),
+    )
+    candidate = MinerEvaluation(1, "miner", 10, EvaluationResult("passed", "", (), None))
+    outcome = RoundResult(
+        "completed",
+        "",
+        (candidate,),
+        stage=Stage.GRADING,
+        challenge_id="challenge",
+        task_id="a" * 64,
+        assigned_miners=((1, "miner"),),
+        checks_total=0,
+        signed_responses=1,  # dispatch ran, so the round has a summary line
+    )
+    returned = []
+    refused = []
+
+    class Validator:
+        def __init__(self, *_args, **_kwargs):
+            self.wallet = SimpleNamespace(hotkey=SimpleNamespace(ss58_address="validator"))
+            self.subtensor = object()
+            self.metagraph = SimpleNamespace(hotkeys=["owner", "miner"], sync=lambda **_: None)
+
+        def setup_bittensor(self):
+            pass
+
+        def set_round_callback(self, callback):
+            self.callback = callback
+
+        def set_weight_setter(self, _setter):
+            pass
+
+        async def run(self):
+            returned.append(await self.callback(self))
+
+    def journal(*args, **kwargs):
+        if args and str(args[0]).startswith("[validator] dispatch:"):
+            refused.append(args[0])
+            raise failure
+        print(*args, **kwargs)
+
+    async def evaluate(*_args, **_kwargs):
+        return outcome
+
+    monkeypatch.setattr(decentralized, "print", journal, raising=False)
+    monkeypatch.setattr(decentralized, "ValidatorNeuron", Validator)
+    monkeypatch.setattr(decentralized, "_apply_weights_rate_limit", lambda *_: None)
+    monkeypatch.setattr(decentralized, "v3_round_policy", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        decentralized, "_solver_clients", lambda *_args, **_kwargs: [SimpleNamespace(uid=1, hotkey="miner")]
+    )
+    monkeypatch.setattr(decentralized, "evaluate_round", evaluate)
+
+    await decentralized._run_decentralized_validator_async(settings)
+
+    assert refused == ["[validator] dispatch: 1 ok"]
+    assert len(returned) == 1 and returned[0][1] == 0.25  # the round was still scored
+    assert json.loads(score_file.read_text())["histories"]["1"]  # and saved

@@ -4,13 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import time
+import unicodedata
 from typing import Optional
 from uuid import uuid4
 
 import httpx
+from pydantic import ValidationError
 
 from ..config import Settings
-from ..protocol import SignedSolution, SolutionPayload, TaskRequest, sign_message, verify_signature
+from ..protocol import (
+    SIGNATURE_WINDOW_MS,
+    SignedSolution,
+    SolutionPayload,
+    TaskRequest,
+    sign_message,
+    verify_signature,
+)
 from ..types import Problem, SolutionResponse
 from ..v3.api import (
     EPISTULA_HEADERS,
@@ -26,6 +35,45 @@ _SEND_START_BUDGET_S = 6.0
 _SOLVE_DEADLINE_GRACE_S = 10.0
 # Time kept back from the lease for the commit that must follow every dispatch.
 _COMMIT_RESERVE_S = 30.0
+
+
+def _signature_skew_s(timestamp_header: str) -> float | None:
+    """How far the response signature's timestamp is from now, in seconds."""
+    try:
+        skew_s = (int(timestamp_header) - time.time() * 1000) / 1000
+    except (ValueError, OverflowError):  # not a number, or absurdly large
+        return None
+    # Beyond a few decades it is not a clock that is off, so no skew is named.
+    return skew_s if abs(skew_s) < 1e9 else None
+
+
+def _journal_text(error: BaseException) -> str:
+    """Class and message for the operator's journal: one printable line, bounded.
+
+    The message is the validator's own, but it is printed to a terminal, so
+    control characters are dropped and a message that cannot be built is left out.
+    """
+    try:
+        message = " ".join(str(error).split())
+    except Exception:  # noqa: BLE001 - a broken __str__ must not replace the real failure
+        message = ""
+    message = "".join(ch for ch in message if ch.isprintable())[:200]
+    name = type(error).__name__
+    return f"{name}: {message}" if message else name
+
+
+def _first_validation_error(error: ValidationError) -> str:
+    """The first problem pydantic found, as "field: message".
+
+    The field path can hold a key the miner chose, so it is kept to printable
+    text, a short length and NFC, which dropping a format character can undo;
+    the message is pydantic's own wording.
+    """
+    first = error.errors()[0]
+    path = ".".join(str(part) for part in first["loc"]) or "body"
+    field = "".join(ch for ch in path if ch.isprintable())[:80]
+    field = unicodedata.normalize("NFC", field) or "body"
+    return f"{field}: {first['msg']}"
 
 
 class _SendPermit:
@@ -168,7 +216,10 @@ class LiveSolverClient:
             headers = sign_message(self._wallet, body, signed_for=self.hotkey)
         except Exception as error:  # noqa: BLE001
             permit.release()
-            return failed(f"dispatch signing failed: {error}")
+            # The validator's own fault, and the message can name its wallet
+            # files: journal for the operator, class only for everyone else.
+            print(f"[validator] WARN: signing the task for uid {self.uid} failed: {_journal_text(error)}")
+            return failed(f"validator error: {type(error).__name__}")
         headers["Content-Type"] = "application/json"
         headers["Content-Length"] = str(len(body))
         # The exchange, its grace and the commit that follows must all fit
@@ -177,9 +228,13 @@ class LiveSolverClient:
         lease_budget = task.expires_at - time.time() - _SOLVE_DEADLINE_GRACE_S - _COMMIT_RESERVE_S
         if lease_budget <= 0:
             permit.release()
-            return failed("lease too short to dispatch")
+            return failed("validator could not send: lease too short to dispatch")
         timeout_s = min(self._settings.solve_deadline_s, lease_budget)
         overall_deadline = time.monotonic() + timeout_s + _SOLVE_DEADLINE_GRACE_S
+
+        def waited() -> str:
+            """What the miner is told: how long the validator waited without a usable response."""
+            return f"no response within {elapsed_ms() / 1000:.0f} s"
 
         async def exchange():
             try:
@@ -200,21 +255,34 @@ class LiveSolverClient:
                     response_headers = {
                         name: response.headers.get(name, "") for name in EPISTULA_HEADERS
                     }
-                if (
-                    response_headers["Epistula-Signed-By"] != self.hotkey
-                    or not verify_signature(
-                        response_headers,
-                        response_body,
-                        expected_signed_for=headers["Epistula-Signed-By"],
-                    )
+                # Each check names its own failure, so a miner can be told why.
+                if response_headers["Epistula-Signed-By"] != self.hotkey:
+                    return failed("signed by a different hotkey")
+                if not verify_signature(
+                    response_headers,
+                    response_body,
+                    expected_signed_for=headers["Epistula-Signed-By"],
                 ):
-                    return failed("invalid or unauthenticated miner response")
+                    # verify_signature alone decides; this only names the likely cause.
+                    skew_s = _signature_skew_s(response_headers["Epistula-Timestamp"])
+                    if skew_s is not None and abs(skew_s) * 1000 > SIGNATURE_WINDOW_MS:
+                        window_s = SIGNATURE_WINDOW_MS // 1000
+                        return failed(
+                            f"signature timestamp outside the +/-{window_s} s window: off by {skew_s:+.1f} s"
+                        )
+                    return failed("signature does not verify")
                 try:
                     response_text = response_body.decode("utf-8")
+                except UnicodeError:
+                    return failed("response is not UTF-8")
+                try:
                     parsed = MinerTaskResponse.model_validate_json(response_body)
+                except ValidationError as error:
+                    return failed(f"response does not parse: {_first_validation_error(error)}")
+                try:
                     validate_miner_response(task, parsed)
-                except (UnicodeError, ValueError):
-                    return failed("invalid V3 miner response")
+                except ValueError as error:
+                    return failed(str(error))
                 return (
                     V3MinerSubmission(
                         uid=self.uid,
@@ -227,8 +295,23 @@ class LiveSolverClient:
                     ),
                     parsed,
                 )
+            except httpx.ReadTimeout:
+                return failed(waited())
+            except httpx.HTTPError as error:
+                # The class names the transport failure: ConnectError,
+                # ConnectTimeout, PoolTimeout, ReadError, RemoteProtocolError. Its
+                # message can describe this validator's own network, so the
+                # class is all that is recorded or told. Only a read timeout is
+                # a miner that was reached and did not answer.
+                return failed(type(error).__name__)
             except Exception as error:  # noqa: BLE001
-                return failed(f"dispatch failed: {error}")
+                # Not about the miner's response. The message goes to the
+                # journal for the operator; the record and the miner get the class.
+                print(
+                    f"[validator] WARN: dispatch to uid {self.uid} failed inside the exchange: "
+                    f"{_journal_text(error)}"
+                )
+                return failed(f"validator error: {type(error).__name__}")
 
         exchange_task = asyncio.create_task(exchange())
         consumed_task = asyncio.create_task(body_consumed.wait())
@@ -243,10 +326,10 @@ class LiveSolverClient:
                 try:
                     return await asyncio.wait_for(exchange_task, timeout=remaining)
                 except asyncio.TimeoutError:
-                    return failed("miner response exceeded the solve deadline")
+                    return failed(waited())
             exchange_task.cancel()
             await asyncio.gather(exchange_task, return_exceptions=True)
-            return failed("request body did not reach transport before signature deadline")
+            return failed("validator could not send: request body did not reach transport before signature deadline")
         finally:
             consumed_task.cancel()
             if not exchange_task.done():
