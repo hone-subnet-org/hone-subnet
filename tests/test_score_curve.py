@@ -160,7 +160,7 @@ def test_engine_rejects_an_unusable_exponent(bad):
         _engine(exponent=bad)
 
 
-@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf"), True])
 def test_policy_rejects_an_unusable_exponent(bad):
     with pytest.raises(ValueError, match="score_exponent"):
         ValidatorPolicy(score_exponent=bad)

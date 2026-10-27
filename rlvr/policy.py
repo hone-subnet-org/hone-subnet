@@ -91,7 +91,11 @@ class ValidatorPolicy:
             raise ValueError("payment_speed_half_life_ms must be positive")
         if not 1 <= self.score_window_min_samples <= self.score_window_max_samples:
             raise ValueError("score sample bounds are invalid")
-        if not math.isfinite(self.score_exponent) or self.score_exponent <= 0.0:
+        if (
+            isinstance(self.score_exponent, bool)
+            or not math.isfinite(self.score_exponent)
+            or self.score_exponent <= 0.0
+        ):
             raise ValueError("score_exponent must be finite and positive")
         if not 1 <= self.min_weight_observations <= self.score_window_max_samples:
             raise ValueError("min_weight_observations is outside the score window")
