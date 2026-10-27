@@ -177,6 +177,17 @@ def test_partial_history_averages_over_the_observed_count():
     assert engine.scores[0] == pytest.approx(_score(0.8, 30))
 
 
+@pytest.mark.parametrize("observations", [1, 2, 10, 19, 20, 21, 50])
+def test_new_miner_score_ramps_linearly_and_is_full_from_twenty(observations):
+    engine = _engine(clock=_advancing_clock())
+    _observe(engine, observations, reward=1.0)
+
+    expected = min(observations / STARTUP_SAMPLES, 1.0)
+    assert engine.scores[0] == pytest.approx(expected)
+    if observations >= STARTUP_SAMPLES:
+        assert engine.scores[0] == 1.0
+
+
 # --------------------------------------------------------------------------- #
 # Registration change resets the whole window
 # --------------------------------------------------------------------------- #

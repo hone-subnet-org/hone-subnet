@@ -13,7 +13,7 @@ from rlvr.v3.grading import EvaluationResult
 from rlvr.v3.reasons import RoundReason, Stage
 from rlvr.v3.round import MinerEvaluation, RoundResult
 
-# One pass from a new miner earns 1 / startup samples of a full score.
+# One pass from a new miner scores 1 / startup samples of a full score.
 ONE_PASS = 1 / RELEASE_POLICY.score_window_min_samples
 
 
