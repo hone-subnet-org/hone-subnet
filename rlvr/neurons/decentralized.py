@@ -544,6 +544,7 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
         policy.score_window_max_samples,
         policy.score_window_min_samples,
         decay=policy.decay_nonresponders,
+        rank_decay=policy.rank_decay,
     )
     _load_scores(engine, settings.validator_score_state_file)
     state_dir = Path(settings.validator_score_state_file).absolute().parent

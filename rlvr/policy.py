@@ -25,7 +25,13 @@ class ValidatorPolicy:
     payment_speed_floor: float = 1.0
     owner_burn_share: float = 0.0
     score_window_max_samples: int = 100
-    score_window_min_samples: int = 4
+    # A miner's score ramps linearly to full over its first 20 observations.
+    # At measured validator cadences that takes 16 to 33 hours, inside the
+    # 36-hour immunity period.
+    score_window_min_samples: int = 20
+    # Weights follow rank: each miner gets this fraction of the weight of the
+    # miner ranked just above it. Ties go to the lower UID.
+    rank_decay: float = 0.995
     min_weight_observations: int = 4
     decay_nonresponders: bool = True
     round_interval_blocks: int = 38
@@ -84,6 +90,8 @@ class ValidatorPolicy:
             raise ValueError("payment_speed_half_life_ms must be positive")
         if not 1 <= self.score_window_min_samples <= self.score_window_max_samples:
             raise ValueError("score sample bounds are invalid")
+        if isinstance(self.rank_decay, bool) or not 0.0 < self.rank_decay <= 1.0:
+            raise ValueError("rank_decay must be in (0, 1]")
         if not 1 <= self.min_weight_observations <= self.score_window_max_samples:
             raise ValueError("min_weight_observations is outside the score window")
         if self.challenges_per_round < 1:
@@ -137,6 +145,7 @@ class ValidatorPolicy:
             f"protocol=3 execution_profile={self.v3_execution_profile_id} "
             f"score_samples={self.score_window_max_samples} "
             f"startup_samples={self.score_window_min_samples} "
+            f"rank_decay={self.rank_decay:g} "
             f"round_blocks={self.round_interval_blocks} "
             f"weight_blocks={self.weights_interval_blocks} "
             f"speed_floor={self.payment_speed_floor:g} "
