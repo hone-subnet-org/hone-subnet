@@ -142,11 +142,13 @@ def test_all_zero_scores_give_all_zero_weights():
 
 def test_ranks_are_taken_after_aligning_to_the_metagraph():
     engine = _engine(num_uids=3)
-    engine.scores[:] = [0.2, 0.5, 0.9]  # uid 2 is beyond a 2-slot metagraph
+    # uid 2 is beyond a 2-slot metagraph. Ranking it first would leave the
+    # kept uids at ranks 0 and 2, giving [0.81, 1] instead of [0.9, 1].
+    engine.scores[:] = [0.2, 0.9, 0.5]
 
     assert engine.get_weights(n=2) == pytest.approx(_normalized([DECAY, 1.0]))
     assert engine.get_weights(n=5) == pytest.approx(
-        _normalized([DECAY**2, DECAY, 1.0, 0, 0])
+        _normalized([DECAY**2, 1.0, DECAY, 0, 0])
     )
 
 
