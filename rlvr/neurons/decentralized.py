@@ -23,7 +23,7 @@ from ..problemserver.client import (
     next_lease_not_before,
     require_secure_problem_url,
 )
-from ..scoring.eval_engine import EvalEngine, history_score
+from ..scoring.eval_engine import EvalEngine
 from ..v3.client import V3ProblemServerClient
 from ..v3.diagnostics import EvaluationLog
 from ..v3.reasons import RoundReason
@@ -436,8 +436,6 @@ def _load_scores(engine: EvalEngine, path: str) -> None:
             # malformed or stale derived values are repaired rather than
             # discarding valid histories and suppressing weights for hours.
             stored_scores = state.get("scores")
-            # Files written before the exponent existed scored linearly.
-            stored_exponent = state.get("score_exponent", 1.0)
             scores_match = False
             try:
                 scores = np.asarray(stored_scores, dtype=np.float64)
@@ -445,18 +443,12 @@ def _load_scores(engine: EvalEngine, path: str) -> None:
                     scores.ndim == 1
                     and scores.size == num_uids
                     and np.all(np.isfinite(scores))
-                    and not isinstance(stored_exponent, bool)
-                    and isinstance(stored_exponent, (int, float))
-                    and np.isfinite(stored_exponent)
-                    and stored_exponent > 0.0
                 ):
                     expected = np.zeros(num_uids, dtype=np.float64)
                     for uid, values in histories.items():
-                        expected[uid] = history_score(
-                            (payment for _, payment in values),
-                            stored_min,
-                            stored_exponent,
-                        )
+                        expected[uid] = sum(
+                            payment for _, payment in values
+                        ) / max(len(values), stored_min)
                     scores_match = bool(
                         np.allclose(scores, expected, rtol=0.0, atol=1e-9)
                     )
@@ -519,7 +511,6 @@ def _save_scores(engine: EvalEngine, path: str) -> bool:
                     "window_seconds": engine.window_seconds,
                     "max_samples": engine.max_samples,
                     "min_samples": engine.min_samples,
-                    "score_exponent": engine.score_exponent,
                     "scores": [float(score) for score in engine.scores],
                     "histories": {
                         str(uid): list(history)
@@ -553,7 +544,7 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
         policy.score_window_max_samples,
         policy.score_window_min_samples,
         decay=policy.decay_nonresponders,
-        score_exponent=policy.score_exponent,
+        rank_decay=policy.rank_decay,
     )
     _load_scores(engine, settings.validator_score_state_file)
     state_dir = Path(settings.validator_score_state_file).absolute().parent

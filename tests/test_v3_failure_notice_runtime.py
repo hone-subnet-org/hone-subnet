@@ -153,6 +153,8 @@ def run_callback(tmp_path, monkeypatch):
         original_save = decentralized._save_scores
 
         def save(engine, filename):
+            # The live validator pays by rank.
+            assert engine.rank_decay == RELEASE_POLICY.rank_decay
             saved = original_save(engine, filename) if persistence else False
             assert saved is persistence
             events.append("saved" if saved else "unsaved")
@@ -206,9 +208,7 @@ async def test_notices_follow_score_persistence_and_diagnostic_attempt(
     assert events == ["saved", "diagnostics", "notice"]
     assert sends[0]["include_details"] is True
     assert scores == {0: 0.0, 1: ONE_PASS, 2: 0.0}
-    state = json.loads(path.read_text())
-    assert state["scores"] == list(scores.values())
-    assert state["score_exponent"] == RELEASE_POLICY.score_exponent
+    assert json.loads(path.read_text())["scores"] == list(scores.values())
 
 
 @pytest.mark.parametrize("persistence,notices", [(False, True), (True, False)])

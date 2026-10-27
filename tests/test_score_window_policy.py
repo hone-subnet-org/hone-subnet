@@ -35,12 +35,11 @@ DEFAULTS = Settings(_env_file=None)
 TARGET_SAMPLES = 100
 STARTUP_SAMPLES = 20
 WEIGHT_GATE = 4
-EXPONENT = 1.5
 
 
 def _score(mean: float, observations: int) -> float:
     """The release score for a miner with this mean over this many observations."""
-    return mean**EXPONENT * min(observations / STARTUP_SAMPLES, 1.0)
+    return mean * min(observations / STARTUP_SAMPLES, 1.0)
 
 
 def _advancing_clock(start: float = 0.0, step: float = 1.0):
@@ -63,7 +62,7 @@ def _engine(num_uids: int = 1, clock=None, max_samples: int = TARGET_SAMPLES):
         max_samples,
         RELEASE_POLICY.score_window_min_samples,
         decay=RELEASE_POLICY.decay_nonresponders,
-        score_exponent=RELEASE_POLICY.score_exponent,
+        rank_decay=RELEASE_POLICY.rank_decay,
         **extra,
     )
 
@@ -233,8 +232,8 @@ def test_default_ramp_is_twenty_and_weight_gate_stays_at_four():
     assert RELEASE_POLICY.min_weight_observations == WEIGHT_GATE
 
 
-def test_default_score_exponent_is_one_and_a_half():
-    assert RELEASE_POLICY.score_exponent == EXPONENT
+def test_default_rank_decay_is_nine_tenths():
+    assert RELEASE_POLICY.rank_decay == 0.9
 
 
 def test_default_engine_accumulates_a_full_window_of_observations():

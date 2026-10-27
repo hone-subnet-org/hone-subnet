@@ -290,11 +290,13 @@ reported in diagnostics but does not change the contribution: the release
 speed floor is 1, which switches the speed factor off. Failed or rejected
 evaluations contribute zero. Abandoned rounds add no observations.
 
-A miner's score is its mean contribution over the window raised to the power
-1.5, so a consistently better miner earns proportionally more than a worse
-one. A new miner's score ramps linearly to full over its first 20
-observations: after 10 it earns half of what the same results would earn once
-mature.
+Weights follow rank, not the size of the score gap. Miners with a score above
+zero are ranked best first, ties going to the lower UID. The best gets weight
+1, the next 0.9, the next 0.81, and so on, normalized to sum to 1. A miner's
+score is its mean contribution over the window, except that a new miner's
+score ramps linearly to full over its first 20 observations: after 10 it is
+half what the same results would score once mature, which usually ranks it
+lower.
 
 The score window retains up to 100 recorded observations. This is not
 necessarily 100 wall-clock rounds:

@@ -2,12 +2,12 @@
 
 Design choices:
   - Each uid retains its latest ``max_samples`` completed-problem payments.
-  - A score is the mean payment raised to ``score_exponent``, then scaled by
-    ``min(observations / min_samples, 1)``. The exponent widens the gap
-    between better and worse miners; among miners past the ramp it never
-    changes their order. The ramp stops a few lucky first answers from
-    earning a full score, and stays linear because the exponent is applied
-    before it, not after.
+  - Scores divide by at least ``min_samples``, preventing one lucky first answer
+    from immediately receiving a full score while allowing a fuller window to
+    reduce the impact of one transient miss.
+  - With ``rank_decay`` set, weights follow rank, not score: the best miner gets
+    1, the next ``rank_decay``, then ``rank_decay ** 2``, and so on, before
+    normalization. Without it, weights are proportional to score.
   - Only completed challenges advance histories. Non-serving miners receive one
     zero per completed challenge, never for server pacing or empty rounds.
     Set ``decay=False`` to freeze histories on silence.
@@ -29,18 +29,13 @@ from typing import Callable, Iterable
 import numpy as np
 
 
-def history_score(
-    rewards: Iterable[float], min_samples: int, exponent: float
-) -> float:
-    """Mean payment to the power ``exponent``, ramped linearly up to ``min_samples``."""
-    values = list(rewards)
-    if not values:
-        return 0.0
-    quality = max(sum(values) / len(values), 0.0)
-    ramp = min(len(values) / min_samples, 1.0)
-    # numpy overflows to inf instead of raising; get_weights maps inf to 0.
-    with np.errstate(over="ignore"):
-        return float(np.power(quality, exponent) * ramp)
+def rank_weights(scores: np.ndarray, decay: float) -> np.ndarray:
+    """``decay ** rank`` for each positive score, best first; ties go to the lower uid."""
+    weights = np.zeros_like(scores)
+    positive = np.flatnonzero(scores > 0.0)
+    best_first = positive[np.lexsort((positive, -scores[positive]))]
+    weights[best_first] = decay ** np.arange(best_first.size)
+    return weights
 
 
 class EvalEngine:
@@ -55,7 +50,7 @@ class EvalEngine:
         decay: bool = True,
         clock: Callable[[], float] = time.time,
         *,
-        score_exponent: float = 1.0,
+        rank_decay: float | None = None,
     ):
         if num_uids < 0:
             raise ValueError("num_uids must be non-negative")
@@ -73,17 +68,15 @@ class EvalEngine:
             or not 1 <= int(min_samples) <= int(max_samples)
         ):
             raise ValueError("min_samples must be between 1 and max_samples")
-        if (
-            isinstance(score_exponent, bool)
-            or not np.isfinite(score_exponent)
-            or float(score_exponent) <= 0.0
+        if rank_decay is not None and (
+            isinstance(rank_decay, bool) or not 0.0 < float(rank_decay) <= 1.0
         ):
-            raise ValueError("score_exponent must be finite and positive")
+            raise ValueError("rank_decay must be in (0, 1]")
         self.window_seconds = float(window_seconds)
         self.max_samples = int(max_samples)
         self.min_samples = int(min_samples)
         self.decay = bool(decay)
-        self.score_exponent = float(score_exponent)
+        self.rank_decay = None if rank_decay is None else float(rank_decay)
         self._clock = clock
         self.scores: np.ndarray = np.zeros(int(num_uids), dtype=np.float64)
         # Sparse so "never observed" remains distinct from "observed zero".
@@ -110,8 +103,12 @@ class EvalEngine:
 
     def _refresh_score(self, uid: int) -> None:
         history = self.histories.get(uid, [])
-        self.scores[uid] = history_score(
-            (reward for _, reward in history), self.min_samples, self.score_exponent
+        # Full-pool peers normally have equal history lengths, so this common
+        # startup divisor does not change their weights. It only suppresses
+        # genuinely thinner evidence, such as a newly registered uid.
+        denominator = max(len(history), self.min_samples)
+        self.scores[uid] = (
+            sum(reward for _, reward in history) / denominator if history else 0.0
         )
 
     def _record(self, uid: int, reward: float, observed_at: float) -> None:
@@ -271,7 +268,7 @@ class EvalEngine:
             self._record(uid, 0.0, timestamp)
 
     def get_weights(self, n: int | None = None) -> "np.ndarray":
-        """L1-normalized weights from the current scores; nan-safe.
+        """L1-normalized weights from the current scores (or their ranks); nan-safe.
 
         nan/inf scores -> 0; negative scores -> 0 (weights are a distribution).
         An all-zero (or empty) score vector yields an all-zero weight vector.
@@ -297,6 +294,8 @@ class EvalEngine:
                 scores = aligned
         # weights represent a non-negative allocation; clamp negatives.
         scores = np.clip(scores, 0.0, None)
+        if self.rank_decay is not None:
+            scores = rank_weights(scores, self.rank_decay)
         total = scores.sum()
         if total <= 0.0 or not np.isfinite(total):
             return np.zeros_like(scores)
