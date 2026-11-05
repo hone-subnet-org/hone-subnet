@@ -25,10 +25,10 @@ class ValidatorPolicy:
     payment_speed_floor: float = 1.0
     owner_burn_share: float = 0.0
     score_window_max_samples: int = 100
-    # A miner's score ramps linearly to full over its first 20 observations.
-    # At measured validator cadences that takes 16 to 33 hours, inside the
-    # 36-hour immunity period.
-    score_window_min_samples: int = 20
+    # A miner's score ramps linearly to full over its first 12 observations.
+    # Kept short so that miners who get problems slowly or unluckily still
+    # finish ramping before the 36-hour immunity period ends.
+    score_window_min_samples: int = 12
     # Weights follow rank: each miner gets this fraction of the weight of the
     # miner ranked just above it. Ties go to the lower UID.
     rank_decay: float = 0.995
