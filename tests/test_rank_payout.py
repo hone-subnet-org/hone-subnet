@@ -5,7 +5,7 @@
     size of the score gaps;
   * ties go to the lower UID;
   * zero, negative, NaN and infinite scores get no weight and take no rank;
-  * the 20-observation ramp still applies to the score used for ranking;
+  * the 12-observation ramp still applies to the score used for ranking;
   * saved histories restore without being cleared.
 """
 
@@ -111,11 +111,11 @@ def test_without_rank_decay_weights_stay_proportional():
 def test_a_ramping_newcomer_ranks_below_a_steady_miner():
     engine = _engine(num_uids=2)
     _observe(engine, 0, 60, 100)  # mature, 60%
-    _observe(engine, 1, 10, 10)  # perfect but only 10 observations: score 0.5
+    _observe(engine, 1, 6, 6)  # perfect but only 6 observations: score 0.5
 
     assert engine.get_weights() == pytest.approx(_normalized([1.0, DECAY]))
 
-    _observe(engine, 1, 10, 10)  # 20 observations: ramp complete
+    _observe(engine, 1, 6, 6)  # 12 observations: ramp complete
 
     assert engine.get_weights() == pytest.approx(_normalized([DECAY, 1.0]))
 
@@ -200,7 +200,7 @@ def test_previous_release_histories_restore_intact(tmp_path, capsys):
     assert "recomputed from histories" not in out
     for uid, values in histories.items():
         assert engine.histories[int(uid)] == [tuple(item) for item in values]
-    assert engine.scores == pytest.approx([0.9, 10 / 20])  # newcomer re-ramped
+    assert engine.scores == pytest.approx([0.9, 10 / 12])  # newcomer re-ramped
     assert engine.get_weights() == pytest.approx(_normalized([1.0, DECAY]))
 
 

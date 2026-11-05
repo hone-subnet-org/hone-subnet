@@ -3,12 +3,12 @@
   * a uid's score averages the latest 100 COMPLETED problems observed since its
     current registration -- a pure count window, no age component;
   * with fewer than 100 observations the mean is over the observed count, not
-    the cap, and a new miner's score ramps linearly over its first 20;
+    the cap, and a new miner's score ramps linearly over its first 12;
   * the previous 16-hour expiry must no longer affect scores: an observation
     leaves a history only when a 101st observation pushes it out;
   * a hotkey change at a uid still clears the whole history (a new registration
     starts empty);
-  * defaults are cap=100, a 20-observation ramp, and a weight gate of 4;
+  * defaults are cap=100, a 12-observation ramp, and a weight gate of 4;
   * an existing persisted six-entry state loads intact -- no reset, no data
     loss -- and then keeps growing up to the cap.
 
@@ -33,7 +33,7 @@ from rlvr.policy import LEGACY_SCORE_WINDOW_SECONDS, RELEASE_POLICY
 
 DEFAULTS = Settings(_env_file=None)
 TARGET_SAMPLES = 100
-STARTUP_SAMPLES = 20
+STARTUP_SAMPLES = 12
 WEIGHT_GATE = 4
 
 
@@ -177,8 +177,8 @@ def test_partial_history_averages_over_the_observed_count():
     assert engine.scores[0] == pytest.approx(_score(0.8, 30))
 
 
-@pytest.mark.parametrize("observations", [1, 2, 10, 19, 20, 21, 50])
-def test_new_miner_score_ramps_linearly_and_is_full_from_twenty(observations):
+@pytest.mark.parametrize("observations", [1, 2, 6, 11, 12, 13, 50])
+def test_new_miner_score_ramps_linearly_and_is_full_from_twelve(observations):
     engine = _engine(clock=_advancing_clock())
     _observe(engine, observations, reward=1.0)
 
@@ -238,7 +238,7 @@ def test_default_score_window_cap_is_one_hundred():
     assert RELEASE_POLICY.score_window_max_samples == TARGET_SAMPLES
 
 
-def test_default_ramp_is_twenty_and_weight_gate_stays_at_four():
+def test_default_ramp_is_twelve_and_weight_gate_stays_at_four():
     assert RELEASE_POLICY.score_window_min_samples == STARTUP_SAMPLES
     assert RELEASE_POLICY.min_weight_observations == WEIGHT_GATE
 
