@@ -24,6 +24,7 @@ from .api import (
     LeaseResponse,
     LedgerPage,
     MinerCandidate,
+    parse_ledger_page,
     serialize_commit_request,
     serialize_feedback_request,
 )
@@ -33,6 +34,7 @@ from .api import (
 class LedgerFetch:
     status: int | None
     page: LedgerPage | None
+    skipped: int = 0  # rounds on the page this release could not read
 
 
 @dataclass(frozen=True)
@@ -115,7 +117,8 @@ class V3ProblemServerClient:
 
     async def fetch_rounds(self, *, since: str | None) -> LedgerFetch:
         """One page of the shared ledger. status None when nothing answered;
-        page None unless the answer was a valid 200."""
+        page None unless the answer was a readable 200. A round that cannot be
+        read is skipped and counted; the rest of the page and its cursor stand."""
         query = f"?limit={LEDGER_PAGE_LIMIT}" + (f"&since={quote(since, safe='')}" if since else "")
         response = await self._transport.get(f"/v3/rounds{query}")
         if response is None:
@@ -123,10 +126,13 @@ class V3ProblemServerClient:
         if response.status_code != 200:
             return LedgerFetch(response.status_code, None)
         try:
-            return LedgerFetch(200, LedgerPage.model_validate_json(response.content))
-        except Exception as error:  # noqa: BLE001 - a malformed page is dropped whole
+            page, skipped = parse_ledger_page(response.content)
+        except Exception as error:  # noqa: BLE001 - a page with no readable envelope is dropped whole
             print(f"[validator] WARN: invalid ledger page: {bounded_detail(str(error))}")
             return LedgerFetch(200, None)
+        if skipped:
+            print(f"[validator] WARN: ledger page: {skipped} round(s) skipped as unreadable")
+        return LedgerFetch(200, page, skipped)
 
     async def signed_round_status(self, body: bytes) -> int | None:
         """POST one signed round exactly as given; the HTTP status, or None

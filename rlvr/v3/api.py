@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Annotated, Literal
+from collections.abc import Iterable
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -449,6 +450,40 @@ class LedgerPage(WireModel):
     protocol_version: ProtocolVersion
     rounds: Annotated[list[LedgerRound], Field(max_length=LEDGER_PAGE_LIMIT)]
     next_cursor: Annotated[str, Field(min_length=1, max_length=512)] | None = None
+
+
+def _known(item: Any, fields: Iterable[str]) -> Any:
+    return {key: item[key] for key in fields if key in item} if type(item) is dict else item
+
+
+def parse_ledger_page(content: bytes) -> tuple[LedgerPage, int]:
+    """Read a ledger page round by round. Returns the page holding the rounds
+    that are valid, and how many were skipped.
+
+    Reading is lenient where sending is strict, so the server and validators
+    can update at different times: a field this release does not know is
+    ignored, and a round it cannot read is skipped without losing the rest of
+    the page or the cursor. Ignoring a field is safe because every round is
+    verified against a signature over the fields kept here. Raises when the
+    page itself is unreadable: not JSON, no list of rounds, another protocol
+    version or a bad cursor.
+    """
+    raw = json.loads(content)
+    if type(raw) is not dict or type(raw.get("rounds")) is not list:
+        raise ValueError("ledger page has no list of rounds")
+    rounds: list[LedgerRound] = []
+    for item in raw["rounds"][:LEDGER_PAGE_LIMIT]:
+        item = _known(item, LedgerRound.model_fields)
+        if type(item) is dict and type(item.get("verdicts")) is list:
+            item["verdicts"] = [_known(verdict, RoundVerdict.model_fields) for verdict in item["verdicts"]]
+        try:
+            rounds.append(LedgerRound.model_validate(item))
+        except Exception:  # noqa: BLE001 - one unreadable round costs only itself
+            continue
+    page = LedgerPage(
+        protocol_version=raw.get("protocol_version"), rounds=rounds, next_cursor=raw.get("next_cursor")
+    )
+    return page, len(raw["rounds"]) - len(rounds)
 
 
 def serialize_signed_round(report: SignedRound) -> bytes:

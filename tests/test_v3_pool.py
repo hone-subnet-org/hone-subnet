@@ -237,6 +237,51 @@ def test_fetch_rounds_is_a_signed_get_and_reports_status(tmp_path):
     assert "since=after%201" in seen[1][1]
 
 
+def fetch_one(content):
+    async def go():
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, content=content))
+        async with httpx.AsyncClient(transport=transport) as http:
+            return await V3ProblemServerClient("https://problems.invalid", "validator", http, retries=1).fetch_rounds(since=None)
+
+    return asyncio.run(go())
+
+
+def test_an_unreadable_round_costs_only_itself_and_the_cursor_moves_on(capsys):
+    good = [signed("val-a", seq, [verdict(1, True, 10)]) for seq in (1, 2)]
+    body = json.loads(page(*good, cursor="c7").model_dump_json())
+    too_slow = json.loads(good[0].model_dump_json()) | {"round_seq": 3}
+    too_slow["verdicts"][0]["response_latency_ms"] = 10**12  # above what this release accepts
+    body["rounds"][1:1] = [too_slow, {"round_seq": "four"}, "not a round"]
+    fetched = fetch_one(json.dumps(body).encode())
+    assert [item.round_seq for item in fetched.page.rounds] == [1, 2]
+    assert fetched.page.next_cursor == "c7" and fetched.skipped == 3
+    assert "3 round(s) skipped as unreadable" in capsys.readouterr().out
+    # the page that used to stall the pull is taken, and the pool moves past it
+    p = pool()
+    assert p.ingest(fetched.page, admitted=EVERYONE, hotkeys=HOTKEYS, now=NOW) == (2, 0)
+    assert p.cursor == "c7"
+
+
+def test_fields_a_newer_server_adds_are_ignored_and_the_signature_still_verifies():
+    body = json.loads(page(signed("val-a", 1, [verdict(1, True, 10)])).model_dump_json())
+    body["served_by"] = "a newer server"
+    body["rounds"][0]["region"] = "eu"
+    body["rounds"][0]["verdicts"][0]["note"] = "new"
+    fetched = fetch_one(json.dumps(body).encode())
+    assert fetched.skipped == 0 and len(fetched.page.rounds) == 1
+    assert pool().ingest(fetched.page, admitted=EVERYONE, hotkeys=HOTKEYS, now=NOW) == (1, 0)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"rounds": "none"}, {"protocol_version": 4}, {"next_cursor": 7}, {"next_cursor": "c" * 513}],
+)
+def test_a_page_with_an_unreadable_envelope_is_still_dropped_whole(change):
+    body = json.loads(page(signed("val-a", 1, [verdict(1, True, 10)])).model_dump_json()) | change
+    fetched = fetch_one(json.dumps(body).encode())
+    assert (fetched.status, fetched.page) == (200, None)
+
+
 def test_sync_pool_is_bounded_a_404_is_a_no_op_and_state_is_saved(tmp_path, capsys):
     calls = []
 
