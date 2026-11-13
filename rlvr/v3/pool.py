@@ -37,8 +37,8 @@ FUTURE_SLACK_S = 600  # a round recorded further ahead of our clock than this is
 # again, however fresh its recorded_at says it is.
 SEQ_SLACK = 100
 Entry = tuple[float, float, int]  # recorded_at, payment, round_seq
-# When one validator's pass rate for a miner is this far from what everyone
-# else saw for the same miner, it is reported in the log. Nothing is scored
+# When one validator's pass rate for a miner is this far from what the other
+# pooled validators saw for the same miner, it is reported in the log. Nothing is scored
 # differently: this is for an operator to look at. Both sides need enough
 # rounds, the rates must differ by a gap that matters, and the difference
 # must be far beyond chance (a two-proportion z-test), since every validator
@@ -56,7 +56,7 @@ class Disagreement(NamedTuple):
     uid: int
     rate: float  # the validator's pass rate for this miner
     rounds: int
-    others_rate: float  # everyone else's, this validator's own rounds included
+    others_rate: float  # the other pooled validators' together
     others_rounds: int
     z: float  # positive when the validator is the more generous
 
@@ -269,25 +269,21 @@ class LedgerPool:
         self.settle(hotkeys, now, admitted=admitted)
         return max((len(self._window(uid, hotkey, local, now)) for uid, hotkey in enumerate(hotkeys)), default=0)
 
-    def disagreements(
-        self, hotkeys: Sequence[str], local: Mapping[int, Sequence[tuple[float, float]]], *, now: float
-    ) -> list[Disagreement]:
-        """Validators whose pass rate for a miner is far from everyone
-        else's for that miner, the strongest first. Everyone else is the other
-        pooled validators plus this validator's own rounds in the window."""
+    def disagreements(self, hotkeys: Sequence[str]) -> list[Disagreement]:
+        """Validators whose pass rate for a miner is far from the other pooled
+        validators' for that miner, the strongest first. Only signed rounds
+        are compared. This validator's own history is left out: it also holds
+        the zeros recorded while a miner is not serving, which are not
+        verdicts and would make an honest peer look generous."""
         found: list[Disagreement] = []
-        cutoff = now - self.window_s
         for uid, hotkey in enumerate(hotkeys):
             passes: dict[str, tuple[int, int]] = {}  # validator -> (passed, rounds)
             for validator, per_miner in self.entries.items():
                 bucket = per_miner.get((uid, hotkey))
                 if bucket:
                     passes[validator] = (sum(payment > 0 for _, payment, _ in bucket), len(bucket))
-            if not passes:
-                continue
-            own = [payment > 0 for observed_at, payment in local.get(uid, ()) if observed_at > cutoff][-self.cap :]
-            all_passed = sum(passed for passed, _ in passes.values()) + sum(own)
-            all_rounds = sum(rounds for _, rounds in passes.values()) + len(own)
+            all_passed = sum(passed for passed, _ in passes.values())
+            all_rounds = sum(rounds for _, rounds in passes.values())
             for validator, (passed, rounds) in passes.items():
                 others_rounds = all_rounds - rounds
                 if rounds < DISAGREEMENT_MIN_ROUNDS or others_rounds < DISAGREEMENT_MIN_ROUNDS:

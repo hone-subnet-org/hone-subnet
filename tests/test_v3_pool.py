@@ -274,9 +274,10 @@ def test_fields_a_newer_server_adds_are_ignored_and_the_signature_still_verifies
 
 @pytest.mark.parametrize(
     "change",
-    [{"rounds": "none"}, {"protocol_version": 4}, {"next_cursor": 7}, {"next_cursor": "c" * 513}],
+    [{"rounds": "none"}, {"rounds": ["x"] * 201}, {"protocol_version": 4}, {"next_cursor": 7}, {"next_cursor": "c" * 513}],
 )
 def test_a_page_with_an_unreadable_envelope_is_still_dropped_whole(change):
+    # more rounds than asked for counts: truncating would move the cursor past rounds never read
     body = json.loads(page(signed("val-a", 1, [verdict(1, True, 10)])).model_dump_json()) | change
     fetched = fetch_one(json.dumps(body).encode())
     assert (fetched.status, fetched.page) == (200, None)
@@ -465,7 +466,7 @@ def test_a_validator_far_from_everyone_else_on_a_miner_is_named():
     for validator in ("val-a", "val-b", "val-c"):
         graded(p, validator, 2, 30, 40, first_seq=41)
     before = p.scores(HOTKEYS, {}, min_samples=4, now=NOW)
-    found = p.disagreements(HOTKEYS, {}, now=NOW)
+    found = p.disagreements(HOTKEYS)
     assert [(item.validator, item.uid) for item in found] == [("val-x", 2), ("val-x", 1)]
     generous = found[1]
     assert (generous.rate, generous.rounds, generous.others_rounds) == (1.0, 40, 120)
@@ -480,19 +481,10 @@ def test_ordinary_variation_and_thin_evidence_are_not_reported():
     graded(p, "val-a", 2, 19, 19, first_seq=41)  # all passes, but under twenty rounds
     graded(p, "val-b", 2, 0, 40, first_seq=41)
     graded(p, "val-a", 3, 40, 40, first_seq=60)  # nobody else to compare with
-    assert p.disagreements(HOTKEYS, {}, now=NOW) == []
+    assert p.disagreements(HOTKEYS) == []
 
 
-def test_this_validators_own_rounds_count_as_someone_else():
-    p = pool(cap_per_validator=50)
-    graded(p, "val-x", 1, 40, 40)
-    local = {1: [(NOW - n, 1.0 if n < 8 else 0.0) for n in range(40)]}  # we saw 20%
-    stale = {1: [(NOW - 5 * DAY, 0.0)] * 40}  # outside the window: not evidence
-    assert [(item.validator, item.others_rounds) for item in p.disagreements(HOTKEYS, local, now=NOW)] == [("val-x", 40)]
-    assert p.disagreements(HOTKEYS, stale, now=NOW) == []
-
-
-def test_the_pull_names_disagreeing_validators_in_the_log(tmp_path, capsys):
+def test_two_validators_far_apart_are_both_named_and_the_pull_logs_them(tmp_path, capsys):
     class Client:
         def __init__(self, pages):
             self.pages = list(pages)
@@ -500,16 +492,37 @@ def test_the_pull_names_disagreeing_validators_in_the_log(tmp_path, capsys):
         async def fetch_rounds(self, *, since):
             return self.pages.pop(0)
 
-    hotkeys = ["val-x", "hk-1", "me"]
-    metagraph = SimpleNamespace(hotkeys=hotkeys, validator_permit=[True, False, True], validator_trust=[0.3, 0.0, 0.3], S=[50.0, 1.0, 50.0])
+    hotkeys = ["val-x", "hk-1", "val-a", "me"]
+    metagraph = SimpleNamespace(hotkeys=hotkeys, validator_permit=[True, False, True, True], validator_trust=[0.3, 0.0, 0.3, 0.3], S=[50.0, 1.0, 50.0, 50.0])
     rounds = [signed("val-x", seq, [verdict(1, True, 10)]) for seq in range(1, 41)]
-    local = {1: [(NOW - n, 0.0) for n in range(40)]}
+    rounds += [signed("val-a", seq, [verdict(1, False)]) for seq in range(1, 41)]
     p = pool(cap_per_validator=50)
     client = Client([SimpleNamespace(status=200, page=page(*rounds, cursor=None))])
-    asyncio.run(decentralized._sync_pool(p, client, metagraph, RELEASE_POLICY, tmp_path / "pool.json", now=NOW, local=local))
+    asyncio.run(decentralized._sync_pool(p, client, metagraph, RELEASE_POLICY, tmp_path / "pool.json", now=NOW))
     out = capsys.readouterr().out
-    assert "1 validator/miner pair(s) far from everyone else's verdicts" in out
-    assert "validator val-x passes uid 1 100% of 40 round(s); everyone else 0% of 40 (z=+8.9)" in out
+    # with only two there is no telling which one is off: both are named
+    assert "2 validator/miner pair(s) far from the other validators' verdicts" in out
+    assert "validator val-x passes uid 1 100% of 40 round(s); the others 0% of 40 (z=+8.9)" in out
+    assert "validator val-a passes uid 1 0% of 40 round(s); the others 100% of 40 (z=-8.9)" in out
+
+
+def test_a_pull_keeps_paging_past_a_page_with_nothing_readable(tmp_path):
+    class Client:
+        def __init__(self, pages):
+            self.pages, self.calls = list(pages), 0
+
+        async def fetch_rounds(self, *, since):
+            self.calls += 1
+            return self.pages.pop(0)
+
+    metagraph = SimpleNamespace(hotkeys=["val-a", "hk-1", "me"], validator_permit=[True, False, True], validator_trust=[0.3, 0.0, 0.3], S=[50.0, 1.0, 50.0])
+    p = pool()
+    client = Client([
+        SimpleNamespace(status=200, page=page(cursor="c1")),  # every round on it was skipped as unreadable
+        SimpleNamespace(status=200, page=page(signed("val-a", 1, [verdict(1, True, 10)]), cursor=None)),
+    ])
+    asyncio.run(decentralized._sync_pool(p, client, metagraph, RELEASE_POLICY, tmp_path / "pool.json", now=NOW))
+    assert client.calls == 2 and p.pooled_observations(1, "hk-1") == [1.0]
 
 
 def test_only_miners_registered_as_named_get_a_bucket():

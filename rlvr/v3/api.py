@@ -465,14 +465,16 @@ def parse_ledger_page(content: bytes) -> tuple[LedgerPage, int]:
     ignored, and a round it cannot read is skipped without losing the rest of
     the page or the cursor. Ignoring a field is safe because every round is
     verified against a signature over the fields kept here. Raises when the
-    page itself is unreadable: not JSON, no list of rounds, another protocol
-    version or a bad cursor.
+    page itself is unreadable: not JSON, no list of rounds, more rounds than
+    were asked for, another protocol version or a bad cursor.
     """
     raw = json.loads(content)
     if type(raw) is not dict or type(raw.get("rounds")) is not list:
         raise ValueError("ledger page has no list of rounds")
+    if len(raw["rounds"]) > LEDGER_PAGE_LIMIT:
+        raise ValueError("ledger page holds more rounds than were asked for")
     rounds: list[LedgerRound] = []
-    for item in raw["rounds"][:LEDGER_PAGE_LIMIT]:
+    for item in raw["rounds"]:
         item = _known(item, LedgerRound.model_fields)
         if type(item) is dict and type(item.get("verdicts")) is list:
             item["verdicts"] = [_known(verdict, RoundVerdict.model_fields) for verdict in item["verdicts"]]

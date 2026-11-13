@@ -8,7 +8,7 @@ import os
 import shutil
 import socket
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Optional
 
@@ -291,13 +291,12 @@ async def _sync_pool(
     path: Path,
     *,
     now: float | None = None,
-    local: Mapping[int, Sequence[tuple[float, float]]] | None = None,
 ) -> None:
     """Pull what the ledger has since our cursor, a bounded number of pages,
     admit by signature, permit, trust and stake, and keep the state on disk.
     A 404 means the server does not serve the ledger yet: nothing changes.
-    After a pull, validators whose verdicts on a miner are far from everyone
-    else's are named in the log; ``local`` is this validator's own history."""
+    After a pull, validators whose verdicts on a miner are far from the other
+    pooled validators' are named in the log."""
     current = time.time() if now is None else now
     admit = _ledger_admission(metagraph, policy)
     taken = dropped = pages = 0
@@ -324,10 +323,11 @@ async def _sync_pool(
         taken += got
         dropped += lost
         page = fetched.page
-        # Stop when the server has nothing more, or is not moving us forward:
-        # no rounds, no cursor, or the same cursor back. A page of rounds we
-        # did not take, expired or already held, still moves the cursor on.
-        if not page.rounds or not page.next_cursor or page.next_cursor == before:
+        # Stop when the server is not moving us forward: no cursor, or the
+        # same cursor back. A page with nothing we took, whether expired,
+        # already held or unreadable, still moves the cursor on, and the
+        # page count and time budget bound how far one pull goes.
+        if not page.next_cursor or page.next_cursor == before:
             break
     pool.settle(list(metagraph.hotkeys), current, admitted=admit)
     if pool.seen:
@@ -341,25 +341,25 @@ async def _sync_pool(
             f"[validator] ledger: {taken} round(s) admitted, {dropped} dropped, "
             f"pooling {len(pool.entries)} validator(s)"
         )
-        _log_disagreements(pool.disagreements(list(metagraph.hotkeys), local or {}, now=current))
+        _log_disagreements(pool.disagreements(list(metagraph.hotkeys)))
 
 
 DISAGREEMENTS_LOGGED = 5  # the strongest few; the count says how many there were
 
 
 def _log_disagreements(found: Sequence[Disagreement]) -> None:
-    """Name validators whose verdicts on a miner are far from everyone else's.
+    """Name validators whose verdicts on a miner are far from the others'.
     Scores are not changed; this is for an operator to look into."""
     if not found:
         return
     print(
-        f"[validator] WARN: ledger: {len(found)} validator/miner pair(s) far from everyone else's verdicts"
+        f"[validator] WARN: ledger: {len(found)} validator/miner pair(s) far from the other validators' verdicts"
         + (f"; the strongest {DISAGREEMENTS_LOGGED}:" if len(found) > DISAGREEMENTS_LOGGED else ":")
     )
     for item in found[:DISAGREEMENTS_LOGGED]:
         print(
             f"[validator] WARN: ledger: validator {item.validator} passes uid {item.uid} "
-            f"{item.rate:.0%} of {item.rounds} round(s); everyone else {item.others_rate:.0%} "
+            f"{item.rate:.0%} of {item.rounds} round(s); the others {item.others_rate:.0%} "
             f"of {item.others_rounds} (z={item.z:+.1f})"
         )
 
@@ -804,7 +804,7 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
                 # Pull the ledger once per completed round; an incomplete round
                 # makes no further requests, as before.
                 try:
-                    await _sync_pool(pool, client, v.metagraph, policy, pool_path, local=engine.histories)
+                    await _sync_pool(pool, client, v.metagraph, policy, pool_path)
                 except Exception as error:  # noqa: BLE001 - pooling never interrupts validation
                     print(f"[validator] WARN: ledger sync failed: {type(error).__name__}")
             if saved and settings.validator_trace_check_url:
