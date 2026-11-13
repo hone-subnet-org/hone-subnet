@@ -285,15 +285,25 @@ task, miner and trajectory role, and match the size and hash of what it fetched.
 
 ## Scoring interpretation
 
-An eligible passing miner gets a contribution between the release speed floor
-and 1, relative to the fastest positive response time among eligible passers.
-The current floor is 0.95 and the speed half-life is 180 seconds. Failed or
-rejected evaluations contribute zero. Abandoned rounds add no observations.
+An eligible passing miner contributes 1. Response latency is measured and
+reported in diagnostics but does not change the contribution: the release
+speed floor is 1, which switches the speed factor off. Failed or rejected
+evaluations contribute zero. Abandoned rounds add no observations.
 
-The local score window retains up to 200 recorded observations, with a startup
-denominator of at least four; the pooled window adds other validators' signed
-rounds from the shared ledger, at most 50 per validator per miner inside four
-days, each round counting equally. This is not necessarily 200 wall-clock rounds:
+Weights follow rank, not the size of the score gap. Miners with a score above
+zero are ranked best first, ties going to the lower UID. The best gets weight
+1 and each next miner 0.995 times the weight of the one above it, normalized
+to sum to 1. A miner's
+score is its mean contribution over the window, except that a new miner's
+score ramps linearly to full over its first 12 observations: after 6 it is
+half what the same results would score once mature, which usually ranks it
+lower.
+
+The local score window retains up to 100 recorded observations. The pooled
+window adds other validators' signed rounds from the shared ledger, at most 50
+per validator per miner inside four days, each round counting equally; pooled
+observations count toward the 12-observation ramp, and the ranking is taken
+over the pooled scores. The local window is not necessarily 100 wall-clock rounds:
 serving miners not sampled for a task do not receive an observation, while
 previously observed nonserving miners receive zero on completed rounds when
 nonresponder decay is enabled. A hotkey change resets the old registration's

@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from rlvr.config import get_settings
-from rlvr.policy import ValidatorPolicy
+from rlvr.policy import RELEASE_POLICY, ValidatorPolicy
 from rlvr.scoring.difficulty import (
     classify_band,
     pass_rate,
@@ -595,6 +595,22 @@ def test_default_payment_speed_is_a_light_tiebreaker():
     pay = compute_payments(outs)
     assert pay[0] == pytest.approx(1.0)
     assert pay[1] == pytest.approx(0.975)
+
+
+def test_release_policy_pays_every_pass_in_full_whatever_its_latency():
+    release = {
+        "speed_half_life_ms": RELEASE_POLICY.payment_speed_half_life_ms,
+        "speed_floor": RELEASE_POLICY.payment_speed_floor,
+    }
+    mixed = [
+        _outcome(0, True, code="def f(x):\n    return x\n", latency_ms=100.0),
+        _outcome(1, True, code="def f(x):\n    return x + 0\n", latency_ms=10**9),
+        _outcome(2, True, code="def f(x):\n    return 0 + x\n", latency_ms=0.0),  # no usable latency
+        _outcome(3, False, code="def f(x):\n    return 1\n", latency_ms=1.0),
+    ]
+    assert compute_payments(mixed, **release) == {0: 1.0, 1: 1.0, 2: 1.0, 3: 0.0}
+    unusable = [_outcome(0, True, code="def f(x):\n    return x\n", latency_ms=float("nan"))]
+    assert compute_payments(unusable, **release) == {0: 1.0}
 
 
 def test_payment_speed_is_correctness_gated_and_respects_floor():

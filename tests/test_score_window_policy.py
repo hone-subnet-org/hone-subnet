@@ -1,16 +1,16 @@
-"""Contract tests for the count-only 200-problem scoring window.
+"""Contract tests for the count-only 100-problem scoring window.
 
-  * a uid's score averages the latest 200 COMPLETED problems observed since its
+  * a uid's score averages the latest 100 COMPLETED problems observed since its
     current registration -- a pure count window, no age component;
-  * with fewer than 200 observations the denominator is the observed count, not
-    the cap, floored at the four-problem startup gate;
+  * with fewer than 100 observations the mean is over the observed count, not
+    the cap, and a new miner's score ramps linearly over its first 12;
   * the previous 16-hour expiry must no longer affect scores: an observation
-    leaves a history only when a 201st observation pushes it out;
+    leaves a history only when a 101st observation pushes it out;
   * a hotkey change at a uid still clears the whole history (a new registration
     starts empty);
-  * defaults become cap=200 with the startup gate unchanged at 4;
+  * defaults are cap=100, a 12-observation ramp, and a weight gate of 4;
   * an existing persisted six-entry state loads intact -- no reset, no data
-    loss -- and then keeps growing under the larger cap.
+    loss -- and then keeps growing up to the cap.
 
 `window_seconds` remains accepted by the constructor and written to the v2
 state file for rollback compatibility, but it no longer prunes observations.
@@ -32,8 +32,14 @@ from rlvr.scoring.eval_engine import EvalEngine
 from rlvr.policy import LEGACY_SCORE_WINDOW_SECONDS, RELEASE_POLICY
 
 DEFAULTS = Settings(_env_file=None)
-TARGET_SAMPLES = 200
-STARTUP_GATE = 4
+TARGET_SAMPLES = 100
+STARTUP_SAMPLES = 12
+WEIGHT_GATE = 4
+
+
+def _score(mean: float, observations: int) -> float:
+    """The release score for a miner with this mean over this many observations."""
+    return mean * min(observations / STARTUP_SAMPLES, 1.0)
 
 
 def _advancing_clock(start: float = 0.0, step: float = 1.0):
@@ -56,6 +62,7 @@ def _engine(num_uids: int = 1, clock=None, max_samples: int = TARGET_SAMPLES):
         max_samples,
         RELEASE_POLICY.score_window_min_samples,
         decay=RELEASE_POLICY.decay_nonresponders,
+        rank_decay=RELEASE_POLICY.rank_decay,
         **extra,
     )
 
@@ -66,28 +73,32 @@ def _observe(engine: EvalEngine, count: int, reward: float = 1.0, uid: int = 0):
 
 
 # --------------------------------------------------------------------------- #
-# Count boundary: 199 / 200 / 201
+# Count boundary: 99 / 100 / 101
 # --------------------------------------------------------------------------- #
-def test_one_hundred_ninety_nine_observations_divide_by_their_own_count():
+def test_one_below_the_cap_divides_by_the_observed_count():
     engine = _engine(clock=_advancing_clock())
     _observe(engine, 1, reward=0.0)
     _observe(engine, TARGET_SAMPLES - 2, reward=1.0)
 
     assert len(engine.histories[0]) == TARGET_SAMPLES - 1
-    assert engine.scores[0] == pytest.approx((TARGET_SAMPLES - 2) / (TARGET_SAMPLES - 1))
+    assert engine.scores[0] == pytest.approx(
+        _score((TARGET_SAMPLES - 2) / (TARGET_SAMPLES - 1), TARGET_SAMPLES - 1)
+    )
 
 
-def test_two_hundredth_observation_is_retained_not_evicted():
+def test_the_observation_at_the_cap_is_retained_not_evicted():
     engine = _engine(clock=_advancing_clock())
     _observe(engine, 1, reward=0.0)
     _observe(engine, TARGET_SAMPLES - 1, reward=1.0)
 
     assert len(engine.histories[0]) == TARGET_SAMPLES
-    # The single miss is still inside the window and still costs exactly 1/200.
-    assert engine.scores[0] == pytest.approx((TARGET_SAMPLES - 1) / TARGET_SAMPLES)
+    # The single miss is still inside the window and still costs 1/100 of the mean.
+    assert engine.scores[0] == pytest.approx(
+        _score((TARGET_SAMPLES - 1) / TARGET_SAMPLES, TARGET_SAMPLES)
+    )
 
 
-def test_two_hundred_first_observation_evicts_only_the_oldest():
+def test_the_observation_past_the_cap_evicts_only_the_oldest():
     engine = _engine(clock=_advancing_clock())
     _observe(engine, 1, reward=0.0)
     _observe(engine, TARGET_SAMPLES, reward=1.0)
@@ -112,13 +123,13 @@ def test_window_stays_at_the_cap_under_sustained_load():
 def test_ancient_observations_survive_a_much_later_record():
     now = [1.0]
     engine = _engine(clock=lambda: now[0])
-    _observe(engine, STARTUP_GATE, reward=1.0)
+    _observe(engine, STARTUP_SAMPLES, reward=1.0)
 
     # Far beyond the retired 16-hour bound.
     now[0] = LEGACY_SCORE_WINDOW_SECONDS * 1000.0
     _observe(engine, 1, reward=1.0)
 
-    assert len(engine.histories[0]) == STARTUP_GATE + 1
+    assert len(engine.histories[0]) == STARTUP_SAMPLES + 1
     assert engine.scores[0] == pytest.approx(1.0)
 
 
@@ -126,13 +137,13 @@ def test_weight_gate_stays_open_across_a_long_supply_pause():
     """Supersedes the old expiry-driven gate collapse in test_eval_engine.py."""
     now = [1.0]
     engine = _engine(clock=lambda: now[0])
-    _observe(engine, STARTUP_GATE, reward=1.0)
-    assert _weight_observation_count(engine) == STARTUP_GATE
+    _observe(engine, WEIGHT_GATE, reward=1.0)
+    assert _weight_observation_count(engine) == WEIGHT_GATE
 
     now[0] = LEGACY_SCORE_WINDOW_SECONDS * 10.0
     _observe(engine, 1, reward=1.0)
 
-    assert _weight_observation_count(engine) == STARTUP_GATE + 1
+    assert _weight_observation_count(engine) == WEIGHT_GATE + 1
 
 
 def test_a_stale_miss_is_not_forgiven_by_the_passage_of_time():
@@ -145,42 +156,42 @@ def test_a_stale_miss_is_not_forgiven_by_the_passage_of_time():
 
     # 0 + 1 + 1 + 1 over four observations; the old zero still counts.
     assert len(engine.histories[0]) == 4
-    assert engine.scores[0] == pytest.approx(0.75)
+    assert engine.scores[0] == pytest.approx(_score(0.75, 4))
 
 
 # --------------------------------------------------------------------------- #
-# Fewer than the cap: average over what exists, floored by the startup gate
+# Fewer than the cap: average over what exists
 # --------------------------------------------------------------------------- #
 def test_fewer_than_the_cap_never_divides_by_the_cap():
     engine = _engine(clock=_advancing_clock())
-    _observe(engine, 10, reward=1.0)
+    _observe(engine, 30, reward=1.0)
 
     assert engine.scores[0] == pytest.approx(1.0)
 
 
 def test_partial_history_averages_over_the_observed_count():
     engine = _engine(clock=_advancing_clock())
-    _observe(engine, 8, reward=1.0)
-    _observe(engine, 2, reward=0.0)
+    _observe(engine, 24, reward=1.0)
+    _observe(engine, 6, reward=0.0)
 
-    assert engine.scores[0] == pytest.approx(0.8)
+    assert engine.scores[0] == pytest.approx(_score(0.8, 30))
 
 
-@pytest.mark.parametrize(
-    "observations,expected",
-    [(1, 0.25), (2, 0.5), (3, 0.75), (4, 1.0), (5, 1.0)],
-)
-def test_four_problem_startup_gate_still_floors_thin_evidence(observations, expected):
+@pytest.mark.parametrize("observations", [1, 2, 6, 11, 12, 13, 50])
+def test_new_miner_score_ramps_linearly_and_is_full_from_twelve(observations):
     engine = _engine(clock=_advancing_clock())
     _observe(engine, observations, reward=1.0)
 
+    expected = min(observations / STARTUP_SAMPLES, 1.0)
     assert engine.scores[0] == pytest.approx(expected)
+    if observations >= STARTUP_SAMPLES:
+        assert engine.scores[0] == 1.0
 
 
 # --------------------------------------------------------------------------- #
 # Registration change resets the whole window
 # --------------------------------------------------------------------------- #
-def test_hotkey_change_clears_a_full_two_hundred_problem_history():
+def test_hotkey_change_clears_a_full_history():
     engine = _engine(clock=_advancing_clock())
     engine.set_hotkeys({0: "incumbent"})
     _observe(engine, TARGET_SAMPLES, reward=1.0)
@@ -192,7 +203,7 @@ def test_hotkey_change_clears_a_full_two_hundred_problem_history():
     assert engine.scores[0] == pytest.approx(0.0)
 
 
-def test_new_registration_restarts_at_the_startup_gate_floor():
+def test_new_registration_restarts_at_the_bottom_of_the_ramp():
     engine = _engine(clock=_advancing_clock())
     engine.set_hotkeys({0: "incumbent"})
     _observe(engine, TARGET_SAMPLES, reward=1.0)
@@ -201,7 +212,7 @@ def test_new_registration_restarts_at_the_startup_gate_floor():
     _observe(engine, 1, reward=1.0)
 
     assert len(engine.histories[0]) == 1
-    assert engine.scores[0] == pytest.approx(1.0 / STARTUP_GATE)
+    assert engine.scores[0] == pytest.approx(1.0 / STARTUP_SAMPLES)
 
 
 def test_persisted_history_is_still_reset_by_a_hotkey_change_after_reload(tmp_path):
@@ -223,16 +234,20 @@ def test_persisted_history_is_still_reset_by_a_hotkey_change_after_reload(tmp_pa
 # --------------------------------------------------------------------------- #
 # Defaults
 # --------------------------------------------------------------------------- #
-def test_default_score_window_cap_is_two_hundred():
+def test_default_score_window_cap_is_one_hundred():
     assert RELEASE_POLICY.score_window_max_samples == TARGET_SAMPLES
 
 
-def test_default_startup_gates_stay_at_four():
-    assert RELEASE_POLICY.score_window_min_samples == STARTUP_GATE
-    assert RELEASE_POLICY.min_weight_observations == STARTUP_GATE
+def test_default_ramp_is_twelve_and_weight_gate_stays_at_four():
+    assert RELEASE_POLICY.score_window_min_samples == STARTUP_SAMPLES
+    assert RELEASE_POLICY.min_weight_observations == WEIGHT_GATE
 
 
-def test_default_engine_accumulates_two_hundred_observations():
+def test_default_rank_decay_is_0_995():
+    assert RELEASE_POLICY.rank_decay == 0.995
+
+
+def test_default_engine_accumulates_a_full_window_of_observations():
     engine = _engine(clock=_advancing_clock())
     _observe(engine, TARGET_SAMPLES, reward=1.0)
 
@@ -275,7 +290,8 @@ def test_existing_six_entry_state_loads_without_reset(tmp_path, capsys):
     _load_scores(engine, str(path))
 
     assert len(engine.histories[0]) == 6
-    assert engine.scores[0] == pytest.approx(4.0 / 6.0)
+    # Rescored under the release policy, not cleared.
+    assert engine.scores[0] == pytest.approx(_score(4.0 / 6.0, 6))
     assert engine.hotkeys == {0: "incumbent"}
     out = capsys.readouterr().out
     assert "could not restore" not in out
@@ -302,10 +318,10 @@ def test_loaded_ancient_entries_are_not_expired_by_the_next_record(tmp_path):
     _observe(engine, 1, reward=1.0)
 
     assert len(engine.histories[0]) == 7
-    assert engine.scores[0] == pytest.approx(5.0 / 7.0)
+    assert engine.scores[0] == pytest.approx(_score(5.0 / 7.0, 7))
 
 
-def test_two_hundred_entry_state_roundtrips_through_persistence(tmp_path):
+def test_a_full_window_of_state_roundtrips_through_persistence(tmp_path):
     path = tmp_path / "scores-full-window.json"
     source = _engine(clock=_advancing_clock())
     source.set_hotkeys({0: "incumbent"})
@@ -323,6 +339,23 @@ def test_two_hundred_entry_state_roundtrips_through_persistence(tmp_path):
     assert restored.scores == pytest.approx(source.scores)
 
 
+def test_a_previous_release_window_of_two_hundred_loads_as_its_newest_hundred(tmp_path):
+    path = tmp_path / "scores-200.json"
+    previous = _engine(clock=_advancing_clock(), max_samples=200)
+    previous.set_hotkeys({0: "incumbent"})
+    _observe(previous, 100, reward=0.0)  # the older half: all misses
+    _observe(previous, 100, reward=1.0)  # the newer half: all passes
+    _save_scores(previous, str(path))
+    assert json.loads(path.read_text())["max_samples"] == 200
+
+    current = _engine(num_uids=0, clock=_advancing_clock())
+    _load_scores(current, str(path))
+
+    assert len(current.histories[0]) == TARGET_SAMPLES == 100
+    assert all(reward == 1.0 for _, reward in current.histories[0])  # only the newest hundred survive
+    assert current.scores[0] == pytest.approx(1.0)
+
+
 def test_reducing_the_cap_keeps_only_the_latest_observations(tmp_path):
     path = tmp_path / "scores-shrink.json"
     source = _engine(clock=_advancing_clock())
@@ -331,8 +364,8 @@ def test_reducing_the_cap_keeps_only_the_latest_observations(tmp_path):
     _observe(source, 1, reward=1.0)
     _save_scores(source, str(path))
 
-    smaller = _engine(num_uids=0, clock=_advancing_clock(), max_samples=10)
+    smaller = _engine(num_uids=0, clock=_advancing_clock(), max_samples=25)
     _load_scores(smaller, str(path))
 
-    assert len(smaller.histories[0]) == 10
-    assert smaller.scores[0] == pytest.approx(0.1)
+    assert len(smaller.histories[0]) == 25
+    assert smaller.scores[0] == pytest.approx(_score(1 / 25, 25))

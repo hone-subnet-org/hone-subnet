@@ -7,10 +7,14 @@ import pytest
 
 from rlvr.config import Settings
 from rlvr.neurons import decentralized, feedback_sender
+from rlvr.policy import RELEASE_POLICY
 from rlvr.scoring.eval_engine import EvalEngine
 from rlvr.v3.grading import EvaluationResult
 from rlvr.v3.reasons import MinerReason, RoundReason, Stage
 from rlvr.v3.round import MinerEvaluation, RoundResult
+
+# One pass from a new miner scores 1 / startup samples of a full score.
+ONE_PASS = 1 / RELEASE_POLICY.score_window_min_samples
 
 
 def _engine():
@@ -149,6 +153,8 @@ def run_callback(tmp_path, monkeypatch):
         original_save = decentralized._save_scores
 
         def save(engine, filename):
+            # The live validator pays by rank.
+            assert engine.rank_decay == RELEASE_POLICY.rank_decay
             saved = original_save(engine, filename) if persistence else False
             assert saved is persistence
             events.append("saved" if saved else "unsaved")
@@ -161,7 +167,7 @@ def run_callback(tmp_path, monkeypatch):
             assert events == ["saved", "diagnostics"]
             assert result is outcome
             assert clients is solvers
-            assert json.loads(path.read_text())["scores"][1] == 0.25
+            assert json.loads(path.read_text())["scores"][1] == ONE_PASS
             sends.append(kwargs)
             events.append("notice")
             if sender_error:
@@ -201,7 +207,7 @@ async def test_notices_follow_score_persistence_and_diagnostic_attempt(
     )
     assert events == ["saved", "diagnostics", "notice"]
     assert sends[0]["include_details"] is True
-    assert scores == {0: 0.0, 1: 0.25, 2: 0.0}
+    assert scores == {0: 0.0, 1: ONE_PASS, 2: 0.0}
     assert json.loads(path.read_text())["scores"] == list(scores.values())
 
 
@@ -214,7 +220,7 @@ async def test_disabled_or_unsaved_notices_do_not_change_scores(
     )
     assert events == ["saved" if persistence else "unsaved", "diagnostics"]
     assert sends == []
-    assert scores == {0: 0.0, 1: 0.25, 2: 0.0}
+    assert scores == {0: 0.0, 1: ONE_PASS, 2: 0.0}
 
 
 async def test_reason_only_setting_reaches_sender(run_callback):
