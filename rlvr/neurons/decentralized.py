@@ -25,7 +25,7 @@ from ..problemserver.client import (
     next_lease_not_before,
     require_secure_problem_url,
 )
-from ..scoring.eval_engine import EvalEngine
+from ..scoring.eval_engine import EvalEngine, rank_weights
 from ..v3.client import V3ProblemServerClient
 from ..v3.diagnostics import EvaluationLog
 from ..v3.ledger import RoundLedger
@@ -349,12 +349,14 @@ def _pooled_weights(
     engine: EvalEngine, pool: LedgerPool, hotkeys: Sequence[str], policy: ValidatorPolicy, now: float, admit
 ):
     """L1-normalized weights from the local window plus the admitted ledger
-    rounds, the same way the engine normalizes its own scores."""
+    rounds, ranked and normalized the same way the engine does its own scores."""
     scores = np.array(
         pool.scores(hotkeys, engine.histories, min_samples=policy.score_window_min_samples, now=now, admitted=admit),
         dtype=np.float64,
     )
     scores = np.clip(np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0), 0.0, None)
+    if engine.rank_decay is not None:
+        scores = rank_weights(scores, engine.rank_decay)
     total = scores.sum()
     return np.zeros_like(scores) if total <= 0.0 or not np.isfinite(total) else scores / total
 

@@ -383,6 +383,25 @@ def test_a_round_from_the_future_is_refused():
     assert p.ingest(page(soon), admitted=EVERYONE, hotkeys=HOTKEYS, now=NOW) == (1, 0)
 
 
+def test_pooled_weights_follow_rank_like_local_ones(monkeypatch):
+    monkeypatch.setattr(decentralized.time, "time", lambda: NOW)
+    monkeypatch.setattr(decentralized, "_weight_result_status", lambda result: (True, "ok"))
+    monkeypatch.setattr(decentralized, "_weight_failure_report", lambda result, validator: "")
+    decay = RELEASE_POLICY.rank_decay
+    engine = EvalEngine(4, 57_600.0, 100, 4, rank_decay=decay)
+    calls = []
+    validator = make_validator(["hk-0", "hk-1", "hk-2"], calls)
+    p = pool(cap_per_validator=50)
+    # uid 2 passes all four pooled rounds, uid 1 only one: scores 1.0 and 0.25
+    rounds = [signed("val-a", seq, [verdict(1, seq == 1, 10), verdict(2, True, 10)]) for seq in (1, 2, 3, 4)]
+    p.ingest(page(*rounds), admitted=EVERYONE, hotkeys=HOTKEYS, now=NOW)
+    policy = RELEASE_POLICY.__class__(score_window_min_samples=4)
+    assert decentralized._submit_local_weights(validator, engine, Settings(_env_file=None), policy=policy, pool=p) is True
+    total = 1.0 + decay
+    # the weight gap is one rank step, not the 4x score gap
+    assert calls[0]["weights"] == pytest.approx([0.0, decay / total, 1.0 / total, 0.0])
+
+
 def test_only_miners_registered_as_named_get_a_bucket():
     p = pool()
     invented = [RoundVerdict(uid=1, hotkey="hk-1", passed=True, response_latency_ms=10)] + [
