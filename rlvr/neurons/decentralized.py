@@ -330,8 +330,10 @@ async def _sync_pool(
         if not page.next_cursor or page.next_cursor == before:
             break
     pool.settle(list(metagraph.hotkeys), current, admitted=admit)
-    if pool.seen:
-        # Saved after every pull, pages or not, so what settle took out stays out across a restart.
+    if pool.seen or pool.cursor is not None:
+        # Saved after every pull, pages or not, so what settle took out stays
+        # out across a restart, and so does a cursor that moved past pages
+        # with nothing to take.
         try:
             await asyncio.to_thread(pool.save, path)
         except OSError as error:

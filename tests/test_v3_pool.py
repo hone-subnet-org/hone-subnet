@@ -525,6 +525,19 @@ def test_a_pull_keeps_paging_past_a_page_with_nothing_readable(tmp_path):
     assert client.calls == 2 and p.pooled_observations(1, "hk-1") == [1.0]
 
 
+def test_a_cursor_that_moved_past_pages_with_nothing_to_take_survives_a_restart(tmp_path):
+    class Client:
+        async def fetch_rounds(self, *, since):
+            return SimpleNamespace(status=200, page=page(cursor=None if since == "c1" else "c1"))
+
+    metagraph = SimpleNamespace(hotkeys=["val-a", "hk-1", "me"], validator_permit=[True, False, True], validator_trust=[0.3, 0.0, 0.3], S=[50.0, 1.0, 50.0])
+    p = pool()
+    asyncio.run(decentralized._sync_pool(p, Client(), metagraph, RELEASE_POLICY, tmp_path / "pool.json", now=NOW))
+    assert p.cursor == "c1" and not p.seen
+    restarted = pool()
+    assert restarted.load(tmp_path / "pool.json", now=NOW) and restarted.cursor == "c1"
+
+
 def test_only_miners_registered_as_named_get_a_bucket():
     p = pool()
     invented = [RoundVerdict(uid=1, hotkey="hk-1", passed=True, response_latency_ms=10)] + [
