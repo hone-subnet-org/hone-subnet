@@ -447,6 +447,71 @@ def test_pooled_weights_follow_rank_like_local_ones(monkeypatch):
     assert calls[0]["weights"] == pytest.approx([0.0, decay / total, 1.0 / total, 0.0])
 
 
+# --------------------------------------------------------------------------- #
+# disagreement: reported, never scored
+# --------------------------------------------------------------------------- #
+def graded(p, validator, uid, passed, rounds, *, first_seq=1):
+    """The validator grades uid in `rounds` rounds and passes it in the first `passed`."""
+    items = [signed(validator, first_seq + n, [verdict(uid, n < passed, 10)]) for n in range(rounds)]
+    p.ingest(page(*items), admitted=EVERYONE, hotkeys=HOTKEYS, now=NOW)
+
+
+def test_a_validator_far_from_everyone_else_on_a_miner_is_named():
+    p = pool(cap_per_validator=50)
+    for validator, passed in (("val-a", 16), ("val-b", 18), ("val-c", 14)):
+        graded(p, validator, 1, passed, 40)  # honest: around 40%
+    graded(p, "val-x", 1, 40, 40)  # passes its own miner every time
+    graded(p, "val-x", 2, 0, 40, first_seq=41)  # and fails a rival every time
+    for validator in ("val-a", "val-b", "val-c"):
+        graded(p, validator, 2, 30, 40, first_seq=41)
+    before = p.scores(HOTKEYS, {}, min_samples=4, now=NOW)
+    found = p.disagreements(HOTKEYS, {}, now=NOW)
+    assert [(item.validator, item.uid) for item in found] == [("val-x", 2), ("val-x", 1)]
+    generous = found[1]
+    assert (generous.rate, generous.rounds, generous.others_rounds) == (1.0, 40, 120)
+    assert generous.others_rate == pytest.approx(0.4) and generous.z > 4 and found[0].z < -4
+    assert p.scores(HOTKEYS, {}, min_samples=4, now=NOW) == before  # reporting changes no score
+
+
+def test_ordinary_variation_and_thin_evidence_are_not_reported():
+    p = pool(cap_per_validator=50)
+    for validator, passed in (("val-a", 16), ("val-b", 22), ("val-c", 12), ("val-d", 19)):
+        graded(p, validator, 1, passed, 40)  # 30% to 55%: chance
+    graded(p, "val-a", 2, 19, 19, first_seq=41)  # all passes, but under twenty rounds
+    graded(p, "val-b", 2, 0, 40, first_seq=41)
+    graded(p, "val-a", 3, 40, 40, first_seq=60)  # nobody else to compare with
+    assert p.disagreements(HOTKEYS, {}, now=NOW) == []
+
+
+def test_this_validators_own_rounds_count_as_someone_else():
+    p = pool(cap_per_validator=50)
+    graded(p, "val-x", 1, 40, 40)
+    local = {1: [(NOW - n, 1.0 if n < 8 else 0.0) for n in range(40)]}  # we saw 20%
+    stale = {1: [(NOW - 5 * DAY, 0.0)] * 40}  # outside the window: not evidence
+    assert [(item.validator, item.others_rounds) for item in p.disagreements(HOTKEYS, local, now=NOW)] == [("val-x", 40)]
+    assert p.disagreements(HOTKEYS, stale, now=NOW) == []
+
+
+def test_the_pull_names_disagreeing_validators_in_the_log(tmp_path, capsys):
+    class Client:
+        def __init__(self, pages):
+            self.pages = list(pages)
+
+        async def fetch_rounds(self, *, since):
+            return self.pages.pop(0)
+
+    hotkeys = ["val-x", "hk-1", "me"]
+    metagraph = SimpleNamespace(hotkeys=hotkeys, validator_permit=[True, False, True], validator_trust=[0.3, 0.0, 0.3], S=[50.0, 1.0, 50.0])
+    rounds = [signed("val-x", seq, [verdict(1, True, 10)]) for seq in range(1, 41)]
+    local = {1: [(NOW - n, 0.0) for n in range(40)]}
+    p = pool(cap_per_validator=50)
+    client = Client([SimpleNamespace(status=200, page=page(*rounds, cursor=None))])
+    asyncio.run(decentralized._sync_pool(p, client, metagraph, RELEASE_POLICY, tmp_path / "pool.json", now=NOW, local=local))
+    out = capsys.readouterr().out
+    assert "1 validator/miner pair(s) far from everyone else's verdicts" in out
+    assert "validator val-x passes uid 1 100% of 40 round(s); everyone else 0% of 40 (z=+8.9)" in out
+
+
 def test_only_miners_registered_as_named_get_a_bucket():
     p = pool()
     invented = [RoundVerdict(uid=1, hotkey="hk-1", passed=True, response_latency_ms=10)] + [

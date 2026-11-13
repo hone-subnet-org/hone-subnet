@@ -8,7 +8,7 @@ import os
 import shutil
 import socket
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Optional
 
@@ -29,7 +29,7 @@ from ..scoring.eval_engine import EvalEngine, rank_weights
 from ..v3.client import V3ProblemServerClient
 from ..v3.diagnostics import EvaluationLog
 from ..v3.ledger import RoundLedger
-from ..v3.pool import LedgerPool, validating_with_stake
+from ..v3.pool import Disagreement, LedgerPool, validating_with_stake
 from ..v3.reasons import RoundReason
 from ..v3.release import default_grading_concurrency
 from ..v3.release import round_policy as v3_round_policy
@@ -291,10 +291,13 @@ async def _sync_pool(
     path: Path,
     *,
     now: float | None = None,
+    local: Mapping[int, Sequence[tuple[float, float]]] | None = None,
 ) -> None:
     """Pull what the ledger has since our cursor, a bounded number of pages,
     admit by signature, permit, trust and stake, and keep the state on disk.
-    A 404 means the server does not serve the ledger yet: nothing changes."""
+    A 404 means the server does not serve the ledger yet: nothing changes.
+    After a pull, validators whose verdicts on a miner are far from everyone
+    else's are named in the log; ``local`` is this validator's own history."""
     current = time.time() if now is None else now
     admit = _ledger_admission(metagraph, policy)
     taken = dropped = pages = 0
@@ -337,6 +340,27 @@ async def _sync_pool(
         print(
             f"[validator] ledger: {taken} round(s) admitted, {dropped} dropped, "
             f"pooling {len(pool.entries)} validator(s)"
+        )
+        _log_disagreements(pool.disagreements(list(metagraph.hotkeys), local or {}, now=current))
+
+
+DISAGREEMENTS_LOGGED = 5  # the strongest few; the count says how many there were
+
+
+def _log_disagreements(found: Sequence[Disagreement]) -> None:
+    """Name validators whose verdicts on a miner are far from everyone else's.
+    Scores are not changed; this is for an operator to look into."""
+    if not found:
+        return
+    print(
+        f"[validator] WARN: ledger: {len(found)} validator/miner pair(s) far from everyone else's verdicts"
+        + (f"; the strongest {DISAGREEMENTS_LOGGED}:" if len(found) > DISAGREEMENTS_LOGGED else ":")
+    )
+    for item in found[:DISAGREEMENTS_LOGGED]:
+        print(
+            f"[validator] WARN: ledger: validator {item.validator} passes uid {item.uid} "
+            f"{item.rate:.0%} of {item.rounds} round(s); everyone else {item.others_rate:.0%} "
+            f"of {item.others_rounds} (z={item.z:+.1f})"
         )
 
 
@@ -780,7 +804,7 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
                 # Pull the ledger once per completed round; an incomplete round
                 # makes no further requests, as before.
                 try:
-                    await _sync_pool(pool, client, v.metagraph, policy, pool_path)
+                    await _sync_pool(pool, client, v.metagraph, policy, pool_path, local=engine.histories)
                 except Exception as error:  # noqa: BLE001 - pooling never interrupts validation
                     print(f"[validator] WARN: ledger sync failed: {type(error).__name__}")
             if saved and settings.validator_trace_check_url:

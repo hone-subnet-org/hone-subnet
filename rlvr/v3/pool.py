@@ -23,7 +23,7 @@ from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from .api import LedgerPage, LedgerRound, RoundVerdict
 from .verdicts import verify_round
@@ -37,6 +37,28 @@ FUTURE_SLACK_S = 600  # a round recorded further ahead of our clock than this is
 # again, however fresh its recorded_at says it is.
 SEQ_SLACK = 100
 Entry = tuple[float, float, int]  # recorded_at, payment, round_seq
+# When one validator's pass rate for a miner is this far from what everyone
+# else saw for the same miner, it is reported in the log. Nothing is scored
+# differently: this is for an operator to look at. Both sides need enough
+# rounds, the rates must differ by a gap that matters, and the difference
+# must be far beyond chance (a two-proportion z-test), since every validator
+# and miner pair is compared after every pull. Simulated with honest
+# validators, these values leave a false report standing for well under one
+# pair in a thousand, and report most validators that pass a miner 40 points
+# above its true rate over 50 rounds. A smaller lift is not told from chance.
+DISAGREEMENT_MIN_ROUNDS = 20
+DISAGREEMENT_MIN_GAP = 0.25
+DISAGREEMENT_MIN_Z = 4.5
+
+
+class Disagreement(NamedTuple):
+    validator: str
+    uid: int
+    rate: float  # the validator's pass rate for this miner
+    rounds: int
+    others_rate: float  # everyone else's, this validator's own rounds included
+    others_rounds: int
+    z: float  # positive when the validator is the more generous
 
 
 def round_payments(
@@ -246,6 +268,39 @@ class LedgerPool:
         """The largest window any miner has: the evidence gate."""
         self.settle(hotkeys, now, admitted=admitted)
         return max((len(self._window(uid, hotkey, local, now)) for uid, hotkey in enumerate(hotkeys)), default=0)
+
+    def disagreements(
+        self, hotkeys: Sequence[str], local: Mapping[int, Sequence[tuple[float, float]]], *, now: float
+    ) -> list[Disagreement]:
+        """Validators whose pass rate for a miner is far from everyone
+        else's for that miner, the strongest first. Everyone else is the other
+        pooled validators plus this validator's own rounds in the window."""
+        found: list[Disagreement] = []
+        cutoff = now - self.window_s
+        for uid, hotkey in enumerate(hotkeys):
+            passes: dict[str, tuple[int, int]] = {}  # validator -> (passed, rounds)
+            for validator, per_miner in self.entries.items():
+                bucket = per_miner.get((uid, hotkey))
+                if bucket:
+                    passes[validator] = (sum(payment > 0 for _, payment, _ in bucket), len(bucket))
+            if not passes:
+                continue
+            own = [payment > 0 for observed_at, payment in local.get(uid, ()) if observed_at > cutoff][-self.cap :]
+            all_passed = sum(passed for passed, _ in passes.values()) + sum(own)
+            all_rounds = sum(rounds for _, rounds in passes.values()) + len(own)
+            for validator, (passed, rounds) in passes.items():
+                others_rounds = all_rounds - rounds
+                if rounds < DISAGREEMENT_MIN_ROUNDS or others_rounds < DISAGREEMENT_MIN_ROUNDS:
+                    continue
+                rate, others_rate = passed / rounds, (all_passed - passed) / others_rounds
+                combined = all_passed / all_rounds
+                spread = math.sqrt(combined * (1 - combined) * (1 / rounds + 1 / others_rounds))
+                if abs(rate - others_rate) < DISAGREEMENT_MIN_GAP or spread <= 0:
+                    continue
+                z = (rate - others_rate) / spread
+                if abs(z) >= DISAGREEMENT_MIN_Z:
+                    found.append(Disagreement(validator, uid, rate, rounds, others_rate, others_rounds, z))
+        return sorted(found, key=lambda item: (-abs(item.z), item.validator, item.uid))
 
     @property
     def active(self) -> bool:
