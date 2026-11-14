@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import quote
 from uuid import uuid4
 
 from ..problemserver.client import (
@@ -14,16 +15,26 @@ from ..problemserver.client import (
     status_category,
 )
 from .api import (
+    LEDGER_PAGE_LIMIT,
     ChallengeCommitRequest,
     ChallengeFeedbackRequest,
     ChallengeFeedbackResponse,
     CommitRevealResponse,
     LeaseRequest,
     LeaseResponse,
+    LedgerPage,
     MinerCandidate,
+    parse_ledger_page,
     serialize_commit_request,
     serialize_feedback_request,
 )
+
+
+@dataclass(frozen=True)
+class LedgerFetch:
+    status: int | None
+    page: LedgerPage | None
+    skipped: int = 0  # rounds on the page this release could not read
 
 
 @dataclass(frozen=True)
@@ -103,6 +114,31 @@ class V3ProblemServerClient:
         except Exception as error:  # noqa: BLE001
             print(f"[validator] WARN: invalid V3 commit response: {error}")
             return None
+
+    async def fetch_rounds(self, *, since: str | None) -> LedgerFetch:
+        """One page of the shared ledger. status None when nothing answered;
+        page None unless the answer was a readable 200. A round that cannot be
+        read is skipped and counted; the rest of the page and its cursor stand."""
+        query = f"?limit={LEDGER_PAGE_LIMIT}" + (f"&since={quote(since, safe='')}" if since else "")
+        response = await self._transport.get(f"/v3/rounds{query}")
+        if response is None:
+            return LedgerFetch(None, None)
+        if response.status_code != 200:
+            return LedgerFetch(response.status_code, None)
+        try:
+            page, skipped = parse_ledger_page(response.content)
+        except Exception as error:  # noqa: BLE001 - a page with no readable envelope is dropped whole
+            print(f"[validator] WARN: invalid ledger page: {bounded_detail(str(error))}")
+            return LedgerFetch(200, None)
+        if skipped:
+            print(f"[validator] WARN: ledger page: {skipped} round(s) skipped as unreadable")
+        return LedgerFetch(200, page, skipped)
+
+    async def signed_round_status(self, body: bytes) -> int | None:
+        """POST one signed round exactly as given; the HTTP status, or None
+        when nothing answered. Kept rounds are resent byte for byte."""
+        response = await self._transport.post("/v3/challenges/round", bytes(body))
+        return None if response is None else response.status_code
 
     async def feedback(self, request: ChallengeFeedbackRequest) -> bool:
         body = serialize_feedback_request(request)
