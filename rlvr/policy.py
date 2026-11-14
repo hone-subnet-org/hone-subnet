@@ -25,10 +25,12 @@ class ValidatorPolicy:
     payment_speed_floor: float = 1.0
     owner_burn_share: float = 0.0
     score_window_max_samples: int = 100
-    # A miner's score ramps linearly to full over its first 12 observations.
-    # Kept short to make it unlikely that slow or unlucky problem assignment
-    # leaves a miner still ramping when its 36-hour immunity period ends.
-    score_window_min_samples: int = 12
+    # A miner's score ramps linearly to full over its first 30 observations.
+    # Rounds pooled from other validators count toward it, so a miner gets
+    # there much sooner than from one validator alone. A validator scoring
+    # without the pool can leave a miner still ramping when its 36-hour
+    # immunity period ends.
+    score_window_min_samples: int = 30
     # Weights follow rank: each miner gets this fraction of the weight of the
     # miner ranked just above it. Ties go to the lower UID.
     rank_decay: float = 0.995
