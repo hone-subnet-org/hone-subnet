@@ -25,7 +25,7 @@ from ..problemserver.client import (
     next_lease_not_before,
     require_secure_problem_url,
 )
-from ..scoring.eval_engine import EvalEngine, rank_weights
+from ..scoring.eval_engine import EvalEngine, rank_weights, zero_blocked
 from ..v3.client import V3ProblemServerClient
 from ..v3.diagnostics import EvaluationLog
 from ..v3.ledger import RoundLedger
@@ -371,8 +371,63 @@ def _weight_observation_count(engine: EvalEngine) -> int:
     return max((len(history) for history in engine.histories.values()), default=0)
 
 
+def _blocked_uids(metagraph: Any, policy: ValidatorPolicy) -> np.ndarray | None:
+    """Mask over the metagraph's positions: True where the coldkey is blocked
+    by release policy. A validator-permit holder or the subnet owner is never
+    blocked. None when any coldkey cannot be read, so no weights are set."""
+    hotkeys = list(metagraph.hotkeys)
+    blocked = np.zeros(len(hotkeys), dtype=bool)
+    if not policy.blocked_coldkeys:
+        return blocked
+    try:
+        coldkeys = list(metagraph.coldkeys)
+    except (AttributeError, TypeError):
+        coldkeys = []
+    if len(coldkeys) != len(hotkeys) or not all(isinstance(ck, str) and ck for ck in coldkeys):
+        print("[validator] ERROR: metagraph coldkeys unavailable; blocked coldkeys cannot be applied, skipping weights")
+        return None
+    uids = [int(uid) for uid in metagraph.uids]
+    permits = getattr(metagraph, "validator_permit", None)
+    permits = [] if permits is None else [bool(permit) for permit in permits]
+    owner = getattr(metagraph, "owner_hotkey", None)
+    listed = set(policy.blocked_coldkeys)
+    for position, (hotkey, coldkey) in enumerate(zip(hotkeys, coldkeys)):
+        if coldkey not in listed:
+            continue
+        if hotkey == owner or (position < len(permits) and permits[position]):
+            role = "is the subnet owner" if hotkey == owner else "holds a validator permit"
+            print(f"[validator] WARN: blocked coldkey {coldkey} not applied to uid {uids[position]}: it {role}")
+            continue
+        blocked[position] = True
+    return blocked
+
+
+def _log_blocked(metagraph: Any, blocked: np.ndarray, unblocked_weights: Sequence[float]) -> None:
+    """Which uids the block zeroed, by coldkey, and the weight they would have had."""
+    if not blocked.any():
+        return
+    coldkeys = list(metagraph.coldkeys)
+    uids = [int(uid) for uid in metagraph.uids]
+    by_coldkey: dict[str, list[int]] = {}
+    for position in np.flatnonzero(blocked):
+        by_coldkey.setdefault(coldkeys[position], []).append(uids[position])
+    share = float(np.sum(np.asarray(unblocked_weights, dtype=np.float64)[blocked]))
+    print(
+        f"[validator] blocked coldkeys: zeroed {int(blocked.sum())} uid(s) under "
+        f"{len(by_coldkey)} coldkey(s); unblocked they would get {share:.2%} of weight"
+    )
+    for coldkey, blocked_uids in sorted(by_coldkey.items()):
+        print(f"[validator]   {coldkey}: uids {blocked_uids}")
+
+
 def _pooled_weights(
-    engine: EvalEngine, pool: LedgerPool, hotkeys: Sequence[str], policy: ValidatorPolicy, now: float, admit
+    engine: EvalEngine,
+    pool: LedgerPool,
+    hotkeys: Sequence[str],
+    policy: ValidatorPolicy,
+    now: float,
+    admit,
+    blocked: np.ndarray | None = None,
 ):
     """L1-normalized weights from the local window plus the admitted ledger
     rounds, ranked and normalized the same way the engine does its own scores."""
@@ -380,7 +435,7 @@ def _pooled_weights(
         pool.scores(hotkeys, engine.histories, min_samples=policy.score_window_min_samples, now=now, admitted=admit),
         dtype=np.float64,
     )
-    scores = np.clip(np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0), 0.0, None)
+    scores = zero_blocked(np.clip(np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0), 0.0, None), blocked)
     if engine.rank_decay is not None:
         scores = rank_weights(scores, engine.rank_decay)
     total = scores.sum()
@@ -417,9 +472,18 @@ def _submit_local_weights(
         )
         return None
 
-    weights = (
-        _pooled_weights(engine, pool, hotkeys, policy, now, admit) if pooled else engine.get_weights(n=len(hotkeys))
-    )
+    blocked = _blocked_uids(validator.metagraph, policy)
+    if blocked is None:
+        return None
+
+    def miner_weights(mask: np.ndarray | None):
+        if pooled:
+            return _pooled_weights(engine, pool, hotkeys, policy, now, admit, mask)
+        return engine.get_weights(n=len(hotkeys), blocked=mask)
+
+    weights = miner_weights(blocked)
+    if blocked.any():
+        _log_blocked(validator.metagraph, blocked, miner_weights(None))
 
     if float(sum(weights)) <= 0.0:
         print(f"[validator] {'pooled' if pooled else 'local'} miner weights are all-zero; skipping")

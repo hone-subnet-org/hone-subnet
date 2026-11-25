@@ -21,7 +21,7 @@ class _Engine:
         self._weights = list(weights)
         self.histories = {0: [1.0] * 8}
 
-    def get_weights(self, n):
+    def get_weights(self, n, blocked=None):
         return list(self._weights)[:n]
 
 
@@ -37,6 +37,7 @@ def _validator(recorded):
         metagraph=SimpleNamespace(
             uids=[0, 1, 2],
             hotkeys=["hk-0", "hk-1", "hk-2"],
+            coldkeys=["ck-0", "ck-1", "ck-2"],
         ),
         subtensor=SimpleNamespace(
             set_weights=set_weights,

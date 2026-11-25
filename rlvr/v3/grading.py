@@ -18,6 +18,7 @@ from .manifest import (
 from .patch import PatchLimits, PatchToolError, apply_patch_in_container
 from .reasons import MinerReason, RoundReason, Stage
 from .script import ScriptLimits, validate_script
+from .shadow import shadowing_files, shadowing_reason, tree_files
 from .supervisor import (
     ContainerRequest,
     ContainerResult,
@@ -138,6 +139,15 @@ def _failed_check_or_none(**kwargs) -> str | None:
         return None
 
 
+def _shadowing(root: Path, before: frozenset[str]) -> str | None:
+    """Why the candidate's tree is refused for a reserved file name, or None."""
+    try:
+        found = shadowing_files(before, tree_files(root))
+    except OSError:
+        return "candidate tree could not be inspected"
+    return shadowing_reason(found) if found else None
+
+
 def _work_cwd(base: str, relative: str) -> str:
     return base if relative == "." else str(PurePosixPath(base, relative))
 
@@ -207,7 +217,10 @@ def _run_checks(
     docker_binary: str,
     run_prefix: str,
     script_exit_code: int | None,
+    baseline: frozenset[str],
 ) -> EvaluationResult:
+    """``baseline`` lists the workspace's files from before any candidate code
+    could run; an added file with a reserved name stops grading."""
     completed: list[CheckResult] = []
     try:
         _inspect_result_tree(workspace, result_tree, tree_limits)
@@ -222,7 +235,25 @@ def _run_checks(
             stage=Stage.RESULT_TREE,
         )
 
-    for check_index, check in enumerate(manifest.checks, start=1):
+    for check_index, check in enumerate((*manifest.checks, None), start=1):
+        # Scanned before every check and once more after the last one.
+        shadowing = _shadowing(workspace, baseline)
+        if shadowing is not None:
+            if check is None and completed:  # appeared during the last check: it no longer passes
+                completed[-1] = CheckResult(
+                    completed[-1].check_id, completed[-1].kind, "failed", completed[-1].exit_code
+                )
+            return _stop(
+                "failed",
+                shadowing,
+                manifest,
+                completed,
+                script_exit_code=script_exit_code,
+                reason_code=MinerReason.RESULT_TREE_INVALID,
+                stage=Stage.RESULT_TREE,
+            )
+        if check is None:
+            break
         try:
             if isinstance(check, InvocationCheck):
                 if _task_directory(host_work_base, check.cwd) is None:
@@ -450,6 +481,13 @@ def evaluate_repository(
             stage=Stage.WORKSPACE_MATERIALIZATION,
         )
     try:
+        before = tree_files(root)
+    except OSError:
+        return EvaluationResult(
+            "abandoned", "validator could not read the workspace", (), None,
+            RoundReason.WORKSPACE_INVALID, Stage.WORKSPACE_MATERIALIZATION,
+        )
+    try:
         applied = apply_patch_in_container(
             root,
             patch,
@@ -467,6 +505,11 @@ def evaluate_repository(
         return EvaluationResult(
             "rejected", applied.reason, (), None,
             applied.reason_code or MinerReason.PATCH_REJECTED, Stage.PATCH,
+        )
+    shadowing = _shadowing(root, before)
+    if shadowing is not None:
+        return EvaluationResult(
+            "rejected", shadowing, (), None, MinerReason.PATCH_STATIC_REJECTED, Stage.PATCH,
         )
 
     work_base = _work_cwd("/work", identity.working_directory)
@@ -498,6 +541,8 @@ def evaluate_repository(
         docker_binary=docker_binary,
         run_prefix=run_prefix,
         script_exit_code=None,
+        # Not re-taken after setup: setup can run repository code the patch changed.
+        baseline=before,
     )
 
 
@@ -551,6 +596,15 @@ def evaluate_terminal(
             stage=Stage.SETUP,
         )
 
+    try:
+        before = tree_files(root)
+    except OSError:
+        return _stop(
+            "abandoned", "validator could not read the workspace", manifest, [],
+            script_exit_code=None,
+            reason_code=RoundReason.WORKSPACE_INVALID,
+            stage=Stage.WORKSPACE_MATERIALIZATION,
+        )
     try:
         # Beside the workspace, not in the system temp directory: see patch.py.
         with tempfile.TemporaryDirectory(prefix="hone-v3-submission-", dir=root.parent) as temporary:
@@ -615,4 +669,5 @@ def evaluate_terminal(
         docker_binary=docker_binary,
         run_prefix=run_prefix,
         script_exit_code=result.exit_code,
+        baseline=before,
     )

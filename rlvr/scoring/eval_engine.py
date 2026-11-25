@@ -38,6 +38,17 @@ def rank_weights(scores: np.ndarray, decay: float) -> np.ndarray:
     return weights
 
 
+def zero_blocked(scores: np.ndarray, blocked: np.ndarray | None) -> np.ndarray:
+    """``scores`` with each blocked uid set to 0, done before ranking so a
+    blocked uid takes no rung of the ladder."""
+    if blocked is None:
+        return scores
+    mask = np.asarray(blocked, dtype=bool)
+    if mask.shape != scores.shape:
+        raise ValueError(f"blocked mask has shape {mask.shape}, scores have {scores.shape}")
+    return np.where(mask, 0.0, scores)
+
+
 class EvalEngine:
     """Per-uid bounded payment history -> normalized weights."""
 
@@ -267,7 +278,7 @@ class EvalEngine:
         for uid in set(self.histories) - active:
             self._record(uid, 0.0, timestamp)
 
-    def get_weights(self, n: int | None = None) -> "np.ndarray":
+    def get_weights(self, n: int | None = None, blocked: np.ndarray | None = None) -> "np.ndarray":
         """L1-normalized weights from the current scores (or their ranks); nan-safe.
 
         nan/inf scores -> 0; negative scores -> 0 (weights are a distribution).
@@ -279,6 +290,9 @@ class EvalEngine:
         length matches what ``set_weights`` expects: a larger ``n`` is zero-padded,
         a smaller ``n`` truncates trailing uids. Normalization is computed over the
         aligned (clamped) scores so the kept weights still sum to 1.
+
+        ``blocked`` (optional) is a boolean mask over the aligned uids; those
+        uids score 0 before ranking.
         """
         scores = np.nan_to_num(
             self.scores, nan=0.0, posinf=0.0, neginf=0.0
@@ -293,7 +307,7 @@ class EvalEngine:
                 aligned[:keep] = scores[:keep]
                 scores = aligned
         # weights represent a non-negative allocation; clamp negatives.
-        scores = np.clip(scores, 0.0, None)
+        scores = zero_blocked(np.clip(scores, 0.0, None), blocked)
         if self.rank_decay is not None:
             scores = rank_weights(scores, self.rank_decay)
         total = scores.sum()

@@ -394,6 +394,7 @@ def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
                 )
             if checker_times_out:
                 from rlvr.v3.grading import _run_checks
+                from rlvr.v3.shadow import tree_files
                 from rlvr.v3.supervisor import ContainerResult
 
                 monkeypatch.setattr(
@@ -405,7 +406,7 @@ def test_complete_synthetic_round_has_pass_fail_malformed_and_no_response(
                     workspace=workspace, host_work_base=workspace, result_tree=workspace,
                     work_base="/work", manifest=manifest, verifier_dir=verifier,
                     supervisor_policy=supervisor, tree_limits=tree, docker_binary=docker,
-                    run_prefix=prefix, script_exit_code=None,
+                    run_prefix=prefix, script_exit_code=None, baseline=tree_files(workspace),
                 )
             return EvaluationResult("failed", "tests failed", (), None)
         return EvaluationResult("rejected", "patch was rejected", (), None)
