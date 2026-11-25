@@ -21,6 +21,7 @@ import pytest
 from rlvr import protocol
 from rlvr.neurons import demo_miner
 from rlvr.neurons.feedback_sender import send_failure_notices
+from rlvr.v3.reasons import MinerReason, Stage
 from rlvr.v3.round import RoundResult
 from tests.test_demo_miner_feedback import make_receiver
 from tests.test_failure_sender import DISPLAY, evaluation, solver
@@ -116,6 +117,7 @@ def previous_release(tmp_path_factory):
         yield ask
     finally:
         process.stdin.close()
+        process.stdout.close()
         try:
             process.wait(timeout=10)
         except subprocess.TimeoutExpired:
@@ -131,15 +133,15 @@ def offline_signatures(monkeypatch):
 _challenges = iter(range(1, 1_000))
 
 
-def round_result(item):
+def round_result(item, failures=()):
     """One completed round for one miner, under a challenge id not seen before."""
     return RoundResult(
         "completed", "", (item,), challenge_id=f"challenge-{next(_challenges)}",
-        task_id="a" * 64, assigned_miners=((item.uid, item.hotkey),),
+        task_id="a" * 64, assigned_miners=((item.uid, item.hotkey),), dispatch_failures=tuple(failures),
     )
 
 
-async def send_to_previous_release(previous_release, result):
+async def send_to_previous_release(previous_release, result, failures=()):
     """Run this release's sender against the previous release's receiver."""
     exchanges = []
 
@@ -152,7 +154,7 @@ async def send_to_previous_release(previous_release, result):
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         delivered = await send_failure_notices(
-            round_result(result), [solver(http, 7, "miner")], wallet="validator", http=http, include_details=True
+            round_result(result, failures), [solver(http, 7, "miner")], wallet="validator", http=http, include_details=True
         )
     return delivered, exchanges
 
@@ -173,6 +175,18 @@ async def test_previous_miner_accepts_a_small_display_first_time(previous_releas
     assert delivered == 1
     assert [(status, len(printed)) for _, status, printed in exchanges] == [(200, 1)]
     assert any(DISPLAY.split("\n")[0] in line for line in exchanges[0][2][0])
+
+
+async def test_previous_miner_refuses_the_local_cause_and_still_gets_the_reason(previous_release):
+    from rlvr.v3.round import DispatchFailure
+
+    item = evaluation(7, "miner", status="rejected", code=MinerReason.ARTIFACT_INVALID, stage=Stage.COMMIT, display=None)
+    failure = DispatchFailure(7, "miner", MinerReason.RESPONSE_UNAVAILABLE, "signature does not verify", 40)
+    delivered, exchanges = await send_to_previous_release(previous_release, item, [failure])
+    assert delivered == 1
+    assert [(status, len(printed)) for _, status, printed in exchanges] == [(400, 0), (200, 1)]
+    (printed,) = exchanges[-1][2]
+    assert len(printed) == 1 and printed[0].startswith("[demo-miner] feedback: artifact_invalid challenge ")
 
 
 async def test_previous_miner_ignores_a_pass_and_still_takes_the_next_failure(previous_release):
@@ -230,12 +244,18 @@ def test_task_wire_models_are_unchanged_since_the_previous_release(previous_rele
             assert new["properties"].pop("miners_per_task")["default"] is None
             assert "miners_per_task" not in new.get("required", [])
         assert new == old[name], name
-    # The notice is identical except that the reason code grew by exactly "passed".
+    # The notice is identical except that the reason code grew by exactly
+    # "passed", and the explanation grew two optional local-cause fields that
+    # stay off the wire when unset, so the previous miner never sees them.
     new = api.MinerFailureNotice.model_json_schema()
     old_notice = old["MinerFailureNotice"]
-    new_reason = new["$defs"]["FailureExplanation"]["properties"].pop("reason_code")
+    explanation = new["$defs"]["FailureExplanation"]
+    for added in ("dispatch_reason_code", "dispatch_detail"):
+        assert explanation["properties"].pop(added)["default"] is None
+        assert added not in explanation.get("required", [])
+    new_reason = explanation["properties"].pop("reason_code")
     old_reason = old_notice["$defs"]["FailureExplanation"]["properties"].pop("reason_code")
-    new["$defs"]["FailureExplanation"].pop("description", None)  # a docstring, not wire
+    explanation.pop("description", None)  # a docstring, not wire
     assert new == old_notice
     assert literals(new_reason) == literals(old_reason) | {"passed"}
 
