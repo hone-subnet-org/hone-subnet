@@ -67,7 +67,7 @@ def validator(
             raise block
         return block
 
-    metagraph = SimpleNamespace(hotkeys=["miner", "owner"], uids=[77, 251])
+    metagraph = SimpleNamespace(hotkeys=["miner", "owner"], coldkeys=["ck-miner", "ck-owner"], uids=[77, 251])
     if last_update is not None:
         metagraph.last_update = [last_update, 0]
 

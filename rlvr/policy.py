@@ -13,6 +13,19 @@ import json
 from dataclasses import asdict, dataclass
 
 
+_BASE58 = frozenset("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+
+
+def _looks_like_ss58(address: object) -> bool:
+    """A generic-prefix SS58 account address: 48 base58 characters starting with 5."""
+    return (
+        isinstance(address, str)
+        and len(address) == 48
+        and address.startswith("5")
+        and set(address) <= _BASE58
+    )
+
+
 @dataclass(frozen=True)
 class ValidatorPolicy:
     version: str = "2026-08-10"
@@ -87,6 +100,15 @@ class ValidatorPolicy:
     v3_pool_min_stake_share: float = 0.0075
     v3_pool_cap_per_validator: int = 50
     v3_pool_window_s: int = 4 * 86_400
+    # Coldkeys whose miners are paid nothing. Their scores are zeroed before
+    # ranking, so every other miner is paid exactly as if they were absent.
+    # A validator-permit holder or the subnet owner is never blocked.
+    blocked_coldkeys: tuple[str, ...] = (
+        "5GsLGYbKBkhkfnXRxGdZqPQ8wYzmVDvrEN8qwif43vpFD5Wu",
+        "5HgYHEhBrnMN4Cox3oSgsb791dfLjBkzJAESof5JkLz64WN5",
+        "5HSwdp8fXt6MtV7cpd2MPNSCDdPdQaRNNfZiURTHki5S8uTe",
+        "5F4GnV4s6UcQnw1MG7QGpL7x4g8WHVA66rY8zFpowc38Diy3",
+    )
 
     def __post_init__(self) -> None:
         if not 0.0 < self.dispatch_fraction <= 1.0:
@@ -146,6 +168,13 @@ class ValidatorPolicy:
                 raise ValueError("V3 resource limits must be positive integers")
         if not 0.0 < self.v3_pool_min_stake_share < 1.0:
             raise ValueError("V3 pool stake share must be a fraction")
+        if type(self.blocked_coldkeys) is not tuple or len(set(self.blocked_coldkeys)) != len(
+            self.blocked_coldkeys
+        ):
+            raise ValueError("blocked_coldkeys must be a tuple without repeats")
+        for coldkey in self.blocked_coldkeys:
+            if not _looks_like_ss58(coldkey):
+                raise ValueError(f"blocked coldkey {coldkey!r} is not an SS58 address")
 
     @property
     def fingerprint(self) -> str:
@@ -161,6 +190,7 @@ class ValidatorPolicy:
             f"rank_decay={self.rank_decay:g} "
             f"round_blocks={self.round_interval_blocks} "
             f"weight_blocks={self.weights_interval_blocks} "
+            f"blocked_coldkeys={len(self.blocked_coldkeys)} "
             f"speed_floor={self.payment_speed_floor:g} "
             f"speed_half_life_ms={self.payment_speed_half_life_ms:g} "
             f"owner_burn={self.owner_burn_share:g}"

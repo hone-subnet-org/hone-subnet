@@ -326,6 +326,7 @@ def make_validator(hotkeys, calls):
     return SimpleNamespace(
         metagraph=SimpleNamespace(
             hotkeys=everyone,
+            coldkeys=[f"ck-{hotkey}" for hotkey in everyone],
             uids=list(range(len(everyone))),
             validator_permit=[False] * len(hotkeys) + [True],
             validator_trust=[0.0] * len(hotkeys) + [0.4],

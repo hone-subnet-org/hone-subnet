@@ -81,6 +81,7 @@ def test_weight_submission_waits_for_configured_completed_observations():
     validator = SimpleNamespace(
         metagraph=SimpleNamespace(
             hotkeys=["miner", "owner"],
+            coldkeys=["ck-miner", "ck-owner"],
             # UIDs deliberately differ from positions.
             uids=[77, 251],
         ),
@@ -118,7 +119,7 @@ def test_six_observation_override_blocks_five_problem_rehearsal():
     policy = ValidatorPolicy(min_weight_observations=6)
     subtensor = _FakeSubtensor()
     validator = SimpleNamespace(
-        metagraph=SimpleNamespace(hotkeys=["miner", "owner"], uids=[0, 251]),
+        metagraph=SimpleNamespace(hotkeys=["miner", "owner"], coldkeys=["ck-miner", "ck-owner"], uids=[0, 251]),
         subtensor=subtensor,
         wallet=object(),
     )
