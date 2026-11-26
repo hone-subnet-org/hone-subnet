@@ -13,8 +13,8 @@ from rlvr.policy import RELEASE_POLICY, ValidatorPolicy
 from rlvr.scoring.eval_engine import EvalEngine, rank_weights
 
 DECAY = RELEASE_POLICY.rank_decay
-BAD = "5GsLGYbKBkhkfnXRxGdZqPQ8wYzmVDvrEN8qwif43vpFD5Wu"
-OTHER_BAD = "5HgYHEhBrnMN4Cox3oSgsb791dfLjBkzJAESof5JkLz64WN5"
+BAD = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+OTHER_BAD = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 POLICY = ValidatorPolicy(blocked_coldkeys=(BAD, OTHER_BAD))
 UNBLOCKED = ValidatorPolicy(blocked_coldkeys=())
 
@@ -61,20 +61,9 @@ def pooled(scores, blocked):
 # --------------------------------------------------------------------------- #
 # policy
 # --------------------------------------------------------------------------- #
-def test_the_release_lists_four_coldkeys():
-    assert RELEASE_POLICY.blocked_coldkeys == (
-        "5GsLGYbKBkhkfnXRxGdZqPQ8wYzmVDvrEN8qwif43vpFD5Wu",
-        "5HgYHEhBrnMN4Cox3oSgsb791dfLjBkzJAESof5JkLz64WN5",
-        "5HSwdp8fXt6MtV7cpd2MPNSCDdPdQaRNNfZiURTHki5S8uTe",
-        "5F4GnV4s6UcQnw1MG7QGpL7x4g8WHVA66rY8zFpowc38Diy3",
-    )
-    assert "blocked_coldkeys=4" in RELEASE_POLICY.summary()
-
-
-def test_every_blocked_coldkey_has_a_valid_checksum():
-    ss58 = pytest.importorskip("scalecodec.utils.ss58")
-    for coldkey in RELEASE_POLICY.blocked_coldkeys:
-        ss58.ss58_decode(coldkey, valid_ss58_format=42)
+def test_the_release_lists_no_coldkeys():
+    assert RELEASE_POLICY.blocked_coldkeys == ()
+    assert "blocked_coldkeys=0" in RELEASE_POLICY.summary()
 
 
 def test_the_list_is_part_of_the_policy_fingerprint():
