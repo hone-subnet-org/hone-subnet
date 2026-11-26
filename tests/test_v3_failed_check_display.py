@@ -433,3 +433,30 @@ def test_inline_check_shows_the_script_itself():
     assert shown.endswith("Inline script:\n" + code)  # the test, verbatim
     big = "x = 1\n" * (65536 // 6)  # a script at the manifest's per-argument cap still renders
     assert render(argv=(python, "-c", big), cwd="/work") is not None
+
+
+@pytest.mark.parametrize("python", ["/usr/bin/python3", "/usr/local/bin/python3"])
+def test_inline_check_with_the_isolated_flag_is_shown_the_same_way(python):
+    code = "import sys\nprint(sys.stdin.read().strip().upper())\n"
+    plain = render(argv=(python, "-c", code), cwd="/work", stderr=b"")
+    isolated = render(argv=(python, "-I", "-c", code), cwd="/work", stderr=b"")
+    assert isolated is not None
+    first, rest = isolated.split("\n", 1)
+    assert json.loads(first.split(": ", 1)[1]) == [python, "-I", "-c", feedback.INLINE_SCRIPT_PLACEHOLDER]
+    assert rest == plain.split("\n", 1)[1]  # identical apart from the argv line
+    assert isolated.endswith("Inline script:\n" + code)
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ("-I", "-I", "-c"),
+        ("-S", "-c"),
+        ("-I", "-S", "-c"),
+        ("-X", "-c"),
+        ("-S", "-I", "-c"),
+        ("-c", "-I"),
+    ],
+)
+def test_other_inline_command_shapes_are_still_omitted(flags):
+    assert render(argv=("/usr/bin/python3", *flags, "print(1)\n")) is None
