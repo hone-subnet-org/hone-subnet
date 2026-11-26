@@ -103,12 +103,7 @@ class ValidatorPolicy:
     # Coldkeys whose miners are paid nothing. Their scores are zeroed before
     # ranking, so every other miner is paid exactly as if they were absent.
     # A validator-permit holder or the subnet owner is never blocked.
-    blocked_coldkeys: tuple[str, ...] = (
-        "5GsLGYbKBkhkfnXRxGdZqPQ8wYzmVDvrEN8qwif43vpFD5Wu",
-        "5HgYHEhBrnMN4Cox3oSgsb791dfLjBkzJAESof5JkLz64WN5",
-        "5HSwdp8fXt6MtV7cpd2MPNSCDdPdQaRNNfZiURTHki5S8uTe",
-        "5F4GnV4s6UcQnw1MG7QGpL7x4g8WHVA66rY8zFpowc38Diy3",
-    )
+    blocked_coldkeys: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not 0.0 < self.dispatch_fraction <= 1.0:

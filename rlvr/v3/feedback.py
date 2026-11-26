@@ -92,9 +92,14 @@ def render_failed_check(
     if not check.argv or check.argv[0] not in _INTERPRETERS:
         return None
     inline_script: str | None = None
+    script_index: int | None = None
     if len(check.argv) == 3 and check.argv[1] == "-c":
+        script_index = 2
+    elif len(check.argv) == 4 and check.argv[1] == "-I" and check.argv[2] == "-c":
+        script_index = 3
+    if script_index is not None:
         # The test is the script itself: show it.
-        inline_script = check.argv[2]
+        inline_script = check.argv[script_index]
         if type(inline_script) is not str or not inline_script:
             return None
     elif len(check.argv) != 2 or not _eligible_script(check.argv[1], request.cwd):
@@ -121,8 +126,8 @@ def render_failed_check(
         return None
 
     shown_argv = list(check.argv)
-    if inline_script is not None:
-        shown_argv[2] = INLINE_SCRIPT_PLACEHOLDER
+    if script_index is not None:
+        shown_argv[script_index] = INLINE_SCRIPT_PLACEHOLDER
     lines = [
         "Command (argv): " + json.dumps(shown_argv, ensure_ascii=True, separators=(",", ":")),
         f"Working directory: {_quote(request.cwd)}",
